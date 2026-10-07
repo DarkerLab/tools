@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent) - Complete Fixed Version
+# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent) - Fixed Version
 # ==============================================================================
 
 set -u  # 开启未定义变量校验
@@ -206,8 +206,10 @@ setup_cron() {
         sed -i '1i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$tmp_cron"
     fi
 
+    # 每日早上 8 点推送日报
     echo "0 8 * * * $SCRIPT_PATH --daily-report >/dev/null 2>&1" >> "$tmp_cron"
-    echo "*/5 * * * * $SCRIPT_PATH --check-threshold >/dev/null 2>&1" >> "$tmp_cron"
+    # 每 1 分钟进行一次流量阈值检测（已修正为 1 分钟）
+    echo "* * * * * $SCRIPT_PATH --check-threshold >/dev/null 2>&1" >> "$tmp_cron"
 
     crontab "$tmp_cron" 2>/dev/null
     rm -f "$tmp_cron"
