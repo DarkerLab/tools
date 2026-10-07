@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =======================================================
-# 仓库及文件配置信息 (对应 DarkerLab/tools/shell)
+# 仓库及文件配置信息
 # =======================================================
 GITHUB_USER="DarkerLab"
 GITHUB_REPO="tools"
@@ -33,10 +33,11 @@ if [ $? -ne 0 ] || [ ! -s "$TARGET_PATH" ]; then
     exit 1
 fi
 
-# 2. 赋予可执行权限
-chmod +x "$TARGET_PATH"
+# 2. 自动清理 Windows \r 换行符（关键修复）
+sed -i 's/\r$//' "$TARGET_PATH"
 
-# 3. 创建快捷命令 'traffic'
+# 3. 赋予权限并创建快捷快捷命令
+chmod +x "$TARGET_PATH"
 ln -sf "$TARGET_PATH" "$SHORTCUT_PATH"
 
 echo "✅ 安装成功！"
@@ -44,5 +45,5 @@ echo "💡 提示：以后随时在终端输入【 traffic 】即可打开控制
 echo "=========================================="
 echo ""
 
-# 4. 自动运行主程序进行初始化
-exec "$TARGET_PATH"
+# 4. 强制使用 bash 解释器运行主程序
+exec bash "$TARGET_PATH"
