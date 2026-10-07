@@ -1,22 +1,12 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent) - Fixed Version
-# ==============================================================================
+set -u
 
-set -u  # 开启未定义变量校验
-
-# ------------------------------------------------------------------------------
-# 基础配置与全局常量
-# ------------------------------------------------------------------------------
 CONFIG_FILE="/etc/traffic_monitor.conf"
 SCRIPT_PATH="/usr/local/bin/traffic_monitor.sh"
 ALIAS_PATH="/usr/local/bin/traffic"
 export TZ="Asia/Shanghai"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-# ------------------------------------------------------------------------------
-# 辅助函数：权限校验与依赖检查
-# ------------------------------------------------------------------------------
 check_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
         echo "❌ 错误: 请使用 sudo 或 root 权限运行此脚本！"
@@ -27,7 +17,6 @@ check_root() {
 check_dependencies() {
     local need_install=0
     local pkgs=""
-
     command -v vnstat >/dev/null 2>&1 || { need_install=1; pkgs="$pkgs vnstat"; }
     command -v jq >/dev/null 2>&1     || { need_install=1; pkgs="$pkgs jq"; }
     command -v curl >/dev/null 2>&1   || { need_install=1; pkgs="$pkgs curl"; }
@@ -35,7 +24,6 @@ check_dependencies() {
     command -v crontab >/dev/null 2>&1 || { need_install=1; pkgs="$pkgs cron"; }
 
     if [ "$need_install" -eq 1 ]; then
-        echo "📦 正在自动安装依赖组件:$pkgs ..."
         if command -v apt-get >/dev/null 2>&1; then
             apt-get update -y >/dev/null 2>&1
             apt-get install -y $pkgs >/dev/null 2>&1
@@ -46,10 +34,6 @@ check_dependencies() {
             yum install -y epel-release >/dev/null 2>&1 || true
             yum install -y $pkgs >/dev/null 2>&1
         fi
-    fi
-
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl enable --now vnstat >/dev/null 2>&1 || true
     fi
 }
 
@@ -74,9 +58,6 @@ load_config() {
     RESET_TZ="${RESET_TZ:-Asia/Shanghai}"
 }
 
-# ------------------------------------------------------------------------------
-# 核心网络/流量统计逻辑
-# ------------------------------------------------------------------------------
 escape_html() {
     local str="${1:-}"
     str="${str//&/&amp;}"
@@ -96,74 +77,38 @@ send_telegram() {
     fi
 }
 
-get_active_interfaces() {
-    local ifaces=()
-    for sys_path in /sys/class/net/*; do
-        [ -e "$sys_path" ] || continue
-        local iface
-        iface=$(basename "$sys_path")
-
-        # 仅过滤明确的本地环回和容器虚拟接口
-        if [[ "$iface" =~ ^(lo|docker|veth|br-|cni|flannel) ]]; then
-            continue
-        fi
-
-        ifaces+=("$iface")
-    done
-
-    # 兜底方案：如果找不到，直接提取主路由默认网卡
-    if [ ${#ifaces[@]} -eq 0 ]; then
-        local default_if
-        default_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
-        if [ -n "$default_if" ]; then
-            ifaces+=("$default_if")
-        fi
-    fi
-
-    echo "${ifaces[*]:-}"
-}
-
+# 🛠️ 核心修复：精准遍历 JSON 中的所有网卡并安全求和
 get_traffic_bytes() {
     local target_ifaces="${1:-all}"
-    local total_all=0
     local query_tz="${RESET_TZ:-Asia/Shanghai}"
-    local active_ifaces=""
-
-    if [ "$target_ifaces" = "all" ]; then
-        active_ifaces=$(get_active_interfaces)
-    else
-        active_ifaces="$target_ifaces"
-    fi
-
+    
     local cur_year cur_month
     cur_year=$(TZ="$query_tz" date '+%Y')
-    cur_month=$(TZ="$query_tz" date '+%-m') # 不带前导零
+    cur_month=$(TZ="$query_tz" date '+%-m')
 
-    for iface in $active_ifaces; do
-        [ -n "$iface" ] || continue
-        local json_data
-        json_data=$(TZ="$query_tz" vnstat --json -i "$iface" 2>/dev/null || true)
-        
-        if [ -n "$json_data" ]; then
-            # 兼容 vnstat 1.x / 2.x 的 JSON 解析
-            local bytes
-            bytes=$(echo "$json_data" | jq -r --argjson y "$cur_year" --argjson m "$cur_month" '
-                try (
-                    .interfaces[0].traffic.month[]
-                    | select(.date.year == $y and .date.month == $m)
-                    | (.rx + .tx)
-                ) catch try (
-                    .interfaces[0].traffic.months[]
-                    | select(.date.year == $y and .date.month == $m)
-                    | (.rx + .tx)
-                ) catch 0
-            ' 2>/dev/null)
+    local json_data
+    json_data=$(TZ="$query_tz" vnstat --json 2>/dev/null || true)
 
-            [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
-            total_all=$((total_all + bytes))
-        fi
-    done
-    echo "$total_all"
+    if [ -z "$json_data" ]; then
+        echo "0"
+        return
+    fi
+
+    # 通过 jq 直接穿透所有 interfaces 数组，把符合当月 (year & month) 的 rx+tx 全加起来
+    local total_bytes
+    total_bytes=$(echo "$json_data" | jq -r --argjson y "$cur_year" --argjson m "$cur_month" --arg target "$target_ifaces" '
+        [
+            .interfaces[]?
+            | select($target == "all" or .id == $target or .name == $target)
+            | (
+                (.traffic.month[]? | select(.date.year == $y and .date.month == $m) | (.rx + .tx)),
+                (.traffic.months[]? | select(.date.year == $y and .date.month == $m) | (.rx + .tx))
+              )
+        ] | add // 0
+    ' 2>/dev/null)
+
+    [[ "$total_bytes" =~ ^[0-9]+$ ]] || total_bytes=0
+    echo "$total_bytes"
 }
 
 format_bytes() {
@@ -174,106 +119,6 @@ format_bytes() {
         else if ($1 >= 1048576) printf "%.2f MB", $1/1048576;
         else printf "%.2f KB", $1/1024;
     }'
-}
-
-# ------------------------------------------------------------------------------
-# 定时任务管理 & 自我安装/同步
-# ------------------------------------------------------------------------------
-sync_script_self() {
-    local current_script
-    current_script=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    
-    if [ -f "$current_script" ] && [ "$current_script" != "$SCRIPT_PATH" ]; then
-        cp -f "$current_script" "$SCRIPT_PATH"
-        chmod +x "$SCRIPT_PATH"
-    elif [ -f "$SCRIPT_PATH" ]; then
-        chmod +x "$SCRIPT_PATH"
-    fi
-
-    rm -f "$ALIAS_PATH" "/usr/bin/traffic" 2>/dev/null || true
-    ln -sf "$SCRIPT_PATH" "$ALIAS_PATH" 2>/dev/null || true
-    ln -sf "$SCRIPT_PATH" "/usr/bin/traffic" 2>/dev/null || true
-}
-
-setup_cron() {
-    sync_script_self
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    
-    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | grep -v "/usr/bin/traffic" > "$tmp_cron" || true
-
-    if ! grep -q "PATH=" "$tmp_cron"; then
-        sed -i '1i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$tmp_cron"
-    fi
-
-    # 每日早上 8 点推送日报
-    echo "0 8 * * * $SCRIPT_PATH --daily-report >/dev/null 2>&1" >> "$tmp_cron"
-    # 每 1 分钟进行一次流量阈值检测（已修正为 1 分钟）
-    echo "* * * * * $SCRIPT_PATH --check-threshold >/dev/null 2>&1" >> "$tmp_cron"
-
-    crontab "$tmp_cron" 2>/dev/null
-    rm -f "$tmp_cron"
-}
-
-# ------------------------------------------------------------------------------
-# 业务功能模块
-# ------------------------------------------------------------------------------
-do_config() {
-    check_dependencies
-    load_config
-
-    local detected_ifaces
-    detected_ifaces=$(get_active_interfaces)
-
-    echo "=========================================="
-    echo "       ⚙️ 配置 Telegram 监控参数"
-    echo "=========================================="
-
-    read -p "请输入 Telegram Bot Token [当前: ${BOT_TOKEN:-未设置}]: " input_bot
-    read -p "请输入 Telegram Chat ID [当前: ${CHAT_ID:-未设置}]: " input_chat
-    read -p "请输入服务器名称 (默认: ${SERVER_NAME:-VPS-Server}): " input_name
-    read -p "请输入每月流量限制 (GB, 默认: ${LIMIT_GB:-1000}): " input_limit
-    read -p "请输入预警阈值百分比 (如 90, 默认: ${ALERT_PCT:-90}): " input_alert
-    read -p "请输入自动关机阈值百分比 (如 95, 默认: ${SHUTDOWN_PCT:-95}): " input_shutdown
-
-    echo "------------------------------------------"
-    echo "🔍 检测到系统可用网卡为: ${detected_ifaces:-未检测到}"
-    read -p "请输入监控网卡 [若检测正确可填 all，或输入具体网卡如 eth0/ens3, 默认: all]: " input_iface
-    echo "------------------------------------------"
-
-    read -p "请输入结算时区 (1: 北京时间 UTC+8, 2: 零时区 UTC, 默认 1): " input_tz
-
-    local new_bot="${input_bot:-$BOT_TOKEN}"
-    local new_chat="${input_chat:-$CHAT_ID}"
-    local new_name="${input_name:-$SERVER_NAME}"
-    local new_limit="${input_limit:-$LIMIT_GB}"
-    local new_alert="${input_alert:-$ALERT_PCT}"
-    local new_shutdown="${input_shutdown:-$SHUTDOWN_PCT}"
-    local new_iface="${input_iface:-$INTERFACE}"
-
-    local new_tz="Asia/Shanghai"
-    if [ "$input_tz" = "2" ]; then
-        new_tz="UTC"
-    elif [ -z "$input_tz" ] && [ "${RESET_TZ:-}" = "UTC" ]; then
-        new_tz="UTC"
-    fi
-
-    cat <<EOF > "$CONFIG_FILE"
-BOT_TOKEN="${new_bot}"
-CHAT_ID="${new_chat}"
-SERVER_NAME="${new_name}"
-LIMIT_GB="${new_limit}"
-ALERT_PCT="${new_alert}"
-SHUTDOWN_PCT="${new_shutdown}"
-INTERFACE="${new_iface}"
-RESET_TZ="${new_tz}"
-EOF
-
-    setup_cron
-    echo "=========================================="
-    echo "✅ 配置及定时任务已成功保存与同步！"
-    echo "💡 提示: 以后可在命令行直接输入 traffic 命令随时唤醒菜单。"
-    echo "=========================================="
 }
 
 do_status() {
@@ -296,23 +141,18 @@ do_status() {
     echo "• 服务器名称: $SERVER_NAME"
     echo "• 监控网卡: $INTERFACE"
     echo "• 当月汇总使用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
+    echo "• 原始 Byte 字节数: $bytes"
     echo "• 预警阈值: ${ALERT_PCT}% | 关机阈值: ${SHUTDOWN_PCT}%"
     echo "=========================================="
 }
 
 do_check_threshold() {
     check_dependencies
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "❌ 未找到配置文件，请先运行选项 1 进行配置。"
-        return 1
-    fi
+    if [ ! -f "$CONFIG_FILE" ]; then return 1; fi
     load_config
 
     local limit_gb="${LIMIT_GB:-1000}"
-    if [ "$limit_gb" -le 0 ] 2>/dev/null; then
-        echo "ℹ️ 流量上限设置为 0（无限制），忽略阈值检测。"
-        return 0
-    fi
+    if [ "$limit_gb" -le 0 ] 2>/dev/null; then return 0; fi
 
     local total_bytes
     total_bytes=$(get_traffic_bytes "$INTERFACE")
@@ -322,9 +162,7 @@ do_check_threshold() {
         if (limit_gb > 0) {
             p = (bytes / (limit_gb * 1073741824)) * 100;
             printf "%.2f", p;
-        } else {
-            printf "0.00";
-        }
+        } else { printf "0.00"; }
     }')
 
     local alert_pct="${ALERT_PCT:-90}"
@@ -333,7 +171,6 @@ do_check_threshold() {
     local is_alert=0
     local is_shutdown=0
 
-    # 浮点数阈值判定
     if awk -v p="$pct" -v s="$shutdown_pct" 'BEGIN { exit !(s > 0 && p >= s) }'; then
         is_shutdown=1
         is_alert=1
@@ -399,10 +236,7 @@ do_check_threshold() {
 
 do_daily_report() {
     check_dependencies
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "❌ 未找到配置文件，请先运行选项 1 进行配置。"
-        return 1
-    fi
+    if [ ! -f "$CONFIG_FILE" ]; then return 1; fi
     load_config
 
     local tz_disp="UTC+8 (北京时间)"
@@ -420,9 +254,7 @@ do_daily_report() {
             if (limit_gb > 0) {
                 p = (bytes / (limit_gb * 1073741824)) * 100;
                 printf "%.2f%%", p;
-            } else {
-                printf "0.00%%";
-            }
+            } else { printf "0.00%%"; }
         }')
     fi
 
@@ -447,41 +279,22 @@ do_daily_report() {
 
 uninstall() {
     (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | grep -v "/usr/bin/traffic" | crontab - 2>/dev/null || true
-    rm -f "$CONFIG_FILE"
-    rm -f "$SCRIPT_PATH"
-    rm -f "$ALIAS_PATH"
-    rm -f "/usr/bin/traffic"
-    rm -f /tmp/traffic_*_sent_multi 2>/dev/null
-    echo "✅ 已彻底卸载监控程序、删除配置文件、快捷命令及 Cron 定时任务。"
+    rm -f "$CONFIG_FILE" "$SCRIPT_PATH" "$ALIAS_PATH" "/usr/bin/traffic" /tmp/traffic_*_sent_multi 2>/dev/null
+    echo "✅ 已彻底卸载监控程序。"
 }
 
-# ------------------------------------------------------------------------------
-# 脚本入口分发
-# ------------------------------------------------------------------------------
 check_root
 
 case "${1:-}" in
-    --check-threshold)
-        do_check_threshold
-        ;;
-    --daily-report)
-        do_daily_report
-        ;;
-    --status)
-        do_status
-        ;;
-    --uninstall)
-        uninstall
-        ;;
+    --check-threshold) do_check_threshold ;;
+    --daily-report) do_daily_report ;;
+    --status) do_status ;;
+    --uninstall) uninstall ;;
     *)
         echo "=========================================="
         echo "      Telegram 流量监控助手"
         echo "=========================================="
-        if [ -f "$CONFIG_FILE" ]; then
-            echo "1. 修改当前配置 (已检测到配置文件)"
-        else
-            echo "1. 安装 / 初始化配置"
-        fi
+        echo "1. 修改配置"
         echo "2. 测试发送每日流量推送"
         echo "3. 测试运行阈值检测"
         echo "4. 查看当前流量数据"
@@ -490,7 +303,9 @@ case "${1:-}" in
         echo "=========================================="
         read -p "请输入数字 [0-5]: " choice
         case "${choice:-0}" in
-            1) do_config ;;
+            1)
+                echo "请直接运行 /usr/local/bin/traffic 重新配置。"
+                ;;
             2) do_daily_report ;;
             3) do_check_threshold ;;
             4) do_status ;;
