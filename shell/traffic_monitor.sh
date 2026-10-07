@@ -102,11 +102,14 @@ do_status() {
 
     local display_name="${SERVER_NAME:-$(hostname)}"
 
+    local p_sign=$(printf '\x25')
+    local pipe_sign=$(printf '\x7c')
+
     echo "=========================================="
     echo "• 服务器名称: $display_name"
     echo "• 监控网卡: $INTERFACE"
     echo "• 当月汇总使用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
-    echo "• 预警阈值: ${ALERT_PCT}\% \vert{} 关机阈值: ${SHUTDOWN_PCT}%"
+    echo "• 预警阈值: ${ALERT_PCT}${p_sign}${pipe_sign} 关机阈值: ${SHUTDOWN_PCT}${p_sign}"
     echo "=========================================="
 }
 
@@ -123,6 +126,7 @@ do_check_threshold() {
     SHUTDOWN_PCT=${SHUTDOWN_PCT:-95}
     INTERFACE=${INTERFACE:-all}
     local display_name="${SERVER_NAME:-$(hostname)}"
+    local p_sign=$(printf '\x25')
 
     if [ "$LIMIT_GB" -le 0 ] 2>/dev/null; then
         echo "ℹ️ 流量上限设置为 0（无限制），忽略阈值检测。"
@@ -158,13 +162,13 @@ do_check_threshold() {
             local msg="🛑 *[流量严重超限 - 自动关机通知]*
 • 服务器: \`${display_name}\`
 • 监控网卡: \`${INTERFACE}\`
-• 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}%)
-• 关机阈值: \`${SHUTDOWN_PCT}%\`
+• 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
+• 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
 ⚠️ 流量已达到关机阈值，服务器将在 5 秒后自动关机！"
             
             send_telegram "$msg"
             touch "$flag_shutdown"
-            echo "🛑 流量超限 (${pct}\% >=${SHUTDOWN_PCT}%)，已发送 TG 通知，5秒后自动关机！"
+            echo "🛑 流量超限 (${pct}${p_sign} >= ${SHUTDOWN_PCT}${p_sign})，已发送 TG 通知，5秒后自动关机！"
             sleep 5
             systemctl poweroff
             return 0
@@ -181,20 +185,20 @@ do_check_threshold() {
             local msg="🚨 *[流量用量预警]*
 • 服务器: \`${display_name}\`
 • 监控网卡: \`${INTERFACE}\`
-• 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}%)
-• 预警阈值: \`${ALERT_PCT}%\`
-• 关机阈值: \`${SHUTDOWN_PCT}%\`
+• 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
+• 预警阈值: \`${ALERT_PCT}${p_sign}\`
+• 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
 ⚠️ 已达到设定的流量预警阈值，请注意控制用量！"
             
             send_telegram "$msg"
             touch "$flag_alert"
-            echo "⚠️ 已达到预警阈值 (当前 ${pct}\% >= 设定 ${ALERT_PCT}%)，预警消息已发送！"
+            echo "⚠️ 已达到预警阈值 (当前 ${pct}${p_sign} >= 设定 ${ALERT_PCT}${p_sign})，预警消息已发送！"
         else
-            echo "ℹ️ 已处于预警状态 (当前 ${pct}%)，不再重复提醒。"
+            echo "ℹ️ 已处于预警状态 (当前 ${pct}${p_sign})，不再重复提醒。"
         fi
     else
         rm -f "$flag_alert" 2>/dev/null
-        echo "✅ 流量正常（当前汇总已用 ${pct}\%，未达到预警阈值 ${ALERT_PCT}%）。"
+        echo "✅ 流量正常（当前汇总已用 ${pct}${p_sign}，未达到预警阈值 ${ALERT_PCT}${p_sign}）。"
     fi
 }
 
@@ -210,6 +214,7 @@ do_daily_report() {
     LIMIT_GB=${LIMIT_GB:-1000}
     RESET_TZ=${RESET_TZ:-Asia/Shanghai}
     local display_name="${SERVER_NAME:-$(hostname)}"
+    local p_sign=$(printf '\x25')
 
     local tz_disp="UTC+8 (北京时间)"
     if [ "$RESET_TZ" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
