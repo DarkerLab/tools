@@ -4,7 +4,7 @@
 # Repository Path: DarkerLab/tools/shell/traffic_monitor.sh
 # ==============================================================================
 
-set -u  # 开启未定义变量校验
+set -u
 
 # ------------------------------------------------------------------------------
 # 基础配置与全局常量
@@ -165,19 +165,10 @@ format_bytes() {
 }
 
 # ------------------------------------------------------------------------------
-# 定时任务管理 & 自我安装/同步
+# 定时任务管理 & 软链接维护
 # ------------------------------------------------------------------------------
 sync_script_self() {
-    local current_script
-    current_script=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    
-    if [ -f "$current_script" ] && [ "$current_script" != "$SCRIPT_PATH" ]; then
-        cp -f "$current_script" "$SCRIPT_PATH"
-        chmod +x "$SCRIPT_PATH"
-    elif [ -f "$SCRIPT_PATH" ]; then
-        chmod +x "$SCRIPT_PATH"
-    fi
-
+    chmod +x "$SCRIPT_PATH" 2>/dev/null || true
     rm -f "$ALIAS_PATH" "/usr/bin/traffic" 2>/dev/null || true
     ln -sf "$SCRIPT_PATH" "$ALIAS_PATH" 2>/dev/null || true
     ln -sf "$SCRIPT_PATH" "/usr/bin/traffic" 2>/dev/null || true
@@ -466,7 +457,7 @@ case "${1:-}" in
         echo "      Telegram 流量监控助手"
         echo "=========================================="
         if [ -f "$CONFIG_FILE" ]; then
-            echo "1. 修改当前配置 (已检测到配置文件)"
+            echo "1. 修改配置"
         else
             echo "1. 安装 / 初始化配置"
         fi
