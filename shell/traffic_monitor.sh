@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent) - Fixed Version
+# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent) - Complete Fixed Version
 # ==============================================================================
 
 set -u  # 开启未定义变量校验
@@ -103,21 +103,15 @@ get_active_interfaces() {
         local iface
         iface=$(basename "$sys_path")
 
-        if [[ "$iface" =~ ^(lo|docker|veth|br-|br0|tun|tap|tailscale|wg|cni|flannel|dummy|bond|kube) ]]; then
+        # 仅过滤明确的本地环回和容器虚拟接口
+        if [[ "$iface" =~ ^(lo|docker|veth|br-|cni|flannel) ]]; then
             continue
-        fi
-
-        if [ -f "$sys_path/operstate" ]; then
-            local state
-            state=$(cat "$sys_path/operstate" 2>/dev/null || echo "unknown")
-            if [ "$state" = "down" ]; then
-                continue
-            fi
         fi
 
         ifaces+=("$iface")
     done
 
+    # 兜底方案：如果找不到，直接提取主路由默认网卡
     if [ ${#ifaces[@]} -eq 0 ]; then
         local default_if
         default_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
@@ -143,7 +137,7 @@ get_traffic_bytes() {
 
     local cur_year cur_month
     cur_year=$(TZ="$query_tz" date '+%Y')
-    cur_month=$(TZ="$query_tz" date '+%-m') # 不带前导零，匹配 vnstat JSON 的数值
+    cur_month=$(TZ="$query_tz" date '+%-m') # 不带前导零
 
     for iface in $active_ifaces; do
         [ -n "$iface" ] || continue
@@ -151,7 +145,7 @@ get_traffic_bytes() {
         json_data=$(TZ="$query_tz" vnstat --json -i "$iface" 2>/dev/null || true)
         
         if [ -n "$json_data" ]; then
-            # 兼容 vnstat 1.x 与 2.x JSON 结构的健壮提取逻辑
+            # 兼容 vnstat 1.x / 2.x 的 JSON 解析
             local bytes
             bytes=$(echo "$json_data" | jq -r --argjson y "$cur_year" --argjson m "$cur_month" '
                 try (
@@ -226,6 +220,9 @@ do_config() {
     check_dependencies
     load_config
 
+    local detected_ifaces
+    detected_ifaces=$(get_active_interfaces)
+
     echo "=========================================="
     echo "       ⚙️ 配置 Telegram 监控参数"
     echo "=========================================="
@@ -236,7 +233,12 @@ do_config() {
     read -p "请输入每月流量限制 (GB, 默认: ${LIMIT_GB:-1000}): " input_limit
     read -p "请输入预警阈值百分比 (如 90, 默认: ${ALERT_PCT:-90}): " input_alert
     read -p "请输入自动关机阈值百分比 (如 95, 默认: ${SHUTDOWN_PCT:-95}): " input_shutdown
-    read -p "请输入监控网卡 (默认: ${INTERFACE:-all}): " input_iface
+
+    echo "------------------------------------------"
+    echo "🔍 检测到系统可用网卡为: ${detected_ifaces:-未检测到}"
+    read -p "请输入监控网卡 [若检测正确可填 all，或输入具体网卡如 eth0/ens3, 默认: all]: " input_iface
+    echo "------------------------------------------"
+
     read -p "请输入结算时区 (1: 北京时间 UTC+8, 2: 零时区 UTC, 默认 1): " input_tz
 
     local new_bot="${input_bot:-$BOT_TOKEN}"
@@ -329,7 +331,7 @@ do_check_threshold() {
     local is_alert=0
     local is_shutdown=0
 
-    # 精准浮点数阈值判定
+    # 浮点数阈值判定
     if awk -v p="$pct" -v s="$shutdown_pct" 'BEGIN { exit !(s > 0 && p >= s) }'; then
         is_shutdown=1
         is_alert=1
@@ -452,7 +454,7 @@ uninstall() {
 }
 
 # ------------------------------------------------------------------------------
-# 脚本入口分发 (严格单映射，无重名分支)
+# 脚本入口分发
 # ------------------------------------------------------------------------------
 check_root
 
