@@ -344,8 +344,8 @@ do_status() {
     echo "=========================================="
     echo "- 服务器名称: $SERVER_NAME"
     echo "- 监控网卡: $INTERFACE"
-    echo "- 每月重置日: 每月 ${RESET_DAY:-1} 号"
-    echo "- 当前周期用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
+    echo "- 每月重置日期: 每月 ${RESET_DAY:-1} 号"
+    echo "- 周期用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
     echo "- 预警阈值: ${ALERT_PCT}% | 关机阈值: ${SHUTDOWN_PCT}%"
     echo "=========================================="
 }
@@ -404,10 +404,10 @@ do_check_threshold() {
             formatted_used=$(format_bytes "$total_bytes")
 
             local msg="🛑 <b>[流量严重超限 - 自动关机通知]</b>
-- 服务器: <code>${safe_server_name}</code>
+- 服务器: #<code>${safe_server_name}</code>
 - 监控网卡: <code>${safe_interface}</code>
-- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
-- 重置日: 每月 <code>${RESET_DAY:-1}</code> 号
+- 周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 重置日期: 每月 <code>${RESET_DAY:-1}</code> 号
 - 关机阈值: <code>${shutdown_pct}%</code>
 ⚠️ 流量已达到关机阈值，服务器将在 5 秒后自动关机！"
 
@@ -428,10 +428,10 @@ do_check_threshold() {
             formatted_used=$(format_bytes "$total_bytes")
 
             local msg="🚨 <b>[流量用量预警]</b>
-- 服务器: <code>${safe_server_name}</code>
+- 服务器: #<code>${safe_server_name}</code>
 - 监控网卡: <code>${safe_interface}</code>
-- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
-- 重置日: 每月 <code>${RESET_DAY:-1}</code> 号
+- 周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 重置日期: 每月 <code>${RESET_DAY:-1}</code> 号
 - 预警阈值: <code>${alert_pct}%</code>
 - 关机阈值: <code>${shutdown_pct}%</code>
 ⚠️ 已达到设定的流量预警阈值，请注意控制用量！"
@@ -486,12 +486,12 @@ do_daily_report() {
     current_time=$(TZ="Asia/Shanghai" date '+%Y-%m-%d %H:%M:%S')
 
     local msg="📊 <b>[每日流量日报]</b>
-- 服务器: <code>${safe_server_name}</code>
+- 服务器: #<code>${safe_server_name}</code>
 - 监控网卡: <code>${safe_interface}</code>
 - 重置日期: 每月 <code>${RESET_DAY:-1}</code> 号
 - 结算时区: <code>${tz_disp}</code>
-- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (已用 ${pct})
-- 统计时间: <code>${current_time} (北京时间)</code>"
+- 周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (已用 ${pct})
+- 统计时间: <code>${current_time}</code>"
 
     send_telegram "$msg"
     echo "✅ 每日流量推送指令已执行！"
