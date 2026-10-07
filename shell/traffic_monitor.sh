@@ -72,8 +72,8 @@ get_traffic_bytes() {
         json_data=$(TZ="$query_tz" vnstat --json m 1 -i "$iface" 2>/dev/null)
         if [ -n "$json_data" ]; then
             local rx tx
-            rx=$(echo "$json_data" | jq -r '(.interfaces[0].traffic.month[0].rx // .interfaces[0].traffic.months[0].rx) // 0' 2>/dev/null)
-            tx=$(echo "$json_data" | jq -r '(.interfaces[0].traffic.month[0].tx // .interfaces[0].traffic.months[0].tx) // 0' 2>/dev/null)
+            rx=$(echo "$json_data" | jq -r '(.interfaces[0].traffic.month[0].rx // .interfaces[0].traffic.months[0].rx // .interfaces[0].traffic.month[-1].rx // .interfaces[0].traffic.months[-1].rx) // 0' 2>/dev/null)
+            tx=$(echo "$json_data" | jq -r '(.interfaces[0].traffic.month[0].tx // .interfaces[0].traffic.months[0].tx // .interfaces[0].traffic.month[-1].tx // .interfaces[0].traffic.months[-1].tx) // 0' 2>/dev/null)
             if [[ ! "$rx" =~ ^[0-9]+$ ]]; then rx=0; fi
             if [[ ! "$tx" =~ ^[0-9]+$ ]]; then tx=0; fi
             total_all=$((total_all + rx + tx))
@@ -158,7 +158,7 @@ do_check_threshold() {
         pct = (limit_gb > 0) ? (used_gb / limit_gb) * 100 : 0;
         is_alert = (pct >= alert_pct) ? 1 : 0;
         is_shutdown = (shutdown_pct > 0 && pct >= shutdown_pct) ? 1 : 0;
-        printf "pct=\"%.1f\"\nis_alert=%d\nis_shutdown=%d\n", pct, is_alert, is_shutdown;
+        printf "pct=\"%.4f\"\nis_alert=%d\nis_shutdown=%d\n", pct, is_alert, is_shutdown;
     }')
 
     local flag_alert="/tmp/traffic_alert_sent_multi"
@@ -237,9 +237,9 @@ do_daily_report() {
     if [ "$LIMIT_GB" -gt 0 ] 2>/dev/null; then
         pct=$(LC_ALL=C awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
             if (limit_gb > 0) {
-                printf "%.1f%%", (bytes / (limit_gb * 1073741824)) * 100;
+                printf "%.4f%%", (bytes / (limit_gb * 1073741824)) * 100;
             } else {
-                printf "0.0%%";
+                printf "0.00%%";
             }
         }')
     fi
