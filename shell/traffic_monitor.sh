@@ -424,4 +424,59 @@ EOF
     local msg="🎉 ${title_str}
 已成功配置流量监控服务！
 • 服务器: \`${SERVER_NAME}\`
-• 监控网卡
+• 监控网卡: \`${INTERFACE}\`
+• 结算重置: \`每月 ${RESET_DAY} 号\`
+• 结算时区: \`${RESET_TZ_NAME}\`
+• 预警线: \`${ALERT_PCT}%\`
+• 关机线: \`${SHUTDOWN_PCT}%\`
+• 推送时间: \`每天 08:00 (北京时间)\`"
+    send_telegram "$msg"
+}
+
+uninstall() {
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
+    rm -f "$CONFIG_FILE"
+    rm -f "$SCRIPT_PATH"
+    rm -f "/usr/local/bin/traffic"
+    echo "✅ 已彻底卸载监控程序、删除配置文件及定时任务。"
+}
+
+case "$1" in
+    --check-threshold)
+        do_check_threshold
+        ;;
+    --daily-report)
+        do_daily_report
+        ;;
+    --status)
+        do_status
+        ;;
+    --uninstall)
+        uninstall
+        ;;
+    *)
+        echo "=========================================="
+        echo "      Telegram 流量监控助手"
+        echo "=========================================="
+        if [ -f "$CONFIG_FILE" ]; then
+            echo "1. 修改当前配置 (已检测到现有配置文件)"
+        else
+            echo "1. 安装 / 初始化配置"
+        fi
+        echo "2. 测试发送每日流量推送"
+        echo "3. 测试运行阈值检测"
+        echo "4. 查看当前流量数据"
+        echo "5. 卸载监控程序"
+        echo "0. 退出"
+        echo "=========================================="
+        read -p "请输入数字 [0-5]: " choice
+        case "$choice" in
+            1) interactive_config ;;
+            2) do_daily_report ;;
+            3) do_check_threshold ;;
+            4) do_status ;;
+            5) uninstall ;;
+            *) exit 0 ;;
+        esac
+        ;;
+esac
