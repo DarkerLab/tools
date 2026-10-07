@@ -84,6 +84,48 @@ format_bytes() {
     }'
 }
 
+do_config() {
+    check_dependencies
+    echo "=========================================="
+    echo "       ⚙️ 配置 Telegram 监控参数"
+    echo "=========================================="
+    
+    read -p "请输入 Telegram Bot Token: " input_bot
+    read -p "请输入 Telegram Chat ID: " input_chat
+    read -p "请输入服务器名称 (留空默认主机名): " input_name
+    read -p "请输入每月流量限制 (GB, 默认 1000): " input_limit
+    read -p "请输入预警阈值百分比 (如 90): " input_alert
+    read -p "请输入自动关机阈值百分比 (如 95): " input_shutdown
+    read -p "请输入监控网卡 (默认 all 或指定如 eth0): " input_iface
+    read -p "请输入结算时区 (1: 北京时间 UTC+8, 2: 零时区 UTC, 默认 1): " input_tz
+
+    bot_token=${input_bot:-""}
+    chat_id=${input_chat:-""}
+    server_name=${input_name:-$(hostname)}
+    limit_gb=${input_limit:-1000}
+    alert_pct=${input_alert:-90}
+    shutdown_pct=${input_shutdown:-95}
+    interface=${input_iface:-all}
+    
+    reset_tz="Asia/Shanghai"
+    if [ "$input_tz" = "2" ]; then
+        reset_tz="UTC"
+    fi
+
+    cat <<EOF > "$CONFIG_FILE"
+BOT_TOKEN="${bot_token}"
+CHAT_ID="${chat_id}"
+SERVER_NAME="${server_name}"
+LIMIT_GB="${limit_gb}"
+ALERT_PCT="${alert_pct}"
+SHUTDOWN_PCT="${shutdown_pct}"
+INTERFACE="${interface}"
+RESET_TZ="${reset_tz}"
+EOF
+
+    echo "✅ 配置已成功保存到 $CONFIG_FILE ！"
+}
+
 do_status() {
     check_dependencies
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -287,7 +329,7 @@ case "$1" in
         echo "=========================================="
         read -p "请输入数字 [0-5]: " choice
         case "$choice" in
-            1) /usr/local/bin/traffic_monitor.sh ;;
+            1) do_config ;;
             2) do_daily_report ;;
             3) do_check_threshold ;;
             4) do_status ;;
