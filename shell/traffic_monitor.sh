@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent)
+# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent) - Fixed Version
 # ==============================================================================
 
 set -u  # 开启未定义变量校验
@@ -12,6 +12,7 @@ CONFIG_FILE="/etc/traffic_monitor.conf"
 SCRIPT_PATH="/usr/local/bin/traffic_monitor.sh"
 ALIAS_PATH="/usr/local/bin/traffic"
 export TZ="Asia/Shanghai"
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 # ------------------------------------------------------------------------------
 # 辅助函数：权限校验与依赖检查
@@ -54,7 +55,7 @@ check_dependencies() {
 
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
-        while IFS='=' read -r key value; do
+        while IFS='=' read -r key value || [ -n "$key" ]; do
             if [[ "$key" =~ ^[A-Z_]+$ ]]; then
                 value="${value%\"}"
                 value="${value#\"}"
@@ -77,7 +78,7 @@ load_config() {
 # 核心网络/流量统计逻辑
 # ------------------------------------------------------------------------------
 escape_html() {
-    local str="$1"
+    local str="${1:-}"
     str="${str//&/&amp;}"
     str="${str//</&lt;}"
     str="${str//>/&gt;}"
@@ -85,9 +86,9 @@ escape_html() {
 }
 
 send_telegram() {
-    local text="$1"
+    local text="${1:-}"
     load_config
-    if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+    if [ -n "${BOT_TOKEN:-}" ] && [ -n "${CHAT_ID:-}" ]; then
         curl -s -m 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d "chat_id=${CHAT_ID}" \
             -d "parse_mode=HTML" \
@@ -129,7 +130,7 @@ get_active_interfaces() {
 }
 
 get_traffic_bytes() {
-    local target_ifaces="$1"
+    local target_ifaces="${1:-all}"
     local total_all=0
     local query_tz="${RESET_TZ:-Asia/Shanghai}"
     local active_ifaces=""
@@ -140,40 +141,32 @@ get_traffic_bytes() {
         active_ifaces="$target_ifaces"
     fi
 
-    local current_year_month
-    current_year_month=$(TZ="$query_tz" date '+%Y-%m')
+    local cur_year cur_month
+    cur_year=$(TZ="$query_tz" date '+%Y')
+    cur_month=$(TZ="$query_tz" date '+%-m') # 不带前导零，匹配 vnstat JSON 的数值
 
     for iface in $active_ifaces; do
         [ -n "$iface" ] || continue
         local json_data
-        json_data=$(TZ="$query_tz" vnstat --json m -i "$iface" 2>/dev/null || true)
+        json_data=$(TZ="$query_tz" vnstat --json -i "$iface" 2>/dev/null || true)
         
         if [ -n "$json_data" ]; then
-            local rx tx
-            rx=$(echo "$json_data" | jq -r --arg ym "$current_year_month" '
+            # 兼容 vnstat 1.x 与 2.x JSON 结构的健壮提取逻辑
+            local bytes
+            bytes=$(echo "$json_data" | jq -r --argjson y "$cur_year" --argjson m "$cur_month" '
                 try (
-                    (.interfaces[0].traffic.month // .interfaces[0].traffic.months // [])
-                    | map(select(
-                        (.date | if type == "object" then "\( .year )-\( if .month < 10 then "0" else "" end )\( .month )" else . end | startswith($ym))
-                    ))
-                    | last | .rx // 0
+                    .interfaces[0].traffic.month[]
+                    | select(.date.year == $y and .date.month == $m)
+                    | (.rx + .tx)
+                ) catch try (
+                    .interfaces[0].traffic.months[]
+                    | select(.date.year == $y and .date.month == $m)
+                    | (.rx + .tx)
                 ) catch 0
             ' 2>/dev/null)
 
-            tx=$(echo "$json_data" | jq -r --arg ym "$current_year_month" '
-                try (
-                    (.interfaces[0].traffic.month // .interfaces[0].traffic.months // [])
-                    | map(select(
-                        (.date | if type == "object" then "\( .year )-\( if .month < 10 then "0" else "" end )\( .month )" else . end | startswith($ym))
-                    ))
-                    | last | .tx // 0
-                ) catch 0
-            ' 2>/dev/null)
-
-            [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
-            [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
-
-            total_all=$((total_all + rx + tx))
+            [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+            total_all=$((total_all + bytes))
         fi
     done
     echo "$total_all"
@@ -239,11 +232,11 @@ do_config() {
 
     read -p "请输入 Telegram Bot Token [当前: ${BOT_TOKEN:-未设置}]: " input_bot
     read -p "请输入 Telegram Chat ID [当前: ${CHAT_ID:-未设置}]: " input_chat
-    read -p "请输入服务器名称 (默认: ${SERVER_NAME}): " input_name
-    read -p "请输入每月流量限制 (GB, 默认: ${LIMIT_GB}): " input_limit
-    read -p "请输入预警阈值百分比 (如 90, 默认: ${ALERT_PCT}): " input_alert
-    read -p "请输入自动关机阈值百分比 (如 95, 默认: ${SHUTDOWN_PCT}): " input_shutdown
-    read -p "请输入监控网卡 (默认: ${INTERFACE}): " input_iface
+    read -p "请输入服务器名称 (默认: ${SERVER_NAME:-VPS-Server}): " input_name
+    read -p "请输入每月流量限制 (GB, 默认: ${LIMIT_GB:-1000}): " input_limit
+    read -p "请输入预警阈值百分比 (如 90, 默认: ${ALERT_PCT:-90}): " input_alert
+    read -p "请输入自动关机阈值百分比 (如 95, 默认: ${SHUTDOWN_PCT:-95}): " input_shutdown
+    read -p "请输入监控网卡 (默认: ${INTERFACE:-all}): " input_iface
     read -p "请输入结算时区 (1: 北京时间 UTC+8, 2: 零时区 UTC, 默认 1): " input_tz
 
     local new_bot="${input_bot:-$BOT_TOKEN}"
@@ -257,7 +250,7 @@ do_config() {
     local new_tz="Asia/Shanghai"
     if [ "$input_tz" = "2" ]; then
         new_tz="UTC"
-    elif [ -z "$input_tz" ] && [ "$RESET_TZ" = "UTC" ]; then
+    elif [ -z "$input_tz" ] && [ "${RESET_TZ:-}" = "UTC" ]; then
         new_tz="UTC"
     fi
 
@@ -293,7 +286,7 @@ do_status() {
     formatted_used=$(format_bytes "$bytes")
 
     local tz_disp="UTC+8 (北京时间)"
-    if [ "$RESET_TZ" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
+    if [ "${RESET_TZ:-}" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
 
     echo "=========================================="
     echo "• 服务器名称: $SERVER_NAME"
@@ -311,7 +304,8 @@ do_check_threshold() {
     fi
     load_config
 
-    if [ "$LIMIT_GB" -le 0 ] 2>/dev/null; then
+    local limit_gb="${LIMIT_GB:-1000}"
+    if [ "$limit_gb" -le 0 ] 2>/dev/null; then
         echo "ℹ️ 流量上限设置为 0（无限制），忽略阈值检测。"
         return 0
     fi
@@ -320,7 +314,7 @@ do_check_threshold() {
     total_bytes=$(get_traffic_bytes "$INTERFACE")
 
     local pct
-    pct=$(awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
+    pct=$(awk -v bytes="$total_bytes" -v limit_gb="$limit_gb" 'BEGIN {
         if (limit_gb > 0) {
             p = (bytes / (limit_gb * 1073741824)) * 100;
             printf "%.2f", p;
@@ -329,14 +323,17 @@ do_check_threshold() {
         }
     }')
 
+    local alert_pct="${ALERT_PCT:-90}"
+    local shutdown_pct="${SHUTDOWN_PCT:-95}"
+
     local is_alert=0
     local is_shutdown=0
 
     # 精准浮点数阈值判定
-    if awk -v p="$pct" -v s="$SHUTDOWN_PCT" 'BEGIN { exit !(s > 0 && p >= s) }'; then
+    if awk -v p="$pct" -v s="$shutdown_pct" 'BEGIN { exit !(s > 0 && p >= s) }'; then
         is_shutdown=1
         is_alert=1
-    elif awk -v p="$pct" -v a="$ALERT_PCT" 'BEGIN { exit !(a > 0 && p >= a) }'; then
+    elif awk -v p="$pct" -v a="$alert_pct" 'BEGIN { exit !(a > 0 && p >= a) }'; then
         is_alert=1
     fi
 
@@ -354,15 +351,15 @@ do_check_threshold() {
             formatted_used=$(format_bytes "$total_bytes")
 
             local msg="🛑 <b>[流量严重超限 - 自动关机通知]</b>
-• 服务器: <code>${safe_server_name}</code>
-• 监控网卡: <code>${safe_interface}</code>
-• 当月汇总用量: <code>${formatted_used}</code> / <code>${LIMIT_GB} GB</code> (${pct}%)
-• 关机阈值: <code>${SHUTDOWN_PCT}%</code>
+- 服务器: <code>${safe_server_name}</code>
+- 监控网卡: <code>${safe_interface}</code>
+- 当月汇总用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 关机阈值: <code>${shutdown_pct}%</code>
 ⚠️ 流量已达到关机阈值，服务器将在 5 秒后自动关机！"
 
             send_telegram "$msg"
             touch "$flag_shutdown"
-            echo "🛑 流量超限 (${pct}% >= ${SHUTDOWN_PCT}%)，已发送 TG 通知，5秒后自动关机！"
+            echo "🛑 流量超限 (${pct}% >= ${shutdown_pct}%)，已发送 TG 通知，5秒后自动关机！"
             sleep 5
             systemctl poweroff || shutdown -h now
             return 0
@@ -377,22 +374,22 @@ do_check_threshold() {
             formatted_used=$(format_bytes "$total_bytes")
 
             local msg="🚨 <b>[流量用量预警]</b>
-• 服务器: <code>${safe_server_name}</code>
-• 监控网卡: <code>${safe_interface}</code>
-• 当月汇总用量: <code>${formatted_used}</code> / <code>${LIMIT_GB} GB</code> (${pct}%)
-• 预警阈值: <code>${ALERT_PCT}%</code>
-• 关机阈值: <code>${SHUTDOWN_PCT}%</code>
+- 服务器: <code>${safe_server_name}</code>
+- 监控网卡: <code>${safe_interface}</code>
+- 当月汇总用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 预警阈值: <code>${alert_pct}%</code>
+- 关机阈值: <code>${shutdown_pct}%</code>
 ⚠️ 已达到设定的流量预警阈值，请注意控制用量！"
 
             send_telegram "$msg"
             touch "$flag_alert"
-            echo "⚠️ 已达到预警阈值 (当前 ${pct}% >= 设定 ${ALERT_PCT}%)，预警消息已发送！"
+            echo "⚠️ 已达到预警阈值 (当前 ${pct}% >= 设定 ${alert_pct}%)，预警消息已发送！"
         else
             echo "ℹ️ 已处于预警状态 (当前 ${pct}%)，不再重复提醒。"
         fi
     else
         rm -f "$flag_alert" 2>/dev/null
-        echo "✅ 流量正常（当前汇总已用 ${pct}%，未达到预警阈值 ${ALERT_PCT}%）。"
+        echo "✅ 流量正常（当前汇总已用 ${pct}%，未达到预警阈值 ${alert_pct}%）。"
     fi
 }
 
@@ -405,16 +402,17 @@ do_daily_report() {
     load_config
 
     local tz_disp="UTC+8 (北京时间)"
-    if [ "$RESET_TZ" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
+    if [ "${RESET_TZ:-}" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
 
     local total_bytes
     total_bytes=$(get_traffic_bytes "$INTERFACE")
     local formatted_used
     formatted_used=$(format_bytes "$total_bytes")
 
+    local limit_gb="${LIMIT_GB:-1000}"
     local pct="无限制"
-    if [ "$LIMIT_GB" -gt 0 ] 2>/dev/null; then
-        pct=$(awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
+    if [ "$limit_gb" -gt 0 ] 2>/dev/null; then
+        pct=$(awk -v bytes="$total_bytes" -v limit_gb="$limit_gb" 'BEGIN {
             if (limit_gb > 0) {
                 p = (bytes / (limit_gb * 1073741824)) * 100;
                 printf "%.2f%%", p;
@@ -433,11 +431,11 @@ do_daily_report() {
     current_time=$(TZ="Asia/Shanghai" date '+%Y-%m-%d %H:%M:%S')
 
     local msg="📊 <b>[每日流量日报]</b>
-• 服务器: <code>${safe_server_name}</code>
-• 监控网卡: <code>${safe_interface}</code>
-• 结算时区: <code>${tz_disp}</code>
-• 当月汇总用量: <code>${formatted_used}</code> / <code>${LIMIT_GB} GB</code> (已用 ${pct})
-• 统计时间: <code>${current_time} (北京时间)</code>"
+- 服务器: <code>${safe_server_name}</code>
+- 监控网卡: <code>${safe_interface}</code>
+- 结算时区: <code>${tz_disp}</code>
+- 当月汇总用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (已用 ${pct})
+- 统计时间: <code>${current_time} (北京时间)</code>"
 
     send_telegram "$msg"
     echo "✅ 每日流量推送指令已执行！"
