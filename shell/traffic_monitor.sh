@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent)
-# Repository Path: DarkerLab/tools/shell/traffic_monitor.sh
+# Telegram 流量监控与自动化预警助手 (traffic_monitor.sh)
+# Repository Path: DarkerLab/tools/main/shell/traffic_monitor.sh
 # ==============================================================================
 
 set -u
@@ -29,10 +29,10 @@ check_dependencies() {
     local need_install=0
     local pkgs=""
 
-    command -v vnstat >/dev/null 2>&1 || { need_install=1; pkgs="$pkgs vnstat"; }
-    command -v jq >/dev/null 2>&1     || { need_install=1; pkgs="$pkgs jq"; }
-    command -v curl >/dev/null 2>&1   || { need_install=1; pkgs="$pkgs curl"; }
-    command -v awk >/dev/null 2>&1    || { need_install=1; pkgs="$pkgs gawk"; }
+    command -v vnstat >/dev/null 2>&1  || { need_install=1; pkgs="$pkgs vnstat"; }
+    command -v jq >/dev/null 2>&1      || { need_install=1; pkgs="$pkgs jq"; }
+    command -v curl >/dev/null 2>&1    || { need_install=1; pkgs="$pkgs curl"; }
+    command -v awk >/dev/null 2>&1     || { need_install=1; pkgs="$pkgs gawk"; }
     command -v crontab >/dev/null 2>&1 || { need_install=1; pkgs="$pkgs cron"; }
 
     if [ "$need_install" -eq 1 ]; then
@@ -129,6 +129,9 @@ get_traffic_bytes() {
     local cur_year cur_month
     cur_year=$(TZ="$query_tz" date '+%Y')
     cur_month=$(TZ="$query_tz" date '+%-m')
+
+    # 【无错刷盘处理】向 vnstatd 发送 SIGUSR1 信号通知其刷盘；防止 vnstat 2.x 不支持 -u 报错
+    killall -s SIGUSR1 vnstatd >/dev/null 2>&1 || pkill -SIGUSR1 vnstatd >/dev/null 2>&1 || true
 
     local json_data
     json_data=$(TZ="$query_tz" vnstat --json 2>/dev/null || true)
@@ -270,10 +273,10 @@ do_status() {
     if [ "${RESET_TZ:-}" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
 
     echo "=========================================="
-    echo "• 服务器名称: $SERVER_NAME"
-    echo "• 监控网卡: $INTERFACE"
-    echo "• 当月汇总使用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
-    echo "• 预警阈值: ${ALERT_PCT}% | 关机阈值: ${SHUTDOWN_PCT}%"
+    echo "- 服务器名称: $SERVER_NAME"
+    echo "- 监控网卡: $INTERFACE"
+    echo "- 当月汇总使用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
+    echo "- 预警阈值: ${ALERT_PCT}% | 关机阈值: ${SHUTDOWN_PCT}%"
     echo "=========================================="
 }
 
