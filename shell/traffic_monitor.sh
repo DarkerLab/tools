@@ -83,14 +83,15 @@ fmt_gib() {
 }
 
 # 字节数 -> 自适应单位（B/KB/MB/GB/TB）
+# 必须用 BEGIN 块且不读 stdin，否则在交互菜单中会阻塞在终端输入
 fmt_auto() {
-    awk -v b="${1:-0}" '{
-        if ($1 >= 1099511627776) printf "%.2f TB", $1/1099511627776;
-        else if ($1 >= 1073741824) printf "%.2f GB", $1/1073741824;
-        else if ($1 >= 1048576) printf "%.2f MB", $1/1048576;
-        else if ($1 >= 1024) printf "%.2f KB", $1/1024;
-        else printf "%d B", $1;
-    }'
+    awk -v b="${1:-0}" 'BEGIN {
+        if (b >= 1099511627776) printf "%.2f TB", b/1099511627776;
+        else if (b >= 1073741824) printf "%.2f GB", b/1073741824;
+        else if (b >= 1048576) printf "%.2f MB", b/1048576;
+        else if (b >= 1024) printf "%.2f KB", b/1024;
+        else printf "%d B", b;
+    }' </dev/null
 }
 
 # 交互式输入：ask_default <变量名> <提示语> <默认值>
