@@ -501,49 +501,50 @@ uninstall() {
 }
 
 # ------------------------------------------------------------------------------
-# 脚本入口分发
+# 脚本入口分发 (采用 if-elif 结构，结构简单稳定)
 # ------------------------------------------------------------------------------
 check_root
 
-case "${1:-}" in
-    --config)
+PARAM="${1:-}"
+
+if [ "$PARAM" = "--config" ]; then
+    do_config
+elif [ "$PARAM" = "--check-threshold" ]; then
+    do_check_threshold
+elif [ "$PARAM" = "--daily-report" ]; then
+    do_daily_report
+elif [ "$PARAM" = "--status" ]; then
+    do_status
+elif [ "$PARAM" = "--uninstall" ]; then
+    uninstall
+else
+    echo "=========================================="
+    echo "      Telegram 流量监控助手"
+    echo "=========================================="
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "1. 修改配置"
+    else
+        echo "1. 安装 / 初始化配置"
+    fi
+    echo "2. 测试发送每日流量推送"
+    echo "3. 测试运行阈值检测"
+    echo "4. 查看当前流量数据"
+    echo "5. 卸载监控程序"
+    echo "0. 退出"
+    echo "=========================================="
+    read -p "请输入数字 [0-5]: " choice
+
+    if [ "$choice" = "1" ]; then
         do_config
-        ;;
-    --check-threshold)
-        do_check_threshold
-        ;;
-    --daily-report)
+    elif [ "$choice" = "2" ]; then
         do_daily_report
-        ;;
-    --status)
+    elif [ "$choice" = "3" ]; then
+        do_check_threshold
+    elif [ "$choice" = "4" ]; then
         do_status
-        ;;
-    --uninstall)
+    elif [ "$choice" = "5" ]; then
         uninstall
-        ;;
-    *)
-        echo "=========================================="
-        echo "      Telegram 流量监控助手"
-        echo "=========================================="
-        if [ -f "$CONFIG_FILE" ]; then
-            echo "1. 修改配置"
-        else
-            echo "1. 安装 / 初始化配置"
-        fi
-        echo "2. 测试发送每日流量推送"
-        echo "3. 测试运行阈值检测"
-        echo "4. 查看当前流量数据"
-        echo "5. 卸载监控程序"
-        echo "0. 退出"
-        echo "=========================================="
-        read -p "请输入数字 [0-5]: " choice
-        case "${choice:-0}" in
-            1) do_config ;;
-            2) do_daily_report ;;
-            3) do_check_threshold ;;
-            4) do_status ;;
-            5) uninstall ;;
-            *) exit 0 ;;
-        esac
-        ;;
-esac
+    else
+        exit 0
+    fi
+fi
