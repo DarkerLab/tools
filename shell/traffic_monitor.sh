@@ -16,7 +16,7 @@ export TZ="Asia/Shanghai"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 # ------------------------------------------------------------------------------
-# 辅助函数：权限校验与依赖检查
+# 辅助函数：权限校验与依赖管理（强制升级到最新 vnstat）
 # ------------------------------------------------------------------------------
 check_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -26,17 +26,16 @@ check_root() {
 }
 
 check_dependencies() {
-    local need_install=0
+    local need_pkg=0
     local pkgs=""
 
-    command -v vnstat >/dev/null 2>&1  || { need_install=1; pkgs="$pkgs vnstat"; }
-    command -v jq >/dev/null 2>&1      || { need_install=1; pkgs="$pkgs jq"; }
-    command -v curl >/dev/null 2>&1    || { need_install=1; pkgs="$pkgs curl"; }
-    command -v awk >/dev/null 2>&1     || { need_install=1; pkgs="$pkgs gawk"; }
-    command -v crontab >/dev/null 2>&1 || { need_install=1; pkgs="$pkgs cron"; }
+    command -v jq >/dev/null 2>&1      || { need_pkg=1; pkgs="$pkgs jq"; }
+    command -v curl >/dev/null 2>&1    || { need_pkg=1; pkgs="$pkgs curl"; }
+    command -v awk >/dev/null 2>&1     || { need_pkg=1; pkgs="$pkgs gawk"; }
+    command -v crontab >/dev/null 2>&1 || { need_pkg=1; pkgs="$pkgs cron"; }
 
-    if [ "$need_install" -eq 1 ]; then
-        echo "📦 正在自动安装依赖组件:$pkgs ..."
+    if [ "$need_pkg" -eq 1 ]; then
+        echo "📦 正在自动安装基础依赖:$pkgs ..."
         if command -v apt-get >/dev/null 2>&1; then
             apt-get update -y >/dev/null 2>&1
             apt-get install -y $pkgs >/dev/null 2>&1
@@ -46,6 +45,34 @@ check_dependencies() {
         elif command -v yum >/dev/null 2>&1; then
             yum install -y epel-release >/dev/null 2>&1 || true
             yum install -y $pkgs >/dev/null 2>&1
+        fi
+    fi
+
+    # 检查并强制确保安装 vnstat 2.x
+    local install_vnstat=0
+    if command -v vnstat >/dev/null 2>&1; then
+        local vn_ver
+        vn_ver=$(vnstat --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 || echo "0.0")
+        local main_ver="${vn_ver%%.*}"
+        if [ "$main_ver" -lt 2 ]; then
+            echo "⚠️ 检测到旧版 vnstat ($vn_ver)，准备更新至最新版 2.x..."
+            install_vnstat=1
+        fi
+    else
+        install_vnstat=1
+    fi
+
+    if [ "$install_vnstat" -eq 1 ]; then
+        echo "📦 正在安装最新版 vnstat 2.x ..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y vnstat >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y epel-release >/dev/null 2>&1 || true
+            dnf install -y vnstat >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y epel-release >/dev/null 2>&1 || true
+            yum install -y vnstat >/dev/null 2>&1
         fi
     fi
 
@@ -77,7 +104,7 @@ load_config() {
 }
 
 # ------------------------------------------------------------------------------
-# 核心网络/流量统计逻辑
+# 核心网络/流量统计逻辑（纯基于最新 vnstat 2.x 标准结构）
 # ------------------------------------------------------------------------------
 escape_html() {
     local str="${1:-}"
@@ -128,7 +155,7 @@ get_traffic_bytes() {
     local query_tz="${RESET_TZ:-Asia/Shanghai}"
     local reset_day="${RESET_DAY:-1}"
 
-    # 强制让 vnstat 刷新持久化
+    # 简单调用 Add 建立记录（已包含数据自动同步机制）
     vnstat --add >/dev/null 2>&1 || true
 
     local json_data
@@ -144,47 +171,58 @@ get_traffic_bytes() {
     cur_m=$(TZ="$query_tz" date '+%-m')
     cur_d=$(TZ="$query_tz" date '+%-d')
 
-    # 计算计费周期的起始日期 (start_date) 和结束日期 (end_date)
-    local start_date end_date
+    # 计算计费周期的起始数值 YYYYMMDD 和结束数值 YYYYMMDD
+    local start_num end_num
+    end_num=$(( cur_y * 10000 + cur_m * 100 + cur_d ))
+
     if [ "$reset_day" -eq 1 ]; then
-        # 自然月模式：从本月1号起
-        start_date=$(printf "%04d%02d01" "$cur_y" "$cur_m")
-        end_date=$(TZ="$query_tz" date '+%Y%m%d')
+        start_num=$(( cur_y * 10000 + cur_m * 100 + 1 ))
     else
         if [ "$cur_d" -ge "$reset_day" ]; then
-            # 当前日期 >= 重置日：起始为本月重置日
-            start_date=$(printf "%04d%02d%02d" "$cur_y" "$cur_m" "$reset_day")
-            end_date=$(TZ="$query_tz" date '+%Y%m%d')
+            start_num=$(( cur_y * 10000 + cur_m * 100 + reset_day ))
         else
-            # 当前日期 < 重置日：起始为上个月重置日
             local prev_y prev_m
             prev_y=$(TZ="$query_tz" date -d "1 month ago" '+%Y')
             prev_m=$(TZ="$query_tz" date -d "1 month ago" '+%-m')
-            start_date=$(printf "%04d%02d%02d" "$prev_y" "$prev_m" "$reset_day")
-            end_date=$(TZ="$query_tz" date '+%Y%m%d')
+            start_num=$(( prev_y * 10000 + prev_m * 100 + reset_day ))
         fi
     fi
 
-    # 按天汇总符合重置日区间的 RX + TX 流量总和
+    # 直接使用最新 vnstat 2.x 的 .traffic.day 标准数字字段算总和
     local total_bytes
-    total_bytes=$(echo "$json_data" | jq -r --argstart "$start_date" --argend "$end_date" --arg target "$target_ifaces" '
+    total_bytes=$(echo "$json_data" | jq -r \
+        --argjson start "$start_num" \
+        --argjson end "$end_num" \
+        --arg target "$target_ifaces" '
         [
             .interfaces[]?
-            | select($target == "all" or .id == $target or .name == $target)
-            | (
-                (.traffic.day[]? | select(
-                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) >= $start
-                    and
-                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) <= $end
-                ) | (.rx + .tx)),
-                (.traffic.days[]? | select(
-                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) >= $start
-                    and
-                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) <= $end
-                ) | (.rx + .tx))
+            | select($target == "all" or .id == $target or .name ==$target)
+            | .traffic.day[]?
+            | select(
+                ((.date.year * 10000) + (.date.month * 100) + .date.day) >= $start and
+                ((.date.year * 10000) + (.date.month * 100) + .date.day) <= $end
               )
-        ] | map(select(. != null)) | add // 0
+            | (.rx + .tx)
+        ] | add // 0
     ' 2>/dev/null)
+
+    # 极简兜底：如果是 1 号且刚安装按天无数据，直接读取当月汇总
+    if [ -z "$total_bytes" ] \vert{}\vert{} [ "$total_bytes" -eq 0 ]; then
+        if [ "$reset_day" -eq 1 ]; then
+            total_bytes=$(echo "$json_data" | jq -r \
+                --argjson y "$cur_y" \
+                --argjson m "$cur_m" \
+                --arg target "$target_ifaces" '
+                [
+                    .interfaces[]?
+                    | select($target == "all" or .id == $target or .name ==$target)
+                    | .traffic.month[]?
+                    | select(.date.year == $y and .date.month ==$m)
+                    | (.rx + .tx)
+                ] | add // 0
+            ' 2>/dev/null)
+        fi
+    fi
 
     [[ "$total_bytes" =~ ^[0-9]+$ ]] || total_bytes=0
     echo "$total_bytes"
@@ -215,7 +253,7 @@ setup_cron() {
     local tmp_cron
     tmp_cron=$(mktemp)
     
-    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | grep -v "/usr/bin/traffic" > "$tmp_cron" || true
+    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" \vert{} grep -v "/usr/bin/traffic" > "$tmp_cron" || true
 
     if ! grep -q "PATH=" "$tmp_cron"; then
         sed -i '1i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$tmp_cron"
@@ -251,7 +289,7 @@ do_config() {
 
     echo "------------------------------------------"
     echo "🔍 检测到系统可用网卡为: ${detected_ifaces:-未检测到}"
-    read -p "请输入监控网卡 [若检测正确可填 all，或输入具体网卡如 eth0/ens3, 默认: all]: " input_iface
+    read -p "请输入监控网卡 [若检测正确可填 all，或输入具体网卡如 ens3, 默认: all]: " input_iface
     echo "------------------------------------------"
 
     read -p "请输入每月流量重置日期 (1-28 日, 默认: ${RESET_DAY:-1}): " input_reset_day
@@ -313,7 +351,7 @@ do_status() {
     echo "- 监控网卡: $INTERFACE"
     echo "- 每月重置日: 每月 ${RESET_DAY:-1} 号"
     echo "- 当前周期用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
-    echo "- 预警阈值: ${ALERT_PCT}% | 关机阈值: ${SHUTDOWN_PCT}%"
+    echo "- 预警阈值: ${ALERT_PCT}\% \vert{} 关机阈值: ${SHUTDOWN_PCT}%"
     echo "=========================================="
 }
 
@@ -380,144 +418,9 @@ do_check_threshold() {
 
             send_telegram "$msg"
             touch "$flag_shutdown"
-            echo "🛑 流量超限 (${pct}% >= ${shutdown_pct}%)，已发送 TG 通知，5秒后自动关机！"
+            echo "🛑 流量超限 (${pct}\% >=${shutdown_pct}%)，已发送 TG 通知，5秒后自动关机！"
             sleep 5
             systemctl poweroff || shutdown -h now
             return 0
         fi
     else
-        rm -f "$flag_shutdown" 2>/dev/null
-    fi
-
-    if [ "$is_alert" -eq 1 ]; then
-        if [ ! -f "$flag_alert" ]; then
-            local formatted_used
-            formatted_used=$(format_bytes "$total_bytes")
-
-            local msg="🚨 <b>[流量用量预警]</b>
-- 服务器: <code>${safe_server_name}</code>
-- 监控网卡: <code>${safe_interface}</code>
-- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
-- 重置日: 每月 <code>${RESET_DAY:-1}</code> 号
-- 预警阈值: <code>${alert_pct}%</code>
-- 关机阈值: <code>${shutdown_pct}%</code>
-⚠️ 已达到设定的流量预警阈值，请注意控制用量！"
-
-            send_telegram "$msg"
-            touch "$flag_alert"
-            echo "⚠️ 已达到预警阈值 (当前 ${pct}% >= 设定 ${alert_pct}%)，预警消息已发送！"
-        else
-            echo "ℹ️ 已处于预警状态 (当前 ${pct}%)，不再重复提醒。"
-        fi
-    else
-        rm -f "$flag_alert" 2>/dev/null
-        echo "✅ 流量正常（当前汇总已用 ${pct}%，未达到预警阈值 ${alert_pct}%）。"
-    fi
-}
-
-do_daily_report() {
-    check_dependencies
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "❌ 未找到配置文件，请先运行选项 1 进行配置。"
-        return 1
-    fi
-    load_config
-
-    local tz_disp="UTC+8 (北京时间)"
-    if [ "${RESET_TZ:-}" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
-
-    local total_bytes
-    total_bytes=$(get_traffic_bytes "$INTERFACE")
-    local formatted_used
-    formatted_used=$(format_bytes "$total_bytes")
-
-    local limit_gb="${LIMIT_GB:-1000}"
-    local pct="无限制"
-    if [ "$limit_gb" -gt 0 ] 2>/dev/null; then
-        pct=$(awk -v bytes="$total_bytes" -v limit_gb="$limit_gb" 'BEGIN {
-            if (limit_gb > 0) {
-                p = (bytes / (limit_gb * 1073741824)) * 100;
-                printf "%.2f%%", p;
-            } else {
-                printf "0.00%%";
-            }
-        }')
-    fi
-
-    local safe_server_name
-    safe_server_name=$(escape_html "$SERVER_NAME")
-    local safe_interface
-    safe_interface=$(escape_html "$INTERFACE")
-
-    local current_time
-    current_time=$(TZ="Asia/Shanghai" date '+%Y-%m-%d %H:%M:%S')
-
-    local msg="📊 <b>[每日流量日报]</b>
-- 服务器: <code>${safe_server_name}</code>
-- 监控网卡: <code>${safe_interface}</code>
-- 重置日期: 每月 <code>${RESET_DAY:-1}</code> 号
-- 结算时区: <code>${tz_disp}</code>
-- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (已用 ${pct})
-- 统计时间: <code>${current_time} (北京时间)</code>"
-
-    send_telegram "$msg"
-    echo "✅ 每日流量推送指令已执行！"
-}
-
-uninstall() {
-    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | grep -v "/usr/bin/traffic" | crontab - 2>/dev/null || true
-    rm -f "$CONFIG_FILE"
-    rm -f "$SCRIPT_PATH"
-    rm -f "$ALIAS_PATH"
-    rm -f "/usr/bin/traffic"
-    rm -f /tmp/traffic_*_sent_multi 2>/dev/null
-    echo "✅ 已彻底卸载监控程序、删除配置文件、快捷命令及 Cron 定时任务。"
-}
-
-# ------------------------------------------------------------------------------
-# 脚本入口分发
-# ------------------------------------------------------------------------------
-check_root
-
-case "${1:-}" in
-    --config)
-        do_config
-        ;;
-    --check-threshold)
-        do_check_threshold
-        ;;
-    --daily-report)
-        do_daily_report
-        ;;
-    --status)
-        do_status
-        ;;
-    --uninstall)
-        uninstall
-        ;;
-    *)
-        echo "=========================================="
-        echo "      Telegram 流量监控助手"
-        echo "=========================================="
-        if [ -f "$CONFIG_FILE" ]; then
-            echo "1. 修改配置"
-        else
-            echo "1. 安装 / 初始化配置"
-        fi
-        echo "2. 测试发送每日流量推送"
-        echo "3. 测试运行阈值检测"
-        echo "4. 查看当前流量数据"
-        echo "5. 卸载监控程序"
-        echo "0. 退出"
-        echo "=========================================="
-        read -p "请输入数字 [0-5]: " choice
-        case "${choice:-0}" in
-            1) do_config ;;
-            2) do_daily_report ;;
-            3) do_check_threshold ;;
-            4) do_status ;;
-            5) uninstall ;;
-            *) exit 0 ;;
-        esac
-        ;;
-esac
