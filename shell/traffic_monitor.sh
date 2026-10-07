@@ -177,13 +177,40 @@ get_smart_interfaces() {
 }
 
 ###############################################################################
-# vnstat 准备：每日数据保留、守护进程、网卡加入
+# vnstat 时间基准：让数据桶的切分时区与结算时区一致
+#   UTC 系结算时区 -> UseUTC 1（守护进程按 UTC 切桶）
+#   北京系结算时区 -> UseUTC 0（按系统本地时间，要求系统时区为北京）
+#   其他 IANA 时区 UseUTC 无法表达，保持原样（建议结算时区只用 UTC/上海）
+###############################################################################
+set_vnstat_timebase() {
+    [[ -f "$VNSTAT_CONF" ]] || return 0
+
+    local val=""
+    case "$TZ_NAME" in
+        UTC|Etc/UTC|Universal|Zulu|GMT|Etc/GMT)
+            val="1" ;;
+        Asia/Shanghai|Asia/Hong_Kong|Asia/Macau|Asia/Taipei)
+            val="0" ;;
+        *)
+            return 0 ;;
+    esac
+
+    if grep -qE '^[[:space:]]*#?[[:space:]]*UseUTC[[:space:]]+[01]' "$VNSTAT_CONF"; then
+        sed -i -E "s/^[[:space:]]*#?[[:space:]]*UseUTC[[:space:]]+[01][[:space:]]*$/UseUTC ${val}/" "$VNSTAT_CONF"
+    else
+        printf '\nUseUTC %s\n' "$val" >> "$VNSTAT_CONF"
+    fi
+}
+
+###############################################################################
+# vnstat 准备：时间基准、每日数据保留、守护进程、网卡加入
 ###############################################################################
 prepare_vnstat() {
     local target="$1"
 
-    # 1) 保证每日数据保留足够长（默认仅 30 天，最长周期可能 31 天）
+    # 1) 时间基准 + 每日数据保留（默认仅 30 天，最长周期可能 31 天）
     if [[ -f "$VNSTAT_CONF" ]]; then
+        set_vnstat_timebase
         if grep -qE '^[[:space:]]*#?[[:space:]]*DailyDays[[:space:]]+[0-9]+' "$VNSTAT_CONF"; then
             sed -i -E "s/^[[:space:]]*#?[[:space:]]*DailyDays[[:space:]]+[0-9]+[[:space:]]*$/DailyDays ${DAILY_DAYS_KEEP}/" "$VNSTAT_CONF"
         else
@@ -338,21 +365,21 @@ check_tz_integrity() {
 get_push_cron_hm() {
     case "$TZ_NAME" in
         UTC|Etc/UTC|Universal|Zulu|GMT|Etc/GMT)
-            printf '0 0'      # 北京 08:00 = UTC 00:00
+            printf '00 00'      # 北京 08:00 = UTC 00:00
             return ;;
         Asia/Shanghai|Asia/Hong_Kong|Asia/Macau|Asia/Taipei)
-            printf '0 8'
+            printf '00 08'
             return ;;
         Asia/Tokyo|Asia/Seoul)
-            printf '0 9'
+            printf '00 09'
             return ;;
     esac
 
     local eff bj_epoch h m
     eff="$(effective_tz "$TZ_NAME")"
     bj_epoch="$(TZ="$PUSH_TZ" date -d "today ${PUSH_HOUR}:${PUSH_MIN}" +%s)"
-    h="$(TZ="$eff" date -d "@$bj_epoch" +%-H)"
-    m="$(TZ="$eff" date -d "@$bj_epoch" +%-M)"
+    h="$(TZ="$eff" date -d "@$bj_epoch" +%H)"
+    m="$(TZ="$eff" date -d "@$bj_epoch" +%M)"
     printf '%s %s' "$m" "$h"
 }
 
@@ -854,6 +881,11 @@ CHECK_INTERVAL="${cint}"
 EOF
     chmod 0600 "$CONFIG_FILE"
     log "配置已写入 ${CONFIG_FILE}（权限 0600）。"
+
+    # 重新加载刚写入的配置，确保后续安装步骤使用最新值
+    # （向导收集的是局部变量，cron_install 等依赖规范变量名）
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
 
     # vnstat 准备、自安装、Cron
     prepare_vnstat "$iface"
