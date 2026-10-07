@@ -485,8 +485,8 @@ do_daily_report() {
     local current_time
     current_time=$(TZ="Asia/Shanghai" date '+%Y-%m-%d %H:%M:%S')
 
-    local msg="📊 <b>[每日流量日报]</b>
-- 服务器: #${safe_server_name}
+    local msg="📊 [#${safe_server_name}]每日流量日报
+- 服务器: 
 - 监控网卡: <code>${safe_interface}</code>
 - 重置日期: 每月 <code>${RESET_DAY:-1}</code> 号
 - 结算时区: <code>${tz_disp}</code>
