@@ -73,6 +73,7 @@ load_config() {
     SHUTDOWN_PCT="${SHUTDOWN_PCT:-95}"
     INTERFACE="${INTERFACE:-all}"
     RESET_TZ="${RESET_TZ:-Asia/Shanghai}"
+    RESET_DAY="${RESET_DAY:-1}"
 }
 
 # ------------------------------------------------------------------------------
@@ -125,13 +126,10 @@ get_active_interfaces() {
 get_traffic_bytes() {
     local target_ifaces="${1:-all}"
     local query_tz="${RESET_TZ:-Asia/Shanghai}"
-    
-    local cur_year cur_month
-    cur_year=$(TZ="$query_tz" date '+%Y')
-    cur_month=$(TZ="$query_tz" date '+%-m')
+    local reset_day="${RESET_DAY:-1}"
 
-    # 【无错刷盘处理】向 vnstatd 发送 SIGUSR1 信号通知其刷盘；防止 vnstat 2.x 不支持 -u 报错
-    killall -s SIGUSR1 vnstatd >/dev/null 2>&1 || pkill -SIGUSR1 vnstatd >/dev/null 2>&1 || true
+    # 强制让 vnstat 刷新持久化
+    vnstat --add >/dev/null 2>&1 || true
 
     local json_data
     json_data=$(TZ="$query_tz" vnstat --json 2>/dev/null || true)
@@ -141,16 +139,51 @@ get_traffic_bytes() {
         return
     fi
 
+    local cur_y cur_m cur_d
+    cur_y=$(TZ="$query_tz" date '+%Y')
+    cur_m=$(TZ="$query_tz" date '+%-m')
+    cur_d=$(TZ="$query_tz" date '+%-d')
+
+    # 计算计费周期的起始日期 (start_date) 和结束日期 (end_date)
+    local start_date end_date
+    if [ "$reset_day" -eq 1 ]; then
+        # 自然月模式：从本月1号起
+        start_date=$(printf "%04d%02d01" "$cur_y" "$cur_m")
+        end_date=$(TZ="$query_tz" date '+%Y%m%d')
+    else
+        if [ "$cur_d" -ge "$reset_day" ]; then
+            # 当前日期 >= 重置日：起始为本月重置日
+            start_date=$(printf "%04d%02d%02d" "$cur_y" "$cur_m" "$reset_day")
+            end_date=$(TZ="$query_tz" date '+%Y%m%d')
+        else
+            # 当前日期 < 重置日：起始为上个月重置日
+            local prev_y prev_m
+            prev_y=$(TZ="$query_tz" date -d "1 month ago" '+%Y')
+            prev_m=$(TZ="$query_tz" date -d "1 month ago" '+%-m')
+            start_date=$(printf "%04d%02d%02d" "$prev_y" "$prev_m" "$reset_day")
+            end_date=$(TZ="$query_tz" date '+%Y%m%d')
+        fi
+    fi
+
+    # 按天汇总符合重置日区间的 RX + TX 流量总和
     local total_bytes
-    total_bytes=$(echo "$json_data" | jq -r --argjson y "$cur_year" --argjson m "$cur_month" --arg target "$target_ifaces" '
+    total_bytes=$(echo "$json_data" | jq -r --argstart "$start_date" --argend "$end_date" --arg target "$target_ifaces" '
         [
             .interfaces[]?
             | select($target == "all" or .id == $target or .name == $target)
             | (
-                (.traffic.month[]? | select(.date.year == $y and .date.month == $m) | (.rx + .tx)),
-                (.traffic.months[]? | select(.date.year == $y and .date.month == $m) | (.rx + .tx))
+                (.traffic.day[]? | select(
+                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) >= $start
+                    and
+                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) <= $end
+                ) | (.rx + .tx)),
+                (.traffic.days[]? | select(
+                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) >= $start
+                    and
+                    ( (.date.year | tostring) + (if .date.month < 10 then "0" else "" end + (.date.month | tostring)) + (if .date.day < 10 then "0" else "" end + (.date.day | tostring)) ) <= $end
+                ) | (.rx + .tx))
               )
-        ] | add // 0
+        ] | map(select(. != null)) | add // 0
     ' 2>/dev/null)
 
     [[ "$total_bytes" =~ ^[0-9]+$ ]] || total_bytes=0
@@ -221,6 +254,7 @@ do_config() {
     read -p "请输入监控网卡 [若检测正确可填 all，或输入具体网卡如 eth0/ens3, 默认: all]: " input_iface
     echo "------------------------------------------"
 
+    read -p "请输入每月流量重置日期 (1-28 日, 默认: ${RESET_DAY:-1}): " input_reset_day
     read -p "请输入结算时区 (1: 北京时间 UTC+8, 2: 零时区 UTC, 默认 1): " input_tz
 
     local new_bot="${input_bot:-$BOT_TOKEN}"
@@ -230,6 +264,7 @@ do_config() {
     local new_alert="${input_alert:-$ALERT_PCT}"
     local new_shutdown="${input_shutdown:-$SHUTDOWN_PCT}"
     local new_iface="${input_iface:-$INTERFACE}"
+    local new_reset_day="${input_reset_day:-$RESET_DAY}"
 
     local new_tz="Asia/Shanghai"
     if [ "$input_tz" = "2" ]; then
@@ -247,6 +282,7 @@ ALERT_PCT="${new_alert}"
 SHUTDOWN_PCT="${new_shutdown}"
 INTERFACE="${new_iface}"
 RESET_TZ="${new_tz}"
+RESET_DAY="${new_reset_day}"
 EOF
 
     setup_cron
@@ -275,7 +311,8 @@ do_status() {
     echo "=========================================="
     echo "- 服务器名称: $SERVER_NAME"
     echo "- 监控网卡: $INTERFACE"
-    echo "- 当月汇总使用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
+    echo "- 每月重置日: 每月 ${RESET_DAY:-1} 号"
+    echo "- 当前周期用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
     echo "- 预警阈值: ${ALERT_PCT}% | 关机阈值: ${SHUTDOWN_PCT}%"
     echo "=========================================="
 }
@@ -336,7 +373,8 @@ do_check_threshold() {
             local msg="🛑 <b>[流量严重超限 - 自动关机通知]</b>
 - 服务器: <code>${safe_server_name}</code>
 - 监控网卡: <code>${safe_interface}</code>
-- 当月汇总用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 重置日: 每月 <code>${RESET_DAY:-1}</code> 号
 - 关机阈值: <code>${shutdown_pct}%</code>
 ⚠️ 流量已达到关机阈值，服务器将在 5 秒后自动关机！"
 
@@ -359,7 +397,8 @@ do_check_threshold() {
             local msg="🚨 <b>[流量用量预警]</b>
 - 服务器: <code>${safe_server_name}</code>
 - 监控网卡: <code>${safe_interface}</code>
-- 当月汇总用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (${pct}%)
+- 重置日: 每月 <code>${RESET_DAY:-1}</code> 号
 - 预警阈值: <code>${alert_pct}%</code>
 - 关机阈值: <code>${shutdown_pct}%</code>
 ⚠️ 已达到设定的流量预警阈值，请注意控制用量！"
@@ -416,8 +455,9 @@ do_daily_report() {
     local msg="📊 <b>[每日流量日报]</b>
 - 服务器: <code>${safe_server_name}</code>
 - 监控网卡: <code>${safe_interface}</code>
+- 重置日期: 每月 <code>${RESET_DAY:-1}</code> 号
 - 结算时区: <code>${tz_disp}</code>
-- 当月汇总用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (已用 ${pct})
+- 当前周期用量: <code>${formatted_used}</code> / <code>${limit_gb} GB</code> (已用 ${pct})
 - 统计时间: <code>${current_time} (北京时间)</code>"
 
     send_telegram "$msg"
