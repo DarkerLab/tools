@@ -84,31 +84,57 @@ format_bytes() {
     }'
 }
 
+setup_cron() {
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
+    (
+        crontab -l 2>/dev/null
+        echo "0 8 * * * $SCRIPT_PATH --daily-report >/dev/null 2>&1"
+        echo "*/5 * * * * $SCRIPT_PATH --check-threshold >/dev/null 2>&1"
+    ) | crontab -
+}
+
 do_config() {
     check_dependencies
+    
+    # 如果已有配置文件，预读取当前配置值
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+
+    local cur_bot="${BOT_TOKEN:-}"
+    local cur_chat="${CHAT_ID:-}"
+    local cur_name="${SERVER_NAME:-$(hostname)}"
+    local cur_limit="${LIMIT_GB:-1000}"
+    local cur_alert="${ALERT_PCT:-90}"
+    local cur_shutdown="${SHUTDOWN_PCT:-95}"
+    local cur_iface="${INTERFACE:-all}"
+    local cur_tz="${RESET_TZ:-Asia/Shanghai}"
+
     echo "=========================================="
     echo "       ⚙️ 配置 Telegram 监控参数"
     echo "=========================================="
     
-    read -p "请输入 Telegram Bot Token: " input_bot
-    read -p "请输入 Telegram Chat ID: " input_chat
-    read -p "请输入服务器名称 (留空默认主机名): " input_name
-    read -p "请输入每月流量限制 (GB, 默认 1000): " input_limit
-    read -p "请输入预警阈值百分比 (如 90): " input_alert
-    read -p "请输入自动关机阈值百分比 (如 95): " input_shutdown
-    read -p "请输入监控网卡 (默认 all 或指定如 eth0): " input_iface
+    read -p "请输入 Telegram Bot Token [默认保留/修改]: " input_bot
+    read -p "请输入 Telegram Chat ID [默认保留/修改]: " input_chat
+    read -p "请输入服务器名称 (默认: $cur_name): " input_name
+    read -p "请输入每月流量限制 (GB, 默认: $cur_limit): " input_limit
+    read -p "请输入预警阈值百分比 (如 90, 默认: $cur_alert): " input_alert
+    read -p "请输入自动关机阈值百分比 (如 95, 默认: $cur_shutdown): " input_shutdown
+    read -p "请输入监控网卡 (默认: $cur_iface): " input_iface
     read -p "请输入结算时区 (1: 北京时间 UTC+8, 2: 零时区 UTC, 默认 1): " input_tz
 
-    bot_token=${input_bot:-""}
-    chat_id=${input_chat:-""}
-    server_name=${input_name:-$(hostname)}
-    limit_gb=${input_limit:-1000}
-    alert_pct=${input_alert:-90}
-    shutdown_pct=${input_shutdown:-95}
-    interface=${input_iface:-all}
+    bot_token=${input_bot:-$cur_bot}
+    chat_id=${input_chat:-$cur_chat}
+    server_name=${input_name:-$cur_name}
+    limit_gb=${input_limit:-$cur_limit}
+    alert_pct=${input_alert:-$cur_alert}
+    shutdown_pct=${input_shutdown:-$cur_shutdown}
+    interface=${input_iface:-$cur_iface}
     
     reset_tz="Asia/Shanghai"
     if [ "$input_tz" = "2" ]; then
+        reset_tz="UTC"
+    elif [ -z "$input_tz" ] && [ "$cur_tz" = "UTC" ]; then
         reset_tz="UTC"
     fi
 
@@ -123,7 +149,8 @@ INTERFACE="${interface}"
 RESET_TZ="${reset_tz}"
 EOF
 
-    echo "✅ 配置已成功保存到 $CONFIG_FILE ！"
+    setup_cron
+    echo "✅ 配置及定时任务已成功保存与更新！"
 }
 
 do_status() {
@@ -202,10 +229,10 @@ do_check_threshold() {
             formatted_used=$(format_bytes "$total_bytes")
             
             local msg="🛑 *[流量严重超限 - 自动关机通知]*
-• 服务器: \`${display_name}\`
-• 监控网卡: \`${INTERFACE}\`
-• 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
-• 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
+- 服务器: \`${display_name}\`
+- 监控网卡: \`${INTERFACE}\`
+- 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
+- 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
 ⚠️ 流量已达到关机阈值，服务器将在 5 秒后自动关机！"
             
             send_telegram "$msg"
@@ -225,11 +252,11 @@ do_check_threshold() {
             formatted_used=$(format_bytes "$total_bytes")
             
             local msg="🚨 *[流量用量预警]*
-• 服务器: \`${display_name}\`
-• 监控网卡: \`${INTERFACE}\`
-• 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
-• 预警阈值: \`${ALERT_PCT}${p_sign}\`
-• 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
+- 服务器: \`${display_name}\`
+- 监控网卡: \`${INTERFACE}\`
+- 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
+- 预警阈值: \`${ALERT_PCT}${p_sign}\`
+- 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
 ⚠️ 已达到设定的流量预警阈值，请注意控制用量！"
             
             send_telegram "$msg"
@@ -280,11 +307,11 @@ do_daily_report() {
     fi
 
     local msg="📊 *[每日流量日报]*
-• 服务器: \`${display_name}\`
-• 监控网卡: \`${INTERFACE}\`
-• 结算时区: \`${tz_disp}\`
-• 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (已用 ${pct})
-• 统计时间: \`$(date '+%Y-%m-%d %H:%M:%S') (北京时间)\`"
+- 服务器: \`${display_name}\`
+- 监控网卡: \`${INTERFACE}\`
+- 结算时区: \`${tz_disp}\`
+- 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (已用 ${pct})
+- 统计时间: \`$(date '+%Y-%m-%d %H:%M:%S') (北京时间)\`"
 
     send_telegram "$msg"
     echo "✅ 每日流量推送指令已执行！"
