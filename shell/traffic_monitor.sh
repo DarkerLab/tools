@@ -368,9 +368,9 @@ get_period_usage() {
     local __json="" __out=""
 
     if [[ "$__target" == "all" || "$__target" == "auto" ]]; then
-        __json="$(vnstat --json 2>/dev/null)" || __json=""
+        __json="$(timeout -s KILL 10 vnstat --json 2>/dev/null)" || __json=""
     else
-        __json="$(vnstat -i "$__target" --json 2>/dev/null)" || __json=""
+        __json="$(timeout -s KILL 10 vnstat -i "$__target" --json 2>/dev/null)" || __json=""
     fi
 
     if [[ -z "$__json" ]]; then
@@ -414,7 +414,7 @@ get_period_usage() {
           | ((.rx // 0) + (.tx // 0))
         ] | add // 0'
 
-    __out="$(printf '%s' "$__json" | jq -r \
+    __out="$(printf '%s' "$__json" | timeout 15 jq -r \
         --argjson s "$__start" \
         --argjson e "$__end" \
         "${__jargs[@]}" \
@@ -875,7 +875,7 @@ EOF
     fi
 
     echo "==========================================================="
-    echo "  部署完成！常用命令："
+    echo "  部署完成！直接输入 traffic 打开数字菜单，也可用以下命令："
     echo "    traffic --status    查看状态"
     echo "    traffic --report    立即发送日报"
     echo "    traffic --check     立即检查阈值"
@@ -894,7 +894,7 @@ cmd_status() {
     used="$(get_period_usage "$IFACE" "$START_NUM" "$END_NUM")"
     limit_bytes="$(get_limit_bytes)"
     pct="$(get_pct "$used" "$limit_bytes")"
-    vnstat_active="$(systemctl is-active vnstat.service 2>/dev/null || echo unknown)"
+    vnstat_active="$(timeout 8 systemctl is-active vnstat.service 2>/dev/null || echo unknown)"
     resolved="$(get_resolved_ifaces_text)"
     push_hm="$(get_push_cron_hm)"
 
@@ -934,6 +934,53 @@ cmd_status() {
         echo "  (未配置)"
     fi
     echo "==========================================================="
+}
+
+###############################################################################
+# 诊断：定位 vnstat / 数据库 / 守护进程问题
+###############################################################################
+cmd_diag() {
+    require_root
+    set_config_defaults
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG_FILE" || true
+    fi
+
+    echo "=== 1. 版本信息 ==="
+    vnstat --version 2>&1 | head -3
+    echo
+    echo "=== 2. 命令路径 ==="
+    for b in vnstat jq curl timeout; do
+        printf '%-8s: %s\n' "$b" "$(command -v "$b" 2>/dev/null || echo '未找到')"
+    done
+    echo
+    echo "=== 3. 数据库目录 /var/lib/vnstat ==="
+    ls -la /var/lib/vnstat/ 2>&1
+    echo
+    echo "=== 4. vnstat 服务状态 ==="
+    timeout 8 systemctl status vnstat.service --no-pager 2>&1 | head -15
+    echo
+    echo "=== 5. vnstat 相关进程 ==="
+    ps -ef | grep '[v]nstat' || echo "(无进程)"
+    echo
+    echo "=== 6. 系统网卡 ==="
+    ls /sys/class/net 2>&1
+    echo
+    echo "=== 7. 计时执行: vnstat -i ${IFACE} --json（10 秒超时）==="
+    local t0 t1 rc
+    t0="$(date +%s)"
+    timeout 10 vnstat -i "$IFACE" --json > /tmp/vnstat-diag.json 2>/tmp/vnstat-diag.err
+    rc="$?"
+    t1="$(date +%s)"
+    printf '返回码=%s，耗时=%s 秒\n' "$rc" "$((t1 - t0))"
+    echo "-- stderr --"
+    cat /tmp/vnstat-diag.err 2>/dev/null || true
+    echo "-- stdout 大小与前 800 字节 --"
+    wc -c /tmp/vnstat-diag.json 2>/dev/null
+    head -c 800 /tmp/vnstat-diag.json 2>/dev/null
+    echo
+    echo "=== 诊断完成 ==="
 }
 
 ###############################################################################
@@ -986,6 +1033,59 @@ cmd_uninstall() {
 }
 
 ###############################################################################
+# 交互式数字菜单（无参数启动，操作后返回菜单循环）
+###############################################################################
+interactive_menu() {
+    require_root
+
+    local choice="" name="" configured=""
+    while :; do
+        set_config_defaults
+        if [[ -f "$CONFIG_FILE" ]]; then
+            # shellcheck disable=SC1090
+            . "$CONFIG_FILE" 2>/dev/null || true
+            configured="已配置"
+        else
+            configured="未配置"
+        fi
+        name="$SERVER_NAME"
+
+        cat <<EOF
+
+==========================================================
+        Telegram 流量监控助手
+==========================================================
+  服务器名称 : ${name}
+  配置状态   : ${configured}
+----------------------------------------------------------
+  1. 安装 / 修改配置
+  2. 立即推送日报
+  3. 立即检查阈值
+  4. 查看运行状态
+  5. 故障诊断
+  6. 卸载程序
+  0. 退出
+==========================================================
+EOF
+        read -r -p "请输入选项 [0-6]: " choice || choice="0"
+
+        case "$choice" in
+            1) cmd_config ;;
+            2) cmd_report ;;
+            3) cmd_check ;;
+            4) cmd_status ;;
+            5) cmd_diag ;;
+            6) cmd_uninstall ;;
+            0) echo "已退出。"; exit 0 ;;
+            *) echo "无效选项: ${choice}，请重新输入。" ;;
+        esac
+
+        # 卸载会 exec/退出；其余操作结束后暂停再返回菜单
+        read -r -p "按回车键返回菜单..." choice || true
+    done
+}
+
+###############################################################################
 # 帮助
 ###############################################################################
 usage() {
@@ -1002,10 +1102,12 @@ Telegram 流量监控与自动化管理脚本（Debian 13 Trixie）
   <名称>   指定单网卡（如 eth0、ens3、ppp0）
 
 用法:
+  traffic                无参数启动数字交互菜单（1/2/3/4/5/6 选择）
   traffic --config       交互式配置向导（保留当前值，回车跳过）
   traffic --status       查看配置、周期用量、阈值与定时任务状态
   traffic --report       立即生成并发送一次 HTML 日报
   traffic --check        立即执行一次阈值检查（预警/关机）
+  traffic --diag         诊断 vnstat/数据库/守护进程（卡住时使用）
   traffic --cron-report  Cron 调用：日报（输出写日志）
   traffic --cron-check   Cron 调用：阈值检查（输出写日志）
   traffic --uninstall    一键卸载清理
@@ -1017,7 +1119,10 @@ EOF
 # 入口
 ###############################################################################
 case "${1:-}" in
-    ""|-h|--help)
+    "")
+        interactive_menu
+        ;;
+    -h|--help)
         usage
         ;;
     --config)
@@ -1034,6 +1139,9 @@ case "${1:-}" in
     --check)
         require_root
         cmd_check
+        ;;
+    --diag)
+        cmd_diag
         ;;
     --cron-report)
         require_root
