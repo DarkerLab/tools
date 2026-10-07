@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent)
-# 支持：vnStat 1.x/2.x JSON 解析、物理网卡自动精准识别、 Telegram 消息安全转义、自动预警关机
 # ==============================================================================
 
 set -u  # 开启未定义变量校验
@@ -56,9 +55,7 @@ check_dependencies() {
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         while IFS='=' read -r key value; do
-            # 过滤注释与非合法变量赋值
             if [[ "$key" =~ ^[A-Z_]+$ ]]; then
-                # 去除包含的双引号
                 value="${value%\"}"
                 value="${value#\"}"
                 export "$key=$value" 2>/dev/null || true
@@ -79,7 +76,6 @@ load_config() {
 # ------------------------------------------------------------------------------
 # 核心网络/流量统计逻辑
 # ------------------------------------------------------------------------------
-# 安全转义 HTML 特殊字符，防 TG 发送失败
 escape_html() {
     local str="$1"
     str="${str//&/&amp;}"
@@ -99,7 +95,6 @@ send_telegram() {
     fi
 }
 
-# 精准筛选真实有效网卡（过滤容器/虚拟/环回网卡）
 get_active_interfaces() {
     local ifaces=()
     for sys_path in /sys/class/net/*; do
@@ -107,12 +102,10 @@ get_active_interfaces() {
         local iface
         iface=$(basename "$sys_path")
 
-        # 排除环回网卡与已知虚拟前缀网卡
         if [[ "$iface" =~ ^(lo|docker|veth|br-|br0|tun|tap|tailscale|wg|cni|flannel|dummy|bond|kube) ]]; then
             continue
         fi
 
-        # 确保网卡在 Up 状态
         if [ -f "$sys_path/operstate" ]; then
             local state
             state=$(cat "$sys_path/operstate" 2>/dev/null || echo "unknown")
@@ -124,7 +117,6 @@ get_active_interfaces() {
         ifaces+=("$iface")
     done
 
-    # 若未识别到，降级回 ip route 默认网卡
     if [ ${#ifaces[@]} -eq 0 ]; then
         local default_if
         default_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
@@ -148,7 +140,6 @@ get_traffic_bytes() {
         active_ifaces="$target_ifaces"
     fi
 
-    # 计算当前年月份（基于设定结算时区）
     local current_year_month
     current_year_month=$(TZ="$query_tz" date '+%Y-%m')
 
@@ -159,7 +150,6 @@ get_traffic_bytes() {
         
         if [ -n "$json_data" ]; then
             local rx tx
-            # jq 强力解析：精准定位当年月记录，兼容 vnStat 1.x/2.x 复杂字段
             rx=$(echo "$json_data" | jq -r --arg ym "$current_year_month" '
                 try (
                     (.interfaces[0].traffic.month // .interfaces[0].traffic.months // [])
@@ -213,9 +203,9 @@ sync_script_self() {
         chmod +x "$SCRIPT_PATH"
     fi
 
-    if [ ! -L "$ALIAS_PATH" ] && [ ! -f "$ALIAS_PATH" ]; then
-        ln -sf "$SCRIPT_PATH" "$ALIAS_PATH" 2>/dev/null || true
-    fi
+    rm -f "$ALIAS_PATH" "/usr/bin/traffic" 2>/dev/null || true
+    ln -sf "$SCRIPT_PATH" "$ALIAS_PATH" 2>/dev/null || true
+    ln -sf "$SCRIPT_PATH" "/usr/bin/traffic" 2>/dev/null || true
 }
 
 setup_cron() {
@@ -223,10 +213,8 @@ setup_cron() {
     local tmp_cron
     tmp_cron=$(mktemp)
     
-    # 获取已有 crontab 并清除本脚本旧记录
-    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" > "$tmp_cron" || true
+    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | grep -v "/usr/bin/traffic" > "$tmp_cron" || true
 
-    # 注入 PATH 避免 Cron 执行缺乏系统环境变量问题
     if ! grep -q "PATH=" "$tmp_cron"; then
         sed -i '1i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$tmp_cron"
     fi
@@ -331,7 +319,6 @@ do_check_threshold() {
     local total_bytes
     total_bytes=$(get_traffic_bytes "$INTERFACE")
 
-    # 精准计算使用百分比
     local pct
     pct=$(awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
         if (limit_gb > 0) {
@@ -345,18 +332,11 @@ do_check_threshold() {
     local is_alert=0
     local is_shutdown=0
 
-    # 纯数值判断避免 awk eval 注入风险
-    awk -v p="$pct" -v a="$ALERT_PCT" -v s="$SHUTDOWN_PCT" 'BEGIN {
-        if (p >= s && s > 0) exit 2;
-        if (p >= a) exit 1;
-        exit 0;
-    }'
-    local res=$?
-
-    if [ "$res" -eq 2 ]; then
+    # 精准浮点数阈值判定
+    if awk -v p="$pct" -v s="$SHUTDOWN_PCT" 'BEGIN { exit !(s > 0 && p >= s) }'; then
         is_shutdown=1
         is_alert=1
-    elif [ "$res" -eq 1 ]; then
+    elif awk -v p="$pct" -v a="$ALERT_PCT" 'BEGIN { exit !(a > 0 && p >= a) }'; then
         is_alert=1
     fi
 
@@ -464,7 +444,7 @@ do_daily_report() {
 }
 
 uninstall() {
-    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | crontab - 2>/dev/null || true
+    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | grep -v "/usr/bin/traffic" | crontab - 2>/dev/null || true
     rm -f "$CONFIG_FILE"
     rm -f "$SCRIPT_PATH"
     rm -f "$ALIAS_PATH"
@@ -474,7 +454,7 @@ uninstall() {
 }
 
 # ------------------------------------------------------------------------------
-# 脚本入口分发
+# 脚本入口分发 (严格单映射，无重名分支)
 # ------------------------------------------------------------------------------
 check_root
 
@@ -512,7 +492,6 @@ case "${1:-}" in
             2) do_daily_report ;;
             3) do_check_threshold ;;
             4) do_status ;;
-            5) do_status ;;
             5) uninstall ;;
             *) exit 0 ;;
         esac
