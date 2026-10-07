@@ -158,7 +158,11 @@ do_check_threshold() {
         pct = (limit_gb > 0) ? (used_gb / limit_gb) * 100 : 0;
         is_alert = (pct >= alert_pct) ? 1 : 0;
         is_shutdown = (shutdown_pct > 0 && pct >= shutdown_pct) ? 1 : 0;
-        printf "pct=\"%.4f\"\nis_alert=%d\nis_shutdown=%d\n", pct, is_alert, is_shutdown;
+        if (pct < 0.01 && pct > 0) {
+            printf "pct=\"%.4f\"\nis_alert=%d\nis_shutdown=%d\n", pct, is_alert, is_shutdown;
+        } else {
+            printf "pct=\"%.2f\"\nis_alert=%d\nis_shutdown=%d\n", pct, is_alert, is_shutdown;
+        }
     }')
 
     local flag_alert="/tmp/traffic_alert_sent_multi"
@@ -237,7 +241,9 @@ do_daily_report() {
     if [ "$LIMIT_GB" -gt 0 ] 2>/dev/null; then
         pct=$(LC_ALL=C awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
             if (limit_gb > 0) {
-                printf "%.4f%%", (bytes / (limit_gb * 1073741824)) * 100;
+                p = (bytes / (limit_gb * 1073741824)) * 100;
+                if (p < 0.01 && p > 0) printf "%.4f%%", p;
+                else printf "%.2f%%", p;
             } else {
                 printf "0.00%%";
             }
