@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Telegram 流量监控与自动化预警助手 (Traffic Monitor Agent)
-# 支持：vnStat JSON 数据解析、多网卡汇总、自定义结算时区、自动阈值关机、每日推送
+# 支持：vnStat 1.x/2.x JSON 解析、物理网卡自动精准识别、 Telegram 消息安全转义、自动预警关机
 # ==============================================================================
 
-set -u  # 开启未定义变量校验（增强严谨性）
+set -u  # 开启未定义变量校验
 
 # ------------------------------------------------------------------------------
 # 基础配置与全局常量
@@ -55,9 +55,17 @@ check_dependencies() {
 
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
-        # 排除危险命令注入，仅安全加载赋值语句
-        eval "$(grep -E '^[A-Z_]+=' "$CONFIG_FILE" 2>/dev/null)"
+        while IFS='=' read -r key value; do
+            # 过滤注释与非合法变量赋值
+            if [[ "$key" =~ ^[A-Z_]+$ ]]; then
+                # 去除包含的双引号
+                value="${value%\"}"
+                value="${value#\"}"
+                export "$key=$value" 2>/dev/null || true
+            fi
+        done < <(grep -E '^[A-Z_]+=' "$CONFIG_FILE" 2>/dev/null)
     fi
+
     BOT_TOKEN="${BOT_TOKEN:-}"
     CHAT_ID="${CHAT_ID:-}"
     SERVER_NAME="${SERVER_NAME:-$(hostname 2>/dev/null || echo 'VPS-Server')}"
@@ -71,15 +79,61 @@ load_config() {
 # ------------------------------------------------------------------------------
 # 核心网络/流量统计逻辑
 # ------------------------------------------------------------------------------
+# 安全转义 HTML 特殊字符，防 TG 发送失败
+escape_html() {
+    local str="$1"
+    str="${str//&/&amp;}"
+    str="${str//</&lt;}"
+    str="${str//>/&gt;}"
+    echo "$str"
+}
+
 send_telegram() {
     local text="$1"
     load_config
     if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
-        curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        curl -s -m 10 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d "chat_id=${CHAT_ID}" \
-            -d "parse_mode=Markdown" \
-            --data-urlencode "text=${text}" > /dev/null 2>&1
+            -d "parse_mode=HTML" \
+            --data-urlencode "text=${text}" > /dev/null 2>&1 || true
     fi
+}
+
+# 精准筛选真实有效网卡（过滤容器/虚拟/环回网卡）
+get_active_interfaces() {
+    local ifaces=()
+    for sys_path in /sys/class/net/*; do
+        [ -e "$sys_path" ] || continue
+        local iface
+        iface=$(basename "$sys_path")
+
+        # 排除环回网卡与已知虚拟前缀网卡
+        if [[ "$iface" =~ ^(lo|docker|veth|br-|br0|tun|tap|tailscale|wg|cni|flannel|dummy|bond|kube) ]]; then
+            continue
+        fi
+
+        # 确保网卡在 Up 状态
+        if [ -f "$sys_path/operstate" ]; then
+            local state
+            state=$(cat "$sys_path/operstate" 2>/dev/null || echo "unknown")
+            if [ "$state" = "down" ]; then
+                continue
+            fi
+        fi
+
+        ifaces+=("$iface")
+    done
+
+    # 若未识别到，降级回 ip route 默认网卡
+    if [ ${#ifaces[@]} -eq 0 ]; then
+        local default_if
+        default_if=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+        if [ -n "$default_if" ]; then
+            ifaces+=("$default_if")
+        fi
+    fi
+
+    echo "${ifaces[*]:-}"
 }
 
 get_traffic_bytes() {
@@ -89,22 +143,46 @@ get_traffic_bytes() {
     local active_ifaces=""
 
     if [ "$target_ifaces" = "all" ]; then
-        active_ifaces=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -Ev "^(lo|docker|veth|br-|tun|tap|tailscale|wg)" || true)
+        active_ifaces=$(get_active_interfaces)
     else
         active_ifaces="$target_ifaces"
     fi
 
+    # 计算当前年月份（基于设定结算时区）
+    local current_year_month
+    current_year_month=$(TZ="$query_tz" date '+%Y-%m')
+
     for iface in $active_ifaces; do
+        [ -n "$iface" ] || continue
         local json_data
-        json_data=$(TZ="$query_tz" vnstat --json m 1 -i "$iface" 2>/dev/null || true)
+        json_data=$(TZ="$query_tz" vnstat --json m -i "$iface" 2>/dev/null || true)
+        
         if [ -n "$json_data" ]; then
             local rx tx
-            rx=$(echo "$json_data" | jq -r '(.interfaces[0].traffic.month[0].rx // .interfaces[0].traffic.months[0].rx // .interfaces[0].traffic.month[-1].rx // .interfaces[0].traffic.months[-1].rx) // 0' 2>/dev/null)
-            tx=$(echo "$json_data" | jq -r '(.interfaces[0].traffic.month[0].tx // .interfaces[0].traffic.months[0].tx // .interfaces[0].traffic.month[-1].tx // .interfaces[0].traffic.months[-1].tx) // 0' 2>/dev/null)
-            
+            # jq 强力解析：精准定位当年月记录，兼容 vnStat 1.x/2.x 复杂字段
+            rx=$(echo "$json_data" | jq -r --arg ym "$current_year_month" '
+                try (
+                    (.interfaces[0].traffic.month // .interfaces[0].traffic.months // [])
+                    | map(select(
+                        (.date | if type == "object" then "\( .year )-\( if .month < 10 then "0" else "" end )\( .month )" else . end | startswith($ym))
+                    ))
+                    | last | .rx // 0
+                ) catch 0
+            ' 2>/dev/null)
+
+            tx=$(echo "$json_data" | jq -r --arg ym "$current_year_month" '
+                try (
+                    (.interfaces[0].traffic.month // .interfaces[0].traffic.months // [])
+                    | map(select(
+                        (.date | if type == "object" then "\( .year )-\( if .month < 10 then "0" else "" end )\( .month )" else . end | startswith($ym))
+                    ))
+                    | last | .tx // 0
+                ) catch 0
+            ' 2>/dev/null)
+
             [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
             [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
-            
+
             total_all=$((total_all + rx + tx))
         fi
     done
@@ -114,7 +192,7 @@ get_traffic_bytes() {
 format_bytes() {
     local bytes=${1:-0}
     echo "$bytes" | awk '{
-        if ($1 >= 1073741824*1024) printf "%.2f TB", $1/1073741824/1024;
+        if ($1 >= 1099511627776) printf "%.2f TB", $1/1099511627776;
         else if ($1 >= 1073741824) printf "%.2f GB", $1/1073741824;
         else if ($1 >= 1048576) printf "%.2f MB", $1/1048576;
         else printf "%.2f KB", $1/1024;
@@ -125,10 +203,10 @@ format_bytes() {
 # 定时任务管理 & 自我安装/同步
 # ------------------------------------------------------------------------------
 sync_script_self() {
-    # 确保脚本被复制到全局可执行路径，并生成软链接
     local current_script
     current_script=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    if [ "$current_script" != "$SCRIPT_PATH" ] && [ -f "$current_script" ]; then
+    
+    if [ -f "$current_script" ] && [ "$current_script" != "$SCRIPT_PATH" ]; then
         cp -f "$current_script" "$SCRIPT_PATH"
         chmod +x "$SCRIPT_PATH"
     elif [ -f "$SCRIPT_PATH" ]; then
@@ -145,11 +223,17 @@ setup_cron() {
     local tmp_cron
     tmp_cron=$(mktemp)
     
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" > "$tmp_cron" || true
-    
+    # 获取已有 crontab 并清除本脚本旧记录
+    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" > "$tmp_cron" || true
+
+    # 注入 PATH 避免 Cron 执行缺乏系统环境变量问题
+    if ! grep -q "PATH=" "$tmp_cron"; then
+        sed -i '1i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$tmp_cron"
+    fi
+
     echo "0 8 * * * $SCRIPT_PATH --daily-report >/dev/null 2>&1" >> "$tmp_cron"
     echo "*/5 * * * * $SCRIPT_PATH --check-threshold >/dev/null 2>&1" >> "$tmp_cron"
-    
+
     crontab "$tmp_cron" 2>/dev/null
     rm -f "$tmp_cron"
 }
@@ -164,7 +248,7 @@ do_config() {
     echo "=========================================="
     echo "       ⚙️ 配置 Telegram 监控参数"
     echo "=========================================="
-    
+
     read -p "请输入 Telegram Bot Token [当前: ${BOT_TOKEN:-未设置}]: " input_bot
     read -p "请输入 Telegram Chat ID [当前: ${CHAT_ID:-未设置}]: " input_chat
     read -p "请输入服务器名称 (默认: ${SERVER_NAME}): " input_name
@@ -181,7 +265,7 @@ do_config() {
     local new_alert="${input_alert:-$ALERT_PCT}"
     local new_shutdown="${input_shutdown:-$SHUTDOWN_PCT}"
     local new_iface="${input_iface:-$INTERFACE}"
-    
+
     local new_tz="Asia/Shanghai"
     if [ "$input_tz" = "2" ]; then
         new_tz="UTC"
@@ -223,14 +307,11 @@ do_status() {
     local tz_disp="UTC+8 (北京时间)"
     if [ "$RESET_TZ" = "UTC" ]; then tz_disp="UTC+0 (零时区)"; fi
 
-    local p_sign="%"
-    local pipe_sign="|"
-
     echo "=========================================="
     echo "• 服务器名称: $SERVER_NAME"
     echo "• 监控网卡: $INTERFACE"
     echo "• 当月汇总使用量: $formatted_used / ${LIMIT_GB} GB (结算时区: ${tz_disp})"
-    echo "• 预警阈值: ${ALERT_PCT}${p_sign}${pipe_sign} 关机阈值: ${SHUTDOWN_PCT}${p_sign}"
+    echo "• 预警阈值: ${ALERT_PCT}% | 关机阈值: ${SHUTDOWN_PCT}%"
     echo "=========================================="
 }
 
@@ -242,8 +323,6 @@ do_check_threshold() {
     fi
     load_config
 
-    local p_sign="%"
-
     if [ "$LIMIT_GB" -le 0 ] 2>/dev/null; then
         echo "ℹ️ 流量上限设置为 0（无限制），忽略阈值检测。"
         return 0
@@ -251,40 +330,59 @@ do_check_threshold() {
 
     local total_bytes
     total_bytes=$(get_traffic_bytes "$INTERFACE")
-    
-    eval "$(LC_ALL=C awk -v bytes="$total_bytes" \
-                        -v limit_gb="$LIMIT_GB" \
-                        -v alert_pct="$ALERT_PCT" \
-                        -v shutdown_pct="$SHUTDOWN_PCT" 'BEGIN {
-        used_gb = bytes / 1073741824;
-        pct = (limit_gb > 0) ? (used_gb / limit_gb) * 100 : 0;
-        is_alert = (pct >= alert_pct) ? 1 : 0;
-        is_shutdown = (shutdown_pct > 0 && pct >= shutdown_pct) ? 1 : 0;
-        if (pct < 0.01 && pct > 0) {
-            printf "pct=\"%.4f\"\nis_alert=%d\nis_shutdown=%d\n", pct, is_alert, is_shutdown;
+
+    # 精准计算使用百分比
+    local pct
+    pct=$(awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
+        if (limit_gb > 0) {
+            p = (bytes / (limit_gb * 1073741824)) * 100;
+            printf "%.2f", p;
         } else {
-            printf "pct=\"%.2f\"\nis_alert=%d\nis_shutdown=%d\n", pct, is_alert, is_shutdown;
+            printf "0.00";
         }
-    }')"
+    }')
+
+    local is_alert=0
+    local is_shutdown=0
+
+    # 纯数值判断避免 awk eval 注入风险
+    awk -v p="$pct" -v a="$ALERT_PCT" -v s="$SHUTDOWN_PCT" 'BEGIN {
+        if (p >= s && s > 0) exit 2;
+        if (p >= a) exit 1;
+        exit 0;
+    }'
+    local res=$?
+
+    if [ "$res" -eq 2 ]; then
+        is_shutdown=1
+        is_alert=1
+    elif [ "$res" -eq 1 ]; then
+        is_alert=1
+    fi
 
     local flag_alert="/tmp/traffic_alert_sent_multi"
     local flag_shutdown="/tmp/traffic_shutdown_sent_multi"
+
+    local safe_server_name
+    safe_server_name=$(escape_html "$SERVER_NAME")
+    local safe_interface
+    safe_interface=$(escape_html "$INTERFACE")
 
     if [ "$is_shutdown" -eq 1 ]; then
         if [ ! -f "$flag_shutdown" ]; then
             local formatted_used
             formatted_used=$(format_bytes "$total_bytes")
-            
-            local msg="🛑 *[流量严重超限 - 自动关机通知]*
-- 服务器: \`${SERVER_NAME}\`
-- 监控网卡: \`${INTERFACE}\`
-- 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
-- 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
+
+            local msg="🛑 <b>[流量严重超限 - 自动关机通知]</b>
+• 服务器: <code>${safe_server_name}</code>
+• 监控网卡: <code>${safe_interface}</code>
+• 当月汇总用量: <code>${formatted_used}</code> / <code>${LIMIT_GB} GB</code> (${pct}%)
+• 关机阈值: <code>${SHUTDOWN_PCT}%</code>
 ⚠️ 流量已达到关机阈值，服务器将在 5 秒后自动关机！"
-            
+
             send_telegram "$msg"
             touch "$flag_shutdown"
-            echo "🛑 流量超限 (${pct}${p_sign} >= ${SHUTDOWN_PCT}${p_sign})，已发送 TG 通知，5秒后自动关机！"
+            echo "🛑 流量超限 (${pct}% >= ${SHUTDOWN_PCT}%)，已发送 TG 通知，5秒后自动关机！"
             sleep 5
             systemctl poweroff || shutdown -h now
             return 0
@@ -297,24 +395,24 @@ do_check_threshold() {
         if [ ! -f "$flag_alert" ]; then
             local formatted_used
             formatted_used=$(format_bytes "$total_bytes")
-            
-            local msg="🚨 *[流量用量预警]*
-- 服务器: \`${SERVER_NAME}\`
-- 监控网卡: \`${INTERFACE}\`
-- 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (${pct}${p_sign})
-- 预警阈值: \`${ALERT_PCT}${p_sign}\`
-- 关机阈值: \`${SHUTDOWN_PCT}${p_sign}\`
+
+            local msg="🚨 <b>[流量用量预警]</b>
+• 服务器: <code>${safe_server_name}</code>
+• 监控网卡: <code>${safe_interface}</code>
+• 当月汇总用量: <code>${formatted_used}</code> / <code>${LIMIT_GB} GB</code> (${pct}%)
+• 预警阈值: <code>${ALERT_PCT}%</code>
+• 关机阈值: <code>${SHUTDOWN_PCT}%</code>
 ⚠️ 已达到设定的流量预警阈值，请注意控制用量！"
-            
+
             send_telegram "$msg"
             touch "$flag_alert"
-            echo "⚠️ 已达到预警阈值 (当前 ${pct}${p_sign} >= 设定 ${ALERT_PCT}${p_sign})，预警消息已发送！"
+            echo "⚠️ 已达到预警阈值 (当前 ${pct}% >= 设定 ${ALERT_PCT}%)，预警消息已发送！"
         else
-            echo "ℹ️ 已处于预警状态 (当前 ${pct}${p_sign})，不再重复提醒。"
+            echo "ℹ️ 已处于预警状态 (当前 ${pct}%)，不再重复提醒。"
         fi
     else
         rm -f "$flag_alert" 2>/dev/null
-        echo "✅ 流量正常（当前汇总已用 ${pct}${p_sign}，未达到预警阈值 ${ALERT_PCT}${p_sign}）。"
+        echo "✅ 流量正常（当前汇总已用 ${pct}%，未达到预警阈值 ${ALERT_PCT}%）。"
     fi
 }
 
@@ -336,30 +434,37 @@ do_daily_report() {
 
     local pct="无限制"
     if [ "$LIMIT_GB" -gt 0 ] 2>/dev/null; then
-        pct=$(LC_ALL=C awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
+        pct=$(awk -v bytes="$total_bytes" -v limit_gb="$LIMIT_GB" 'BEGIN {
             if (limit_gb > 0) {
                 p = (bytes / (limit_gb * 1073741824)) * 100;
-                if (p < 0.01 && p > 0) printf "%.4f%%", p;
-                else printf "%.2f%%", p;
+                printf "%.2f%%", p;
             } else {
                 printf "0.00%%";
             }
         }')
     fi
 
-    local msg="📊 *[每日流量日报]*
-- 服务器: \`${SERVER_NAME}\`
-- 监控网卡: \`${INTERFACE}\`
-- 结算时区: \`${tz_disp}\`
-- 当月汇总用量: \`${formatted_used}\` / \`${LIMIT_GB} GB\` (已用 ${pct})
-- 统计时间: \`$(date '+%Y-%m-%d %H:%M:%S') (北京时间)\`"
+    local safe_server_name
+    safe_server_name=$(escape_html "$SERVER_NAME")
+    local safe_interface
+    safe_interface=$(escape_html "$INTERFACE")
+
+    local current_time
+    current_time=$(TZ="Asia/Shanghai" date '+%Y-%m-%d %H:%M:%S')
+
+    local msg="📊 <b>[每日流量日报]</b>
+• 服务器: <code>${safe_server_name}</code>
+• 监控网卡: <code>${safe_interface}</code>
+• 结算时区: <code>${tz_disp}</code>
+• 当月汇总用量: <code>${formatted_used}</code> / <code>${LIMIT_GB} GB</code> (已用 ${pct})
+• 统计时间: <code>${current_time} (北京时间)</code>"
 
     send_telegram "$msg"
     echo "✅ 每日流量推送指令已执行！"
 }
 
 uninstall() {
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" \vert{} grep -v "$ALIAS_PATH" | crontab - 2>/dev/null || true
+    (crontab -l 2>/dev/null || true) | grep -v "$SCRIPT_PATH" | grep -v "$ALIAS_PATH" | crontab - 2>/dev/null || true
     rm -f "$CONFIG_FILE"
     rm -f "$SCRIPT_PATH"
     rm -f "$ALIAS_PATH"
@@ -407,6 +512,7 @@ case "${1:-}" in
             2) do_daily_report ;;
             3) do_check_threshold ;;
             4) do_status ;;
+            5) do_status ;;
             5) uninstall ;;
             *) exit 0 ;;
         esac
