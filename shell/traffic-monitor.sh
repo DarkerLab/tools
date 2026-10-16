@@ -2,7 +2,7 @@
 # ==============================================================================
 # 脚本名称: traffic-monitor.sh
 # 适用系统: Debian 13 / Linux
-# 脚本版本: v1.3.0
+# 脚本版本: v1.3.2
 # 脚本作者: DarkerLab
 # GitHub Raw 链接: https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 # ==============================================================================
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor/config.json"
 STATE_FILE="/etc/traffic-monitor/state.json"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-VERSION="v1.3.0"
+VERSION="v1.3.2"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -25,7 +25,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # 清除颜色
+NC='\033[0m'
 
 # ------------------------------------------------------------------------------
 # 1. 系统环境检查与依赖安装
@@ -33,7 +33,6 @@ NC='\033[0m' # 清除颜色
 init_system() {
     echo -e "${BLUE}[+] 正在检查系统环境与依赖工具...${NC}"
     
-    # 检查并设置系统时区为 Asia/Shanghai
     CURRENT_TZ=$(timedatectl show --property=Timezone --value)
     if [ "$CURRENT_TZ" != "Asia/Shanghai" ]; then
         echo -e "${YELLOW}[*] 当前系统时区为 $CURRENT_TZ，正在修改为 Asia/Shanghai...${NC}"
@@ -42,14 +41,10 @@ init_system() {
         echo -e "${GREEN}[+] 当前系统时区已正确设置为 Asia/Shanghai。${NC}"
     fi
 
-    # 更新软件包列表并安装依赖
     apt-get update -y
     DEBIAN_FRONTEND=noninteractive apt-get install -y vnstat curl jq bc cron gawk
 
-    # 启动并开机自启 vnstat 服务
     systemctl enable --now vnstat
-    
-    # 创建配置目录与日志文件
     mkdir -p /etc/traffic-monitor
     touch "$LOG_FILE"
 }
@@ -156,7 +151,6 @@ configure_wizard() {
     save_config
     setup_cron_and_script
     
-    # 创建全局快捷命令
     ln -sf "$SCRIPT_PATH" /usr/local/bin/traffic-monitor
 
     echo -e "\n${GREEN}[+] 参数配置已成功保存！定时任务与执行脚本已更新。${NC}"
@@ -172,7 +166,6 @@ setup_cron_and_script() {
         chmod +x "$SCRIPT_PATH"
     fi
 
-    # 设置 1 分钟执行一次的定时任务
     CRON_JOB="* * * * * $SCRIPT_PATH --monitor >>$LOG_FILE 2>&1"
     (crontab -l 2>/dev/null | grep -v "traffic-monitor.sh") | { cat; echo "$CRON_JOB"; } | crontab -
 }
@@ -209,9 +202,7 @@ get_current_traffic_bytes() {
 
     for iface in $INTERFACES; do
         json_data=$(vnstat -i "$iface" --json 2>/dev/null)
-        if [ -z "$json_data" ]; then
-            continue
-        fi
+        [ -z "$json_data" ] && continue
 
         if [ "$RESET_TZ" = "UTC8" ]; then
             TZ='Asia/Shanghai'
@@ -271,7 +262,7 @@ bytes_to_gb() {
 }
 
 # ------------------------------------------------------------------------------
-# 7. 流量监控核心与报警任务（每1分钟由Cron调用）
+# 7. 流量监控核心与报警任务
 # ------------------------------------------------------------------------------
 run_monitor() {
     load_config
@@ -283,7 +274,6 @@ run_monitor() {
     fi
 
     current_time=$(TZ=$TZ date "+%Y-%m-%d %H:%M:%S")
-
     used_bytes=$(get_current_traffic_bytes)
     used_gb=$(bytes_to_gb "$used_bytes")
     
@@ -312,7 +302,7 @@ run_monitor() {
         state_cycle="$current_cycle"
     fi
 
-    # 1. Telegram 每日流量报告（北京时间 08:10 准时推送）
+    # 每日报告 (北京时间 08:10)
     bj_hm=$(TZ='Asia/Shanghai' date "+%H:%M")
     bj_date=$(TZ='Asia/Shanghai' date "+%Y-%m-%d")
     
@@ -334,7 +324,7 @@ run_monitor() {
         fi
     fi
 
-    # 2. 90% 流量预警推送
+    # 90% 预警
     is_above_90=$(echo "$percentage >= 90 &&$percentage < 95" | bc)
     if [ "$is_above_90" -eq 1 ] && [ "$warn_90_sent" = "false" ]; then
         warn_msg="⚠️ *【流量使用 90% 预警通知】*
@@ -350,7 +340,7 @@ run_monitor() {
         fi
     fi
 
-    # 3. 95% 流量超限自动关机推送
+    # 95% 超限关机
     is_above_95=$(echo "$percentage >= 95" | bc)
     if [ "$is_above_95" -eq 1 ] && [ "$shutdown_95_sent" = "false" ]; then
         shutdown_msg="🚨 *【流量超限自动关机报警】*
@@ -362,7 +352,6 @@ run_monitor() {
 ━━━━━━━━━━━━━━━━━━
 🛑 *严重警告*: 流量使用已达到或超过 95% 阈值，为了防止超出流量产生额外扣费，系统即将执行自动关机！"
         
-        # 先校验 Telegram 关机通知是否正常发送成功，成功后再执行关机
         if send_telegram "$shutdown_msg"; then
             shutdown_95_sent="true"
             jq -n \
@@ -385,13 +374,12 @@ run_monitor() {
 }
 
 # ------------------------------------------------------------------------------
-# 8. GitHub 一键更新脚本（检查本地是否存在文件，存在则删除后从GitHub拉取）
+# 8. GitHub 一键更新脚本
 # ------------------------------------------------------------------------------
 update_script() {
     echo -e "${BLUE}[+] 正在检查并从 GitHub 更新脚本...${NC}"
     TEMP_SCRIPT="/tmp/traffic-monitor.sh"
     
-    # 检查本地是否存在 traffic-monitor.sh 文件，存在则执行删除命令
     if [ -f "$SCRIPT_PATH" ]; then
         echo -e "${YELLOW}[*] 检测到本地已存在脚本文件 ($SCRIPT_PATH)，正在执行删除命令...${NC}"
         rm -f "$SCRIPT_PATH"
@@ -494,7 +482,7 @@ show_menu() {
 }
 
 # ------------------------------------------------------------------------------
-# 10. 脚本入口点逻辑优化
+# 10. 脚本入口点
 # ------------------------------------------------------------------------------
 case "$1" in
     --monitor)
@@ -505,7 +493,6 @@ case "$1" in
         show_menu
         ;;
     *)
-        # 无论配置文件是否存在，直接进入菜单或执行环境初始化
         if [ ! -f "$CONFIG_FILE" ]; then
             init_system
         fi
