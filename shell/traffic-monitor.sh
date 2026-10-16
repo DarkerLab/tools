@@ -10,7 +10,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 CRON_FILE="/etc/cron.d/traffic-monitor"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-SCRIPT_VERSION="1.3"
+SCRIPT_VERSION="1.4"
 BASE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
@@ -125,7 +125,7 @@ EOF
 
     echo -e "${GREEN}[√] 配置文件已成功保存至 $CONFIG_FILE${NC}"
 
-    # 配置定时任务与脚本自复制（避免同文件复制报错）
+    # 配置定时任务与脚本自复制
     if [ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]; then
         cp "$0" "$SCRIPT_PATH"
     fi
@@ -146,7 +146,7 @@ EOF
 # ==================== 2. 发送 Telegram 通知函数 ====================
 send_tg_msg() {
     local message="$1"
-    if [ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ]; then
+    if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
         return 1
     fi
     response=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
@@ -161,7 +161,7 @@ send_tg_msg() {
     fi
 }
 
-# ==================== 3. 流量计算核心逻辑 (适配 vnstat 原生 + 语法) ====================
+# ==================== 3. 流量计算核心逻辑 ====================
 get_current_traffic_bytes() {
     local c_year=$(date +%Y)
     local c_month=$(date +%m | sed 's/^0//')
@@ -174,9 +174,8 @@ get_current_traffic_bytes() {
         p_year=$((c_year - 1))
     fi
 
-    # vnstat 支持直接传入用 + 连接的多网口（如 ens18+ens19）
     json_data=$(vnstat -i "$INTERFACES" --json 2>/dev/null)
-    if [ $? -ne 0 ] \vert{}\vert{} [ -z "$json_data" ]; then
+    if [ $? -ne 0 ] || [ -z "$json_data" ]; then
         echo "0"
         return
     fi
@@ -184,40 +183,40 @@ get_current_traffic_bytes() {
     if [ "$RESET_DAY" -eq 1 ]; then
         rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
             .interfaces[0].traffic.month | 
-            map(select(.date.year == $yr and .date.month ==$mo)) | 
+            map(select(.date.year == $yr and .date.month == $mo)) | 
             .[0].rx // 0
         ')
         tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
             .interfaces[0].traffic.month | 
-            map(select(.date.year == $yr and .date.month ==$mo)) | 
+            map(select(.date.year == $yr and .date.month == $mo)) | 
             .[0].tx // 0
         ')
     else
         if [ "$c_day" -ge "$RESET_DAY" ]; then
             rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
-                map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
+                map(select(.date.year == $yr and .date.month == $mo and .date.day >= $rday)) | 
                 map(.rx) | add // 0
             ')
             tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
-                map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
+                map(select(.date.year == $yr and .date.month == $mo and .date.day >= $rday)) | 
                 map(.tx) | add // 0
             ')
         else
             rx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
                 map(select(
-                    (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
-                    (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
+                    (.date.year == $pyr and .date.month == $pmo and .date.day >= $rday) or
+                    (.date.year == $cyr and .date.month == $cmo and .date.day < $rday)
                 )) | 
                 map(.rx) | add // 0
             ')
             tx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
                 map(select(
-                    (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
-                    (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
+                    (.date.year == $pyr and .date.month == $pmo and .date.day >= $rday) or
+                    (.date.year == $cyr and .date.month == $cmo and .date.day < $rday)
                 )) | 
                 map(.tx) | add // 0
             ')
@@ -227,7 +226,7 @@ get_current_traffic_bytes() {
     case "$TRAFFIC_TYPE" in
         2) echo "${tx:-0}" ;;
         3) echo "${rx:-0}" ;;
-        *) echo $(( ${rx:-0} +${tx:-0} )) ;;
+        *) echo $(( ${rx:-0} + ${tx:-0} )) ;;
     esac
 }
 
@@ -244,7 +243,7 @@ format_bytes() {
     fi
 }
 
-# ==================== 4. 后台检查与定时推送逻辑 ====================
+# ==================== 4. 后台检查与定时推送逻辑 (已优化通知样式) ====================
 run_checker() {
     [ ! -f "$CONFIG_FILE" ] && exit 0
     source "$CONFIG_FILE"
@@ -266,45 +265,41 @@ run_checker() {
     current_hm=$(date '+%H:%M')
     daily_flag="/var/lib/traffic-monitor/daily_${today_date}.flag"
 
+    # 1. 每日 08:10 定时报告（采用全新简洁美观样式）
     if [ "$current_hm" = "08:10" ] && [ ! -f "$daily_flag" ]; then
-        msg="📊 *服务器流量日报*
-━━━━━━━━━━━━━━━━━━
-🖥 *名称:* \`${SERVER_NAME}\`
-📈 *已用:* \`${used_str}\` / \`${total_str}\`
-📊 *占比:* \`${percent}%\`
-⏰ *时间:* \`${current_time}\`
-━━━━━━━━━━━━━━━━━━"
+        msg="📊 *[${SERVER_NAME}] 每日流量日报*
+
+- 流量: ${used_str} / ${total_str} (${percent}%)
+- 时间: ${current_time}"
         send_tg_msg "$msg"
         touch "$daily_flag"
         find /var/lib/traffic-monitor/ -name "daily_*.flag" ! -name "daily_${today_date}.flag" -delete
     fi
 
+    # 2. 90% 预警检查
     warning_flag="/var/lib/traffic-monitor/warning_sent_${RESET_DAY}_$(date '+%Y%m')"
-    is_above_90=$(awk "BEGIN {print ($percent >= 90 &&$percent < 95) ? 1 : 0}")
+    is_above_90=$(awk "BEGIN {print ($percent >= 90 && $percent < 95) ? 1 : 0}")
     if [ "$is_above_90" -eq 1 ] && [ ! -f "$warning_flag" ]; then
-        msg="⚠️ *流量预警通知*
-━━━━━━━━━━━━━━━━━━
-🖥 *名称:* \`${SERVER_NAME}\`
-🚨 *状态:* 已使用流量达到 *${percent}%*
-📈 *已用:* \`${used_str}\` / \`${total_str}\`
-⏰ *时间:* \`${current_time}\`
-━━━━━━━━━━━━━━━━━━"
+        msg="⚠️ *[${SERVER_NAME}] 流量预警通知*
+
+- 状态: 已使用流量达到 *${percent}%*
+- 流量: ${used_str} / ${total_str}
+- 时间: ${current_time}"
         if send_tg_msg "$msg"; then
             touch "$warning_flag"
         fi
     fi
 
+    # 3. 95% 超阈值关机告警检查
     shutdown_flag="/var/lib/traffic-monitor/shutdown_sent_${RESET_DAY}_$(date '+%Y%m')"
     is_above_95=$(awk "BEGIN {print ($percent >= 95) ? 1 : 0}")
     if [ "$is_above_95" -eq 1 ] && [ ! -f "$shutdown_flag" ]; then
-        msg="🛑 *超流量关机告警*
-━━━━━━━━━━━━━━━━━━
-🖥 *名称:* \`${SERVER_NAME}\`
-❌ *状态:* 流量已超 95% (*${percent}%*)
-📈 *已用:* \`${used_str}\` / \`${total_str}\`
-🔌 *操作:* 服务器正在执行安全关机
-⏰ *时间:* \`${current_time}\`
-━━━━━━━━━━━━━━━━━━"
+        msg="🛑 *[${SERVER_NAME}] 超流量关机告警*
+
+- 状态: 流量已超 95% (*${percent}%*)
+- 流量: ${used_str} / ${total_str}
+- 操作: 服务器正在执行安全关机
+- 时间: ${current_time}"
         if send_tg_msg "$msg"; then
             touch "$shutdown_flag"
             sync
@@ -337,13 +332,10 @@ test_daily_report() {
     total_str="${TOTAL_LIMIT_GB} GB"
     current_time=$(date '+%Y-%m-%d %H:%M:%S')
 
-    msg="🧪 *测试流量推送报告*
-━━━━━━━━━━━━━━━━━━
-🖥 *名称:* \`${SERVER_NAME}\`
-📈 *已用:* \`${used_str}\` / \`${total_str}\`
-📊 *占比:* \`${percent}%\`
-⏰ *时间:* \`${current_time}\`
-━━━━━━━━━━━━━━━━━━"
+    msg="📊 *[${SERVER_NAME}] 每日流量日报 (测试)*
+
+- 流量: ${used_str} / ${total_str} (${percent}%)
+- 时间: ${current_time}"
     echo -e "${YELLOW}正在发送测试消息到 Telegram...${NC}"
     if send_tg_msg "$msg"; then
         echo -e "${GREEN}[√] 测试消息发送成功！${NC}"
@@ -381,7 +373,7 @@ view_traffic() {
     echo -e "每月重置日: ${GREEN}每月 ${RESET_DAY} 号${NC}"
     echo -e "已用流量:   ${GREEN}${used_str}${NC}"
     echo -e "总流量限额: ${GREEN}${total_str}${NC}"
-    echo -e "当前使用率: ${GREEN}${percent}\%${NC}"
+    echo -e "当前使用率: ${GREEN}${percent}%${NC}"
     echo "----------------------------------------"
     echo -e "${YELLOW}vnstat 详细接口状态：${NC}"
     vnstat -i "$INTERFACES"
