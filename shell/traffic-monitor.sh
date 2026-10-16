@@ -1,10 +1,9 @@
-
 #!/bin/bash
 # ==============================================================================
 # 脚本名称: traffic-monitor.sh
 # 描述: 基于 vnStat 的流量监控、Telegram 每日报告、预警及超限关机助手
 # 系统环境: Debian 13
-# GitHub 仓库: https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
+# GitHub 仓库链接: https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 # ==============================================================================
 
 CONF_FILE="/etc/traffic-monitor.conf"
@@ -25,10 +24,10 @@ check_root() {
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}[错误] 请使用 root 权限运行此脚本！(sudo -i)${NC}"
         exit 1
-    }
+    fi
 }
 
-# 打印 Logo
+# 打印 Logo 界面
 print_logo() {
     clear
     echo -e "${CYAN}======================================================${NC}"
@@ -38,13 +37,13 @@ print_logo() {
 
 # 1. 安装部署/修改配置
 install_or_update() {
-    echo -e "${YELLOW}[信息] 正在检查系统环境与更新依赖...${NC}"
+    echo -e "${YELLOW}[信息] 正在检查系统环境与更新依赖工具...${NC}"
     apt update -y && apt install -y vnstat curl jq python3 bc cron
 
     # 确保 vnstat 服务运行
     systemctl enable --now vnstat
 
-    # 检查系统时区是否为 Asia/Shanghai
+    # 检查系统时区设置为 Asia/Shanghai
     CURRENT_TZ=$(timedatectl show --property=Timezone --value)
     if [ "$CURRENT_TZ" != "Asia/Shanghai" ]; then
         echo -e "${YELLOW}[信息] 当前时区为 $CURRENT_TZ，正在自动设置时区为 Asia/Shanghai...${NC}"
@@ -53,7 +52,7 @@ install_or_update() {
         echo -e "${GREEN}[√] 系统时区已确认: Asia/Shanghai${NC}"
     fi
 
-    # 获取可用网卡列表
+    # 获取可用网卡接口
     AVAILABLE_IFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo")
     echo -e "\n${CYAN}当前可用网卡接口:${NC} $AVAILABLE_IFACES"
 
@@ -66,7 +65,7 @@ install_or_update() {
     read -p "请输入自定义服务器名称 [默认: $(hostname)]: " INPUT_SERVER_NAME
     SERVER_NAME="${INPUT_SERVER_NAME:-$(hostname)}"
 
-    read -p "请输入监控网卡接口（单或多网卡用逗号隔开，例: eth0 或 eth0,eth1） [默认: $(echo $AVAILABLE_IFACES | awk '{print $1}')]: " INPUT_IFACES
+    read -p "请输入监控网卡接口（单网口或多网口用逗号隔开，例: eth0 或 eth0,eth1） [默认: $(echo $AVAILABLE_IFACES | awk '{print $1}')]: " INPUT_IFACES
     INTERFACES="${INPUT_IFACES:-$(echo $AVAILABLE_IFACES | awk '{print $1}')}"
 
     read -p "请输入每月流量重置日期 (1-31) [默认: 1]: " INPUT_RESET_DAY
@@ -83,7 +82,7 @@ install_or_update() {
     fi
 
     echo "请选择流量统计类型:"
-    echo "1) 总流量 (上传 + 下载)"
+    echo "1) 总流量 (上传+下载流量)"
     echo "2) 仅上传流量"
     echo "3) 仅下载流量"
     read -p "请输入选项 [默认: 1]: " INPUT_TRAFFIC_TYPE
@@ -107,8 +106,8 @@ TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 EOF
 
-    # 生成 Python 计算与解析脚本
-    cat << 'EOF' > "$PY_SCRIPT"
+    # 生成独立的 Python 计算与解析核心脚本
+    cat << 'PYTHON_EOF' > "$PY_SCRIPT"
 #!/usr/bin/env python3
 import json
 import subprocess
@@ -179,17 +178,16 @@ def get_traffic_data(interfaces, reset_day, tz_mode, traffic_type, limit_gb):
     print(json.dumps(result))
 
 if __name__ == '__main__':
-    if len(sys.argv) < 6:
-        sys.exit(1)
-    get_traffic_data(sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), float(sys.argv[5]))
-EOF
+    if len(sys.argv) >= 6:
+        get_traffic_data(sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), float(sys.argv[5]))
+PYTHON_EOF
     chmod +x "$PY_SCRIPT"
 
-    # 将当前脚本复制到全局路径以供定时任务调用
+    # 将脚本复制到全局路径
     cp "$0" "$SCRIPT_PATH" 2>/dev/null || true
     chmod +x "$SCRIPT_PATH"
 
-    # 配置 Cron 定时任务 (1分钟阈值检测，每日北京时间 8:10 推送报告)
+    # 配置 Cron 定时任务（1分钟阈值检测，每日北京时间 8:10 推送报告）
     CRON_TEMP="/tmp/traffic_cron"
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" > "$CRON_TEMP"
     echo "*/1 * * * * /usr/local/bin/traffic-monitor.sh --check-threshold >/dev/null 2>&1" >> "$CRON_TEMP"
@@ -198,7 +196,7 @@ EOF
     rm -f "$CRON_TEMP"
     systemctl restart cron
 
-    echo -e "\n${GREEN}[√] 部署与配置完成！定时任务已成功激活。${NC}"
+    echo -e "\n${GREEN}[√] 安装部署与配置完成！定时任务（1分钟周期）已激活。${NC}"
     read -p "按回车键返回主菜单..."
 }
 
@@ -239,7 +237,6 @@ test_daily_push() {
         return
     fi
     source "$CONF_FILE"
-    
     stats_json=$(fetch_stats)
     if [ "$stats_json" = "{}" ]; then
         echo -e "${RED}[错误] 获取流量数据失败！${NC}"
@@ -290,7 +287,6 @@ do_threshold_check() {
     local mode="$1"
     if [ ! -f "$CONF_FILE" ]; then
         [ "$mode" != "test" ] && exit 0
-        echo -e "${RED}[错误] 未配置监控参数${NC}"
         return
     fi
     source "$CONF_FILE"
@@ -302,7 +298,6 @@ do_threshold_check() {
     used_gb=$(echo "$stats_json" | jq -r '.used_gb')
     limit_gb=$(echo "$stats_json" | jq -r '.limit_gb')
 
-    # 初始化状态文件记录当前周期警报状态
     current_month_key=$(date +%Y-%m)
     if [ ! -f "$STATE_FILE" ]; then
         echo "MONTH=$current_month_key" > "$STATE_FILE"
@@ -311,7 +306,6 @@ do_threshold_check() {
     fi
     source "$STATE_FILE"
     if [ "$MONTH" != "$current_month_key" ]; then
-        current_month_key="$current_month_key"
         WARN_90=0
         SHUTDOWN_95=0
         cat << EOF > "$STATE_FILE"
@@ -321,7 +315,7 @@ SHUTDOWN_95=$SHUTDOWN_95
 EOF
     fi
 
-    # 检查 95% 关机阈值
+    # 检查 95% 关机报警推送通知（必须检查关机通知发送成功才执行关机命令）
     is_ge_95=$(echo "$pct >= 95" | bc -l)
     if [ "$is_ge_95" -eq 1 ]; then
         if [ "$SHUTDOWN_95" -eq 0 ] || [ "$mode" = "test" ]; then
@@ -349,7 +343,7 @@ EOF
         return
     fi
 
-    # 检查 90% 预警阈值
+    # 检查 90% 预警推送通知
     is_ge_90=$(echo "$pct >= 90" | bc -l)
     if [ "$is_ge_90" -eq 1 ]; then
         if [ "$WARN_90" -eq 0 ] || [ "$mode" = "test" ]; then
@@ -373,9 +367,7 @@ EOF
         fi
     fi
 
-    if [ "$mode" = "test" ]; then
-        echo -e "${GREEN}当前流量使用率: ${pct}% (未达到预警/关机线)${NC}"
-    fi
+    [ "$mode" = "test" ] && echo -e "${GREEN}当前流量使用率: ${pct}% (未达到预警/关机线)${NC}"
 }
 
 # 4. 查看当前流量数据
@@ -415,7 +407,6 @@ show_traffic() {
     echo -e "  └── 下载: ${GREEN}${rx_gb} GB${NC}"
     echo -e "${CYAN}======================================================${NC}"
     
-    # 同时展示系统自带的 vnstat 简要快照
     echo -e "\n${YELLOW}vnstat 实时快照:${NC}"
     vnstat -i "$INTERFACES" 2>/dev/null || vnstat
 
@@ -428,9 +419,7 @@ do_uninstall() {
     echo -e "${RED}警告: 即将卸载流量监控程序及清理相关配置、定时任务！${NC}"
     read -p "确认卸载？(y/n): " confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        # 清理 Cron
         crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | crontab -
-        # 删除文件
         rm -f "$CONF_FILE" "$STATE_FILE" "$PY_SCRIPT" "$SCRIPT_PATH"
         echo -e "${GREEN}[√] 流量监控助手已成功卸载。${NC}"
     else
@@ -439,7 +428,7 @@ do_uninstall() {
     read -p "按回车键返回主菜单..."
 }
 
-# 每日推送 Cron 入口
+# 定时任务每日推送入口
 do_daily_push() {
     if [ ! -f "$CONF_FILE" ]; then exit 0; fi
     source "$CONF_FILE"
@@ -505,7 +494,7 @@ while true; do
         3) test_threshold_check ;;
         4) show_traffic ;;
         5) do_uninstall ;;
-        0) echo -e "${GREEN}再见！${NC}; exit 0 ;;
+        0) echo -e "${GREEN}再见！${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选项，请重新输入！${NC}"; sleep 1 ;;
     esac
 done
