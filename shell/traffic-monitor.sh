@@ -65,8 +65,10 @@ install_or_update() {
     read -p "请输入自定义服务器名称 [默认: $(hostname)]: " INPUT_SERVER_NAME
     SERVER_NAME="${INPUT_SERVER_NAME:-$(hostname)}"
 
-    read -p "请输入监控网卡接口（单网口或多网口用逗号隔开，例: eth0 或 eth0,eth1） [默认: $(echo $AVAILABLE_IFACES | awk '{print $1}')]: " INPUT_IFACES
+    read -p "请输入监控网卡接口（多网卡可用逗号或加号隔开，例: ens18,ens19 或 ens18+ens19） [默认: $(echo $AVAILABLE_IFACES | awk '{print $1}')]: " INPUT_IFACES
     INTERFACES="${INPUT_IFACES:-$(echo $AVAILABLE_IFACES | awk '{print $1}')}"
+    # 统一将用户输入的 + 或空格规范处理为逗号存储，方便后续 Python 处理
+    INTERFACES=$(echo "$INTERFACES" | tr '+' ',' | tr ' ' ',')
 
     read -p "请输入每月流量重置日期 (1-31) [默认: 1]: " INPUT_RESET_DAY
     RESET_DAY="${INPUT_RESET_DAY:-1}"
@@ -133,7 +135,7 @@ def get_traffic_data(interfaces, reset_day, tz_mode, traffic_type, limit_gb):
     total_rx = 0
     total_tx = 0
     
-    ifaces = [iface.strip() for iface in interfaces.split(',') if iface.strip()]
+    ifaces = [iface.strip() for iface in interfaces.replace('+', ',').split(',') if iface.strip()]
     
     for iface in ifaces:
         try:
@@ -370,7 +372,7 @@ EOF
     [ "$mode" = "test" ] && echo -e "${GREEN}当前流量使用率: ${pct}% (未达到预警/关机线)${NC}"
 }
 
-# 4. 查看当前流量数据
+# 4. 查看当前流量数据（使用 vnstat 原生支持的加号语法 ens18+ens19 查询）
 show_traffic() {
     clear
     echo -e "${CYAN}======================================================${NC}"
@@ -408,7 +410,9 @@ show_traffic() {
     echo -e "${CYAN}======================================================${NC}"
     
     echo -e "\n${YELLOW}vnstat 实时快照:${NC}"
-    vnstat -i "$INTERFACES" 2>/dev/null || vnstat
+    # 自动将配置中的网卡转换为 ens18+ens19 的原生联查格式
+    vnstat_ifaces=$(echo "$INTERFACES" | tr ',' '+')
+    vnstat -i "$vnstat_ifaces" 2>/dev/null || vnstat
 
     echo ""
     read -p "按回车键返回主菜单..."
@@ -494,7 +498,7 @@ while true; do
         3) test_threshold_check ;;
         4) show_traffic ;;
         5) do_uninstall ;;
-        0) echo -e "${GREEN}再见！${NC}"; exit 0 ;;
+        0) echo -e "${GREEN}再见！${NC}; exit 0 ;;
         *) echo -e "${RED}无效选项，请重新输入！${NC}"; sleep 1 ;;
     esac
 done
