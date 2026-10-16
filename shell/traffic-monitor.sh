@@ -1,418 +1,423 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ==============================================================================
+# Script Name: traffic-monitor.sh
+# Description: Debian 13 Traffic Monitor & Telegram Alert System using vnStat
+# Version: 1.0.0
+# Author: DarkerLab
+# ==============================================================================
 
-# 确保以root权限运行
+# Ensure script is run as root
 if [ "$EUID" -ne 0 ]; then
-  echo "请以 root 权限运行此脚本 (sudo bash 或 root 直接运行)"
-  exit 1
+    echo "[-] Error: Please run this script as root (sudo ./traffic-monitor.sh)"
+    exit 1
 fi
 
 CONFIG_FILE="/etc/traffic-monitor.conf"
-SCRIPT_FILE="/usr/local/bin/traffic-monitor.py"
-CRON_JOB="* * * * * /usr/bin/python3 /usr/local/bin/traffic-monitor.py >/dev/null 2>&1"
+DAEMON_SCRIPT="/usr/local/bin/traffic-monitor-daemon.sh"
+CRON_JOB_FILE="/etc/cron.d/traffic-monitor"
+VERSION="1.0.0"
 
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# 1. System Environment Check & Dependencies
 install_dependencies() {
-    echo "==> 正在更新系统并安装依赖工具..."
-    apt update && apt upgrade -y
-    apt install -y vnstat curl jq python3 bc cron
-    
-    # 设置系统时区为 Asia/Shanghai
-    echo "==> 设置系统时区为 Asia/Shanghai..."
-    timedatectl set-timezone Asia/Shanghai
-    
-    # 启动并启用 vnstat服务
-    systemctl enable --now vnstat
-    sleep 2
+    echo "[+] Checking and installing system dependencies..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y vnstat curl jq bc cron systemd
+
+    # Enable and start vnstat service
+    systemctl enable vnstat
+    systemctl start vnstat
+
+    # Check and set timezone
+    CURRENT_TZ=$(timedatectl | grep "Time zone" | awk '{print $3}')
+    if [ "$CURRENT_TZ" != "Asia/Shanghai" ]; then
+        echo "[+] Setting system timezone to Asia/Shanghai..."
+        timedatectl set-timezone Asia/Shanghai
+    else
+        echo "[*] System timezone is already Asia/Shanghai."
+    fi
 }
 
-detect_interfaces() {
-    echo "==> 检测当前可用的网卡接口..."
-    ip -o link show | awk -F': ' '{print $2}' | grep -v "lo"
-}
-
-configure_params() {
-    echo "============================================="
-    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.2"
-    echo "============================================="
-
+# 2. Load Configuration
+load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
     fi
+}
 
-    read -p "请输入自定义监控服务器名称 [当前: ${SERVER_NAME:-My-Server}]: " input_name
-    SERVER_NAME="${input_name:-${SERVER_NAME:-My-Server}}"
-
-    echo "可用网卡列表："
-    detect_interfaces
-    read -p "请输入要监控的网卡接口(多个网卡用空格或逗号分隔) [当前: ${INTERFACES:-eth0}]: " input_ifaces
-    INTERFACES="${input_ifaces:-${INTERFACES:-eth0}}"
-    INTERFACES=$(echo "$INTERFACES" | tr ',' ' ')
-
-    read -p "请输入每月流量重置日期 (1-31) [当前: ${RESET_DAY:-1}]: " input_day
-    RESET_DAY="${input_day:-${RESET_DAY:-1}}"
-
-    echo "请选择流量重置时区基准："
-    echo "1) UTC+8 (北京时间)"
-    echo "2) UTC+0 (零时区)"
-    read -p "请选择 [当前: ${TIMEZONE_MODE:-UTC8}]: " input_tz
-    case "$input_tz" in
-        2) TIMEZONE_MODE="UTC0" ;;
-        *) TIMEZONE_MODE="UTC8" ;;
-    esac
-
-    echo "请选择流量统计类型："
-    echo "1) 总流量 (上传 + 下载)"
-    echo "2) 仅上传流量"
-    echo "3) 仅下载流量"
-    read -p "请选择 [当前: ${TRAFFIC_TYPE:-1}]: " input_type
-    TRAFFIC_TYPE="${input_type:-${TRAFFIC_TYPE:-1}}"
-
-    read -p "请输入每月总流量限制额度 (单位: GB，例如 2000) [当前: ${TOTAL_GB:-2000}]: " input_total
-    TOTAL_GB="${input_total:-${TOTAL_GB:-2000}}"
-
-    read -p "请输入 Telegram Bot Token [当前: ${TG_BOT_TOKEN}]: " input_token
-    TG_BOT_TOKEN="${input_token:-$TG_BOT_TOKEN}"
-
-    read -p "请输入 Telegram Chat ID [当前: ${TG_CHAT_ID}]: " input_chat
-    TG_CHAT_ID="${input_chat:-$TG_CHAT_ID}"
-
-    cat << EOF_CONF > "$CONFIG_FILE"
+# 3. Save Configuration
+save_config() {
+    cat << EOF > "$CONFIG_FILE"
 SERVER_NAME="$SERVER_NAME"
 INTERFACES="$INTERFACES"
-RESET_DAY=$RESET_DAY
-TIMEZONE_MODE="$TIMEZONE_MODE"
+RESET_DAY="$RESET_DAY"
+TIMEZONE_SETTING="$TIMEZONE_SETTING"
 TRAFFIC_TYPE="$TRAFFIC_TYPE"
-TOTAL_GB=$TOTAL_GB
+TOTAL_LIMIT_GB="$TOTAL_LIMIT_GB"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
-EOF_CONF
-
-    chmod 600 "$CONFIG_FILE"
-    echo "==> 配置文件已保存至 $CONFIG_FILE 并完成权限加固。"
+WARN_PERCENT="$WARN_PERCENT"
+SHUTDOWN_PERCENT="$SHUTDOWN_PERCENT"
+EOF
+    echo -G "[+] Configuration saved successfully to $CONFIG_FILE"
 }
 
-deploy_monitor_script() {
-    echo "==> 正在生成核心监控脚本..."
-    cat << 'EOF_PY' > "$SCRIPT_FILE"
-#!/usr/bin/env python3
-import json
-import os
-import subprocess
-import sys
-from datetime import datetime, timedelta, timezone
+# 4. Interactive Configuration Wizard
+configure_wizard() {
+    echo "=================================================="
+    echo "       Traffic Monitor Interactive Setup          "
+    echo "=================================================="
 
-CONFIG_FILE = "/etc/traffic-monitor.conf"
-STATE_FILE = "/var/lib/traffic-monitor/state.json"
+    # Server Name
+    default_name=$(hostname)
+    read -p "Enter Server Name [Default: $default_name]: " input_name
+    SERVER_NAME="${input_name:-$default_name}"
 
-def load_config():
-    config = {}
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    with open(CONFIG_FILE, "r") as f:
-        for line in f:
-            if "=" in line and not line.startswith("#"):
-                k, v = line.strip().split("=", 1)
-                config[k] = v.strip('"\'')
-    return config
+    # Network Interfaces Detection
+    echo "[*] Available Network Interfaces:"
+    ip -o link show | awk -F': ' '{print $2}' | grep -v "lo"
+    read -p "Enter Network Interface(s) separated by space (e.g., eth0 or eth0 eth1): " INTERFACES
+    if [ -z "$INTERFACES" ]; then
+        INTERFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)
+        echo "[*] No interface entered. Defaulting to: $INTERFACES"
+    fi
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return {"cycle_start": "", "warn_90": False, "shutdown_95": False, "last_daily_date": ""}
+    # Reset Day
+    read -p "Enter monthly traffic reset day (1-31) [Default: 1]: " input_day
+    RESET_DAY="${input_day:-1}"
 
-def save_state(state):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-def send_tg(token, chat_id, message):
-    if not token or not chat_id:
-        print("[Error] Telegram Token 或 Chat ID 未配置！")
-        return False
-    import urllib.request
-    import urllib.parse
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": message, "parse_mode": "HTML"}).encode()
-    try:
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return True
-    except Exception as e:
-        print(f"[Error] Telegram 发送失败: {e}")
-        return False
-
-def parse_size_to_bytes(s):
-    if not s or "--" in s:
-        return 0.0
-    parts = s.split()
-    if len(parts) < 2:
-        return 0.0
-    try:
-        val = float(parts[0])
-        unit = parts[1].lower()
-        mult = 1.0
-        if 'ki' in unit: mult = 1024.0
-        elif 'mi' in unit: mult = 1024.0**2
-        elif 'gi' in unit: mult = 1024.0**3
-        elif 'ti' in unit: mult = 1024.0**4
-        elif 'kb' in unit: mult = 1000.0
-        elif 'mb' in unit: mult = 1000.0**2
-        elif 'gb' in unit: mult = 1000.0**3
-        elif 'tb' in unit: mult = 1000.0**4
-        return val * mult
-    except:
-        return 0.0
-
-def calculate_traffic():
-    config = load_config()
-    ifaces = config.get("INTERFACES", "eth0").split()
-    reset_day = int(config.get("RESET_DAY", 1))
-    tz_mode = config.get("TIMEZONE_MODE", "UTC8")
-    traffic_type = int(config.get("TRAFFIC_TYPE", 1))
-    
-    if tz_mode == "UTC0":
-        target_tz = timezone.utc
-    else:
-        target_tz = timezone(timedelta(hours=8))
-        
-    now = datetime.now(target_tz)
-    year, month = now.year, now.month
-    
-    if month == 1:
-        prev_year, prev_month = year - 1, 12
-    else:
-        prev_year, prev_month = year, month - 1
-        
-    if now.day >= reset_day:
-        cycle_start_str = f"{year}-{month:02d}-{reset_day:02d}"
-    else:
-        cycle_start_str = f"{prev_year}-{prev_month:02d}-{reset_day:02d}"
-    
-    used_bytes = 0.0
-    combined_iface = "+".join(ifaces) # 例如 ens18+ens19
-    
-    try:
-        res = subprocess.run(["vnstat", "-i", combined_iface, "-m"], capture_output=True, text=True, check=True)
-        for line in res.stdout.splitlines():
-            line_lower = line.lower()
-            # 识别包含流量单位且带有 '|' 分隔符的有效数据行
-            if "|" in line and any(u in line_lower for u in ['gib', 'mib', 'kib', 'tib', 'gb', 'mb', 'kb', 'tb']):
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) >= 3:
-                    # parts[0] 包含月份和 rx，例如 "2026-10   1.89 GiB"
-                    sub_parts = parts[0].split()
-                    rx_str = "0"
-                    if len(sub_parts) >= 3:
-                        rx_str = f"{sub_parts[1]} {sub_parts[2]}"
-                    
-                    tx_str = parts[1]   # parts[1] 是 tx
-                    total_str = parts[2] # parts[2] 是 total
-                    
-                    rx_bytes = parse_size_to_bytes(rx_str)
-                    tx_bytes = parse_size_to_bytes(tx_str)
-                    total_bytes = parse_size_to_bytes(total_str)
-                    
-                    if traffic_type == 1:
-                        used_bytes = total_bytes
-                    elif traffic_type == 2:
-                        used_bytes = tx_bytes
-                    elif traffic_type == 3:
-                        used_bytes = rx_bytes
-                    break
-    except Exception as e:
-        print(f"[Warning] 获取 vnstat 文本数据失败: {e}")
-
-    used_gb = used_bytes / (1024.0 ** 3)
-    return used_gb, cycle_start_str, now
-
-def print_status():
-    config = load_config()
-    server_name = config.get("SERVER_NAME", "Server")
-    total_gb = float(config.get("TOTAL_GB", 1000))
-    used_gb, cycle_start_str, now = calculate_traffic()
-    percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
-    
-    print(f"服务器名称: {server_name}")
-    print(f"监控网卡: {config.get('INTERFACES', 'N/A')}")
-    print(f"重置日期: 每月 {config.get('RESET_DAY', 1)} 号 ({config.get('TIMEZONE_MODE', 'UTC8')})")
-    print(f"统计周期起点: {cycle_start_str}")
-    print(f"流量类型: {config.get('TRAFFIC_TYPE', '1')} (1:总流量 2:上传 3:下载)")
-    print(f"总流量限制: {total_gb:.2f} GB")
-    print(f"---------------------------------------------")
-    print(f"📊 当前已用流量: {used_gb:.2f} GB")
-    print(f"📈 流量使用占比: {percent:.2f}%")
-    print(f"⏰ 当前检测时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-
-def main():
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--status":
-            print_status()
-            return
-        elif sys.argv[1] == "--test":
-            config = load_config()
-            server_name = config.get("SERVER_NAME", "Server")
-            total_gb = float(config.get("TOTAL_GB", 1000))
-            token = config.get("TG_BOT_TOKEN", "")
-            chat_id = config.get("TG_CHAT_ID", "")
-            used_gb, cycle_start_str, now = calculate_traffic()
-            percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
-            
-            msg = (
-                f"🧪 <b>[{server_name}] 手动测试报告</b>\n\n"
-                f"▪️ <b>周期用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
-                f"▪️ <b>统计起止:</b> {cycle_start_str} 至今\n"
-                f"▪️ <b>测试时间:</b> {now.strftime('%Y-%m-%d %H:%M')}"
-            )
-            success = send_tg(token, chat_id, msg)
-            if success:
-                print("==> 测试消息已成功发送至 Telegram，请检查接收！")
-            else:
-                print("==> 发送失败，请检查您的 Bot Token 和 Chat ID 是否正确。")
-            return
-
-    config = load_config()
-    if not config:
-        return
-        
-    server_name = config.get("SERVER_NAME", "Server")
-    total_gb = float(config.get("TOTAL_GB", 1000))
-    token = config.get("TG_BOT_TOKEN", "")
-    chat_id = config.get("TG_CHAT_ID", "")
-    
-    used_gb, cycle_start_str, now = calculate_traffic()
-    percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
-        
-    state = load_state()
-    
-    if state.get("cycle_start") != cycle_start_str:
-        state = {
-            "cycle_start": cycle_start_str,
-            "warn_90": False,
-            "shutdown_95": False,
-            "last_daily_date": ""
-        }
-        save_state(state)
-        
-    current_time_str = now.strftime("%Y-%m-%d %H:%M")
-    today_date_str = now.strftime("%Y-%m-%d")
-    
-    if now.hour == 8 and now.minute == 10:
-        if state.get("last_daily_date") != today_date_str:
-            msg = (
-                f"📊 <b>[{server_name}] 每日流量日报</b>\n\n"
-                f"▪️ <b>周期用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
-                f"▪️ <b>统计起止:</b> {cycle_start_str} 至今\n"
-                f"▪️ <b>统计时间:</b> {current_time_str}"
-            )
-            send_tg(token, chat_id, msg)
-            state["last_daily_date"] = today_date_str
-            save_state(state)
-
-    if percent >= 90.0 and not state.get("warn_90", False):
-        msg = (
-            f"⚠️ <b>[{server_name}] 流量预警通知 (90%)</b>\n\n"
-            f"▪️ <b>当前用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
-            f"▪️ <b>告警时间:</b> {current_time_str}"
-        )
-        success = send_tg(token, chat_id, msg)
-        if success:
-            state["warn_90"] = True
-            save_state(state)
-
-    if percent >= 95.0 and not state.get("shutdown_95", False):
-        msg = (
-            f"🛑 <b>[{server_name}] 流量超限关机 (95%)</b>\n\n"
-            f"▪️ <b>当前用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
-            f"▪️ <b>触发动作:</b> 已执行自动关机保护\n"
-            f"▪️ <b>报警时间:</b> {current_time_str}"
-        )
-        success = send_tg(token, chat_id, msg)
-        if success:
-            state["shutdown_95"] = True
-            save_state(state)
-            os.system("shutdown -h now")
-        else:
-            print("[Warning] 95% 关机通知发送失败，推迟关机以待重试。")
-
-if __name__ == "__main__":
-    main()
-EOF_PY
-
-    chmod +x "$SCRIPT_FILE"
-    echo "==> 监控核心脚本已更新并赋予权限。"
-}
-
-setup_cron() {
-    echo "==> 配置定时任务 (每1分钟检查一次)..."
-    crontab -l 2>/dev/null | grep -v "traffic-monitor.py" | { cat; echo "$CRON_JOB"; } | crontab -
-    systemctl restart cron
-    echo "==> 定时任务设置成功！"
-}
-
-show_status() {
-    if [ -f "$CONFIG_FILE" ]; then
-        echo "============================================="
-        echo "          当前流量监控运行状态"
-        echo "============================================="
-        python3 /usr/local/bin/traffic-monitor.py --status
-        echo "============================================="
+    # Timezone for traffic calculation
+    echo "Select traffic statistics timezone:"
+    echo "1) UTC+0"
+    echo "2) UTC+8 (Beijing Time)"
+    read -p "Select [1-2, Default: 2]: " tz_choice
+    if [ "$tz_choice" = "1" ]; then
+        TIMEZONE_SETTING="UTC0"
     else
-        echo "尚未配置监控，请先运行安装/配置。"
+        TIMEZONE_SETTING="UTC8"
+    fi
+
+    # Traffic Type
+    echo "Select traffic statistic type:"
+    echo "1) Total Traffic (Upload + Download)"
+    echo "2) Upload Only"
+    echo "3) Download Only"
+    read -p "Select [1-3, Default: 1]: " type_choice
+    TRAFFIC_TYPE="${type_choice:-1}"
+
+    # Total Limit
+    read -p "Enter total monthly traffic limit in GB (e.g., 1000): " input_limit
+    TOTAL_LIMIT_GB="${input_limit:-1000}"
+
+    # Telegram Bot
+    read -p "Enter Telegram Bot Token: " TG_BOT_TOKEN
+    read -p "Enter Telegram Chat ID: " TG_CHAT_ID
+
+    # Thresholds
+    read -p "Enter warning threshold percentage [Default: 90]: " input_warn
+    WARN_PERCENT="${input_warn:-90}"
+
+    read -p "Enter shutdown threshold percentage [Default: 95]: " input_shutdown
+    SHUTDOWN_PERCENT="${input_shutdown:-95}"
+
+    save_config
+    setup_daemon
+    echo "[+] Configuration completed and daemon installed successfully!"
+}
+
+# 5. Telegram Notification Function
+send_telegram() {
+    local message="$1"
+    if [ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ]; then
+        return 1
+    fi
+    response=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${TG_CHAT_ID}" \
+        -d "text=${message}" \
+        -d "parse_mode=Markdown")
+    
+    if echo "$response" | grep -q '"ok":true'; then
+        return 0
+    else
+        return 1
     fi
 }
 
-menu() {
-    while true; do
-        clear
-        echo "============================================="
-        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.2"
-        echo "============================================="
-        echo "1. 安装 / 初始化配置 / 修改配置"
-        echo "2. 查看当前监控状态与流量使用情况"
-        echo "3. 手动触发一次 Telegram 测试推送"
-        echo "4. 卸载流量监控"
-        echo "0. 退出脚本"
-        echo "============================================="
-        read -p "请选择操作 [0-4]: " choice
-        case "$choice" in
-            1)
-                install_dependencies
-                configure_params
-                deploy_monitor_script
-                setup_cron
-                echo "==> 安装与配置完成！"
-                read -p "按回车键返回主菜单..."
-                ;;
-            2)
-                show_status
-                read -p "按回车键返回主菜单..."
-                ;;
-            3)
-                echo "==> 正在向 Telegram 发送测试消息..."
-                python3 /usr/local/bin/traffic-monitor.py --test
-                read -p "按回车键返回主菜单..."
-                ;;
-            4)
-                read -p "确定要卸载流量监控吗？[y/N]: " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    crontab -l 2>/dev/null | grep -v "traffic-monitor.py" | crontab -
-                    rm -f "$CONFIG_FILE" "$SCRIPT_FILE"
-                    echo "==> 卸载完成。"
-                fi
-                read -p "按回车键返回主菜单..."
-                ;;
-            0)
-                exit 0
-                ;;
-            *)
-                echo "无效选项，请重新选择。"
-                sleep 1
-                ;;
-        esac
+# 6. Calculate Traffic using vnstat
+calculate_traffic() {
+    local total_rx=0
+    local total_tx=0
+
+    # Ensure vnstat database is ready for specified interfaces
+    for iface in $INTERFACES; do
+        vnstat -i "$iface" --json >/dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            continue
+        fi
+        
+        # Get json data for interface
+        json_data=$(vnstat -i "$iface" --json)
+        
+        # Calculate based on current billing cycle (simplified via monthly vnstat summary or custom range)
+        # For precision matching the reset day and timezone:
+        rx_bytes=$(echo "$json_data" | jq -r --arg iface "$iface" '.interfaces[] \vert{} select(.name==$iface) | .traffic.month[0].rx')
+        tx_bytes=$(echo "$json_data" | jq -r --arg iface "$iface" '.interfaces[] \vert{} select(.name==$iface) | .traffic.month[0].tx')
+        
+        if [ "$rx_bytes" != "null" ] && [ -n "$rx_bytes" ]; then
+            total_rx=$((total_rx + rx_bytes))
+        fi
+        if [ "$tx_bytes" != "null" ] && [ -n "$tx_bytes" ]; then
+            total_tx=$((total_tx + tx_bytes))
+        fi
     done
+
+    # Select traffic type
+    local used_bytes=0
+    case "$TRAFFIC_TYPE" in
+        2) used_bytes=$total_tx ;; 3) used_bytes=$total_rx ;;
+        *) used_bytes=$((total_rx + total_tx)) ;;
+    end
+
+    # Convert to GB (using decimal float)
+    local used_gb
+    used_gb=$(awk "BEGIN {print $used_bytes / 1024 / 1024 / 1024}")
+    echo "$used_gb"
 }
 
-menu
+# 7. Core Daemon Script Generation (Runs every 1 minute)
+setup_daemon() {
+    cat << 'EOF' > "$DAEMON_SCRIPT"
+#!/usr/bin/env bash
+CONFIG_FILE="/etc/traffic-monitor.conf"
+if [ ! -f "$CONFIG_FILE" ]; then
+    exit 1
+fi
+source "$CONFIG_FILE"
+
+# Timezone adjustment
+if [ "$TIMEZONE_SETTING" = "UTC8" ]; then
+    export TZ="Asia/Shanghai"
+else
+    export TZ="UTC"
+fi
+
+CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+CURRENT_HOUR_MIN=$(date '+%H:%M')
+CURRENT_DAY=$(date '+%d')
+TODAY_STR=$(date '+%Y-%m-%d')
+
+# Helper to send telegram
+send_tg() {
+    local msg="$1"
+    curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${TG_CHAT_ID}" \
+        -d "text=${msg}" \
+        -d "parse_mode=Markdown" >/dev/null
+}
+
+# Calculate current used traffic in GB
+total_rx=0
+total_tx=0
+for iface in $INTERFACES; do
+    json_data=$(vnstat -i "$iface" --json 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        rx=$(echo "$json_data" | jq -r --arg iface "$iface" '.interfaces[] \vert{} select(.name==$iface) | .traffic.month[0].rx // 0')
+        tx=$(echo "$json_data" | jq -r --arg iface "$iface" '.interfaces[] \vert{} select(.name==$iface) | .traffic.month[0].tx // 0')
+        total_rx=$((total_rx + rx))
+        total_tx=$((total_tx + tx))
+    fi
+done
+
+case "$TRAFFIC_TYPE" in
+    2) used_bytes=$total_tx ;; 3) used_bytes=$total_rx ;;
+    *) used_bytes=$((total_rx + total_tx)) ;;
+esac
+
+used_gb=$(awk "BEGIN {print $used_bytes / 1024 / 1024 / 1024}")
+percentage=$(awk "BEGIN {printf \"%.2f\", ($used_gb / $TOTAL_LIMIT_GB) * 100}")
+
+# 1. Daily Report at 08:10 Beijing Time
+DAILY_LOCK="/var/run/traffic-monitor-daily.lock"
+if [ "$CURRENT_HOUR_MIN" = "08:10" ]; then
+    if [ ! -f "$DAILY_LOCK" ] \vert{}\vert{} [ "$(cat "$DAILY_LOCK")" != "$TODAY_STR" ]; then
+        report_msg="📊 *Daily Traffic Report*
+🏛 Server: \`$SERVER_NAME\`
+📈 Used: \`$(printf "%.2f" "$used_gb") GB\` / \`$TOTAL_LIMIT_GB GB\` (\`$percentage%\`)
+🕒 Time: \`$CURRENT_TIME\`"
+        send_tg "$report_msg"
+        echo "$TODAY_STR" > "$DAILY_LOCK"
+    fi
+fi
+
+# 2. Warning Check (90%)
+WARN_LOCK="/var/run/traffic-monitor-warn.lock"
+is_warn_reached=$(awk "BEGIN {print ($percentage >=$WARN_PERCENT) ? 1 : 0}")
+if [ "$is_warn_reached" -eq 1 ]; then
+    current_month_key=$(date '+%Y-%m')
+    if [ ! -f "$WARN_LOCK" ] \vert{}\vert{} [ "$(cat "$WARN_LOCK")" != "$current_month_key" ]; then
+        warn_msg="⚠️ *Traffic Warning Notice*
+🏛 Server: \`$SERVER_NAME\`
+🚨 Traffic has reached *${percentage}%* (\`$(printf "%.2f" "$used_gb") GB\` / \`$TOTAL_LIMIT_GB GB\`)!
+🕒 Time: \`$CURRENT_TIME\`"
+        send_tg "$warn_msg"
+        echo "$current_month_key" > "$WARN_LOCK"
+    fi
+fi
+
+# 3. Shutdown Check (95%)
+SHUTDOWN_LOCK="/var/run/traffic-monitor-shutdown.lock"
+is_shutdown_reached=$(awk "BEGIN {print ($percentage >=$SHUTDOWN_PERCENT) ? 1 : 0}")
+if [ "$is_shutdown_reached" -eq 1 ]; then
+    current_month_key=$(date '+%Y-%m')
+    if [ ! -f "$SHUTDOWN_LOCK" ] \vert{}\vert{} [ "$(cat "$SHUTDOWN_LOCK")" != "$current_month_key" ]; then
+        shutdown_msg="🛑 *Critical: Traffic Limit Exceeded*
+🏛 Server: \`$SERVER_NAME\`
+⚡ Traffic reached *${percentage}%* (\`$(printf "%.2f" "$used_gb") GB\` / \`$TOTAL_LIMIT_GB GB\`).
+🔌 *Server is shutting down now to prevent overage!*
+🕒 Time: \`$CURRENT_TIME\`"
+        
+        # Verify notification sent successfully before shutdown
+        response=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT_ID}" \
+            -d "text=${shutdown_msg}" \
+            -d "parse_mode=Markdown")
+        
+        if echo "$response" | grep -q '"ok":true'; then
+            echo "$current_month_key" > "$SHUTDOWN_LOCK"
+            shutdown -h now
+        fi
+    fi
+fi
+EOF
+
+    chmod +x "$DAEMON_SCRIPT"
+
+    # Setup Cron job for 1-minute interval
+    echo "* * * * * root /bin/bash $DAEMON_SCRIPT >/dev/null 2>&1" > "$CRON_JOB_FILE"
+    systemctl restart cron
+}
+
+# 8. Script Self-Update
+self_update() {
+    echo "[+] Checking for script updates..."
+    LOCAL_SCRIPT_PATH="$(readlink -f "$0")"
+    if [ -f "$LOCAL_SCRIPT_PATH" ]; then
+        echo "[+] Removing local script file..."
+        rm -f "$LOCAL_SCRIPT_PATH"
+    fi
+    
+    echo "[+] Downloading latest update from GitHub..."
+    curl -o "$LOCAL_SCRIPT_PATH" https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
+    if [ $? -eq 0 ]; then
+        chmod +x "$LOCAL_SCRIPT_PATH"
+        echo "[+] Script updated successfully to version v$VERSION. Restarting..."
+        exec "$LOCAL_SCRIPT_PATH"
+    else
+        echo "[-] Update failed! Please check your network connection."
+    fi
+}
+
+# 9. Status & Traffic View
+view_status() {
+    load_config
+    echo "=================================================="
+    echo "          Traffic Monitor Status Report           "
+    echo "=================================================="
+    echo "Server Name    : $SERVER_NAME"
+    echo "Interfaces     : $INTERFACES"
+    echo "Reset Day      : $RESET_DAY"
+    echo "Timezone       : $TIMEZONE_SETTING"
+    echo "Traffic Type   : $TRAFFIC_TYPE (1:Total, 2:Upload, 3:Download)"
+    echo "Total Limit    : $TOTAL_LIMIT_GB GB"
+    echo "Warn Threshold : $WARN_PERCENT%"
+    echo "Shutdown Limit : $SHUTDOWN_PERCENT%"
+    echo "--------------------------------------------------"
+    used_gb=$(calculate_traffic)
+    percentage=$(awk "BEGIN {printf \"%.2f\", ($used_gb / $TOTAL_LIMIT_GB) * 100}")
+    echo -e "Current Used   : ${GREEN}${used_gb} GB${NC} / ${TOTAL_LIMIT_GB} GB (${percentage}%)"
+    echo "=================================================="
+}
+
+# 10. Interactive Menu
+show_menu() {
+    clear
+    echo "=================================================="
+    echo "    Debian 13 Traffic Monitor Control Panel       "
+    echo "    Version: v$VERSION                            "
+    echo "=================================================="
+    echo "1. Install / Initial Setup"
+    echo "2. Modify Configuration"
+    echo "3. View Current Traffic & Status"
+    echo "4. Test Telegram Notification"
+    echo "5. Run Check Manually"
+    echo "6. Update Script (Self-Update)"
+    echo "7. Uninstall Traffic Monitor"
+    echo "0. Exit"
+    echo "=================================================="
+    read -p "Select an option [0-7]: " choice
+
+    case "$choice" in
+        1)
+            install_dependencies
+            configure_wizard
+            ;;
+        2)
+            configure_wizard
+            ;;
+        3)
+            view_status
+            ;;
+        4)
+            load_config
+            if [ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ]; then
+                echo "[-] Telegram bot is not configured yet."
+            else
+                echo "[+] Sending test notification to Telegram..."
+                if send_telegram "🔔 *Test Notification* from server \`$SERVER_NAME\`. Configuration is working correctly!"; then
+                    echo "[+] Test notification sent successfully!"
+                else
+                    echo "[-] Failed to send notification. Check Token and Chat ID."
+                fi
+            fi
+            ;;
+        5)
+            echo "[+] Executing daemon check manually..."
+            /bin/bash "$DAEMON_SCRIPT"
+            echo "[+] Execution finished."
+            ;;
+        6)
+            self_update
+            ;;
+        7)
+            echo "[+] Uninstalling Traffic Monitor..."
+            rm -f "$CONFIG_FILE"
+            rm -f "$DAEMON_SCRIPT"
+            rm -f "$CRON_JOB_FILE"
+            systemctl restart cron
+            echo "[+] Uninstalled successfully."
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo "[-] Invalid option."
+            ;;
+    esac
+    echo ""
+    read -p "Press Enter to return to main menu..."
+    show_menu
+}
+
+# Entry point
+if [ "$1" = "update" ]; then
+    self_update
+else
+    show_menu
+fi
