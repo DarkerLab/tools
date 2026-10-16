@@ -31,7 +31,7 @@ detect_interfaces() {
 
 configure_params() {
     echo "============================================="
-    echo "       Debian 13 流量监控与告警脚本配置v0.1"
+    echo "    Debian 13 流量监控与报警一键脚本 v1.4"
     echo "============================================="
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -195,7 +195,6 @@ def calculate_traffic():
     combined_iface = "+".join(ifaces)
     
     try:
-        # 使用 vnstat 文本表格查询，完美支持多网卡聚合（如 ens18+ens19）
         res = subprocess.run(["vnstat", "-i", combined_iface, "-m"], capture_output=True, text=True, check=True)
         target_ym = now.strftime("%Y-%m")
         
@@ -291,7 +290,6 @@ def main():
     current_time_str = now.strftime("%Y-%m-%d %H:%M")
     today_date_str = now.strftime("%Y-%m-%d")
     
-    # 1. 每日 08:10 北京时间报告推送
     if now.hour == 8 and now.minute == 10:
         if state.get("last_daily_date") != today_date_str:
             msg = (
@@ -304,7 +302,6 @@ def main():
             state["last_daily_date"] = today_date_str
             save_state(state)
 
-    # 2. 90% 预警推送通知
     if percent >= 90.0 and not state.get("warn_90", False):
         msg = (
             f"⚠️ <b>[{server_name}] 流量预警通知 (90%)</b>\n\n"
@@ -316,7 +313,6 @@ def main():
             state["warn_90"] = True
             save_state(state)
 
-    # 3. 95% 关机报警推送通知
     if percent >= 95.0 and not state.get("shutdown_95", False):
         msg = (
             f"🛑 <b>[{server_name}] 流量超限关机 (95%)</b>\n\n"
@@ -363,7 +359,7 @@ menu() {
     while true; do
         clear
         echo "============================================="
-        echo "    Debian 13 vnstat 流量监控与报警一键脚本"
+        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.4"
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
