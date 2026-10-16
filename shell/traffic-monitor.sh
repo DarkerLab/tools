@@ -10,7 +10,8 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 CRON_FILE="/etc/cron.d/traffic-monitor"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-RAW_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
+SCRIPT_VERSION="1.1"
+BASE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
 RED='\033[01;31m'
@@ -22,7 +23,7 @@ NC='\033[0m'
 # ==================== 1. 安装与配置模块 ====================
 install_or_config() {
     clear
-    echo -e "${BLUE}=== vnstat 流量监控助手 - 安装与配置 ===${NC}"
+    echo -e "${BLUE}=== vnstat 流量监控助手 v${SCRIPT_VERSION} - 安装与配置 ===${NC}"
     
     # 检查并安装依赖
     echo -e "${YELLOW}[*] 检查系统环境与依赖工具...${NC}"
@@ -330,8 +331,11 @@ view_traffic() {
 }
 
 update_script() {
-    echo -e "${YELLOW}正在从 GitHub 强制刷新拉取最新脚本...${NC}"
-    if curl -sSL "$RAW_URL" -o "$SCRIPT_PATH"; then
+    echo -e "${YELLOW}正在从 GitHub 强制刷新拉取最新脚本（已启用防CDN缓存机制）...${NC}"
+    # 核心优化：拼接动态时间戳参数 ?v=$(date +%s)，强制 CDN 丢弃旧缓存拉取最新代码
+    FORCE_URL="${BASE_URL}?v=$(date +%s)"
+    
+    if curl -sSL "$FORCE_URL" -o "$SCRIPT_PATH"; then
         chmod +x "$SCRIPT_PATH"
         cp "$SCRIPT_PATH" "$0"
         echo -e "${GREEN}[√] 脚本更新成功，正在重新启动...${NC}"
@@ -362,7 +366,7 @@ uninstall() {
 show_menu() {
     clear
     echo "========================================"
-    echo "       vnstat 流量监控助手 v1.1          "
+    echo "       vnstat 流量监控助手 v${SCRIPT_VERSION}          "
     echo "========================================"
     echo " 1. 安装部署/修改配置"
     echo " 2. 测试发送每日流量推送"
