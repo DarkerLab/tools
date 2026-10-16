@@ -1,397 +1,413 @@
-#!/bin/sh
+#!/bin/bash
 
-# 确保以 root 权限运行
-if [ "$(id -u)" != "0" ]; then
-    echo "错误：请使用 root 权限运行此脚本！(sudo sh install.sh)"
-    exit 1
+# 确保以root权限运行
+if [ "$EUID" -ne 0 ]; then
+  echo "请以 root 权限运行此脚本 (sudo bash install.sh)"
+  exit 1
 fi
 
-CONF_FILE="/etc/traffic-monitor.conf"
-CHECK_SCRIPT="/usr/local/bin/traffic-monitor-check.sh"
-REPORT_SCRIPT="/usr/local/bin/traffic-monitor-report.sh"
+CONFIG_FILE="/etc/traffic-monitor.conf"
+SCRIPT_FILE="/usr/local/bin/traffic-monitor.py"
+CRON_JOB="* * * * * /usr/bin/python3 /usr/local/bin/traffic-monitor.py >/dev/null 2>&1"
 
-# 检查并安装依赖
 install_dependencies() {
-    echo "正在更新软件源并安装必要的依赖 (vnstat, jq, curl, bc)..."
-    apt-get update -y
-    apt-get install -y vnstat jq curl bc
+    echo "==> 正在更新系统并安装依赖工具..."
+    apt update && apt upgrade -y
+    apt install -y vnstat curl jq python3 bc cron
+    
+    # 设置系统时区为 Asia/Shanghai
+    echo "==> 设置系统时区为 Asia/Shanghai..."
+    timedatectl set-timezone Asia/Shanghai
+    
+    # 启动并启用 vnstat服务
     systemctl enable --now vnstat
+    sleep 2
 }
 
-# 交互式配置向导
-configure_menu() {
-    clear
-    echo "=========================================="
-    echo "       Debian 13 流量监控与报警系统配置       "
-    echo "=========================================="
+detect_interfaces() {
+    echo "==> 检测当前可用的网卡接口..."
+    ip -o link show | awk -F': ' '{print $2}' | grep -v "lo"
+}
 
-    # 加载现有配置（如果存在）
-    if [ -f "$CONF_FILE" ]; then
-        . "$CONF_FILE"
-        echo "检测到已有配置文件，当前配置："
-        echo "  - 监控网口: $INTERFACES"
-        echo "  - 月流量上限: ${MONTHLY_LIMIT_GB} GB"
-        echo "  - 每月重置日: $RESET_DAY 日"
-        echo "  - 统计时区: $TIMEZONE"
-        echo "  - Telegram Chat ID: $TG_CHAT_ID"
-        echo "  - 流量预警线: ${WARN_PERCENT}%"
-        echo "  - 关机保护线: ${SHUTDOWN_PERCENT}%"
-        echo ""
-        printf "是否基于现有配置进行修改？[y/N]: "
-        read modify_choice
-        case "$modify_choice" in
-            [yY]) ;;
-            *) echo "取消修改。"; return ;;
-        esac
+configure_params() {
+    echo "============================================="
+    echo "       Debian 13 流量监控与告警脚本配置"
+    echo "============================================="
+
+    # 读取现有配置（如果存在）
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
     fi
 
-    # 1. 网卡选择
-    echo ""
-    echo "当前系统可用网口列表："
-    ip -o link show | awk -F': ' '{print "  - " $2}'
-    echo "提示：如需同时监控多个网口，请用空格隔开（例如：eth0 eth1）。"
-    printf "请输入要监控的网口名称 [%s]: " "${INTERFACES:-eth0}"
-    read input_ifaces
+    read -p "请输入自定义监控服务器名称 [当前: ${SERVER_NAME:-My-Server}]: " input_name
+    SERVER_NAME="${input_name:-${SERVER_NAME:-My-Server}}"
+
+    echo "可用网卡列表："
+    detect_interfaces
+    read -p "请输入要监控的网卡接口(多个网卡用空格或逗号分隔) [当前: ${INTERFACES:-eth0}]: " input_ifaces
     INTERFACES="${input_ifaces:-${INTERFACES:-eth0}}"
+    # 统一转换空格为逗号或保持格式
+    INTERFACES=$(echo "$INTERFACES" | tr ',' ' ')
 
-    # 2. 月流量上限
-    printf "请输入每月流量上限 (单位: GB) [%s]: " "${MONTHLY_LIMIT_GB:-1000}"
-    read input_limit
-    MONTHLY_LIMIT_GB="${input_limit:-${MONTHLY_LIMIT_GB:-1000}}"
+    read -p "请输入每月流量重置日期 (1-31) [当前: ${RESET_DAY:-1}]: " input_day
+    RESET_DAY="${input_day:-${RESET_DAY:-1}}"
 
-    # 3. 每月重置日
-    printf "请输入每月流量重置日 (1-28) [%s]: " "${RESET_DAY:-1}"
-    read input_reset
-    RESET_DAY="${input_reset:-${RESET_DAY:-1}}"
-
-    # 4. 时区选择
-    echo ""
-    echo "请选择流量统计与重置时区："
-    echo "  1) UTC+8 (Asia/Shanghai - 北京时间)"
-    echo "  2) UTC+0 (Etc/UTC)"
-    printf "请选择 [1-2] [%s]: " "1"
-    read input_tz_choice
-    case "$input_tz_choice" in
-        2) TIMEZONE="Etc/UTC" ;;
-        *) TIMEZONE="Asia/Shanghai" ;;
+    echo "请选择流量重置时区基准："
+    echo "1) UTC+8 (北京时间)"
+    echo "2) UTC+0 (零时区)"
+    read -p "请选择 [当前: ${TIMEZONE_MODE:-UTC8}]: " input_tz
+    case "$input_tz" in
+        2) TIMEZONE_MODE="UTC0" ;;
+        *) TIMEZONE_MODE="UTC8" ;;
     esac
 
-    # 5. Telegram 配置
-    printf "请输入 Telegram Bot Token [%s]: " "$TG_BOT_TOKEN"
-    read input_token
-    [ -n "$input_token" ] && TG_BOT_TOKEN="$input_token"
+    echo "请选择流量统计类型："
+    echo "1) 总流量 (上传 + 下载)"
+    echo "2) 仅上传流量"
+    echo "3) 仅下载流量"
+    read -p "请选择 [当前: ${TRAFFIC_TYPE:-1}]: " input_type
+    TRAFFIC_TYPE="${input_type:-${TRAFFIC_TYPE:-1}}"
 
-    printf "请输入 Telegram Chat ID [%s]: " "$TG_CHAT_ID"
-    read input_chatid
-    [ -n "$input_chatid" ] && TG_CHAT_ID="$input_chatid"
+    read -p "请输入每月总流量限制额度 (单位: GB，例如 1000) [当前: ${TOTAL_GB:-1000}]: " input_total
+    TOTAL_GB="${input_total:-${TOTAL_GB:-1000}}"
 
-    # 6. 预警与关机阈值
-    printf "请输入流量预警百分比 (默认 90) [%s]: " "${WARN_PERCENT:-90}"
-    read input_warn
-    WARN_PERCENT="${input_warn:-${WARN_PERCENT:-90}}"
+    read -p "请输入 Telegram Bot Token [当前: ${TG_BOT_TOKEN}]: " input_token
+    TG_BOT_TOKEN="${input_token:-$TG_BOT_TOKEN}"
 
-    printf "请输入超额关机百分比 (默认 95) [%s]: " "${SHUTDOWN_PERCENT:-95}"
-    read input_shut
-    SHUTDOWN_PERCENT="${input_shut:-${SHUTDOWN_PERCENT:-95}}"
+    read -p "请输入 Telegram Chat ID [当前: ${TG_CHAT_ID}]: " input_chat
+    TG_CHAT_ID="${input_chat:-$TG_CHAT_ID}"
 
-    # 保存配置文件
-    cat << EOF > "$CONF_FILE"
+    # 写入配置文件
+    cat << EOF_CONF > "$CONFIG_FILE"
+SERVER_NAME="$SERVER_NAME"
 INTERFACES="$INTERFACES"
-MONTHLY_LIMIT_GB="$MONTHLY_LIMIT_GB"
-RESET_DAY="$RESET_DAY"
-TIMEZONE="$TIMEZONE"
+RESET_DAY=$RESET_DAY
+TIMEZONE_MODE="$TIMEZONE_MODE"
+TRAFFIC_TYPE="$TRAFFIC_TYPE"
+TOTAL_GB=$TOTAL_GB
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
-WARN_PERCENT="$WARN_PERCENT"
-SHUTDOWN_PERCENT="$SHUTDOWN_PERCENT"
-EOF
+EOF_CONF
 
-    echo "配置文件已保存至 $CONF_FILE"
+    echo "==> 配置文件已保存至 $CONFIG_FILE"
+}
 
-    # 更新 vnstat 全局配置中的 MonthRotate
-    if grep -q "^MonthRotate" /etc/vnstat.conf; then
-        sed -i "s/^MonthRotate.*/MonthRotate $RESET_DAY/" /etc/vnstat.conf
+deploy_monitor_script() {
+    echo "==> 正在生成核心监控脚本..."
+    cat << 'EOF_PY' > "$SCRIPT_FILE"
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+CONFIG_FILE = "/etc/traffic-monitor.conf"
+STATE_FILE = "/var/lib/traffic-monitor/state.json"
+
+def load_config():
+    config = {}
+    if not os.path.exists(CONFIG_FILE):
+        sys.exit(0)
+    with open(CONFIG_FILE, "r") as f:
+        for line in f:
+            if "=" in line and not line.startswith("#"):
+                k, v = line.strip().split("=", 1)
+                config[k] = v.strip('"\'')
+    return config
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"cycle_start": "", "warn_90": False, "shutdown_95": False, "last_daily_date": ""}
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+def send_tg(token, chat_id, message):
+    if not token or not chat_id:
+        return
+    import urllib.request
+    import urllib.parse
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": message, "parse_mode": "HTML"}).encode()
+    try:
+        urllib.request.urlopen(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"Telegram send error: {e}")
+
+def get_vnstat_data(interfaces):
+    ifaces = interfaces.split()
+    total_rx = 0
+    total_tx = 0
+    
+    # 聚合所有选定网卡的每日流量数据
+    for iface in ifaces:
+        try:
+            cmd = ["vnstat", "-i", iface, "--days", "--json"]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(res.stdout)
+            for inf in data.get("interfaces", []):
+                if inf.get("name") == iface:
+                    for day_rec in inf.get("traffic", {}).get("days", []):
+                        # 收集所有日记录，后续在Python中精确按时区和重置日过滤
+                        pass
+        except Exception as e:
+            continue
+            
+    # 为了更稳妥，直接使用 vnstat --json 全局获取
+    try:
+        res = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        for inf in data.get("interfaces", []):
+            if inf.get("name") in ifaces:
+                for day_rec in inf.get("traffic", {}).get("days", []):
+                    d_date = day_rec.get("date")
+                    d_rx = day_rec.get("rx", 0)
+                    d_tx = day_rec.get("tx", 0)
+                    # 可以在这里累加或暂存
+        return data
+    except Exception as e:
+        return None
+
+def calculate_traffic():
+    config = load_config()
+    ifaces = config.get("INTERFACES", "eth0").split()
+    reset_day = int(config.get("RESET_DAY", 1))
+    tz_mode = config.get("TIMEZONE_MODE", "UTC8")
+    traffic_type = int(config.get("TRAFFIC_TYPE", 1))
+    
+    # 时区设置
+    if tz_mode == "UTC0":
+        target_tz = timezone.utc
+    else:
+        target_tz = timezone(timedelta(hours=8))
+        
+    now = datetime.now(target_tz)
+    year, month, day = now.year, now.month, now.day
+    
+    # 计算当前流量重置周期的开始时间
+    if day >= reset_day:
+        cycle_start = datetime(year, month, reset_day, 0, 0, 0, tzinfo=target_tz)
+    else:
+        if month == 1:
+            cycle_start = datetime(year - 1, 12, reset_day, 0, 0, 0, tzinfo=target_tz)
+        else:
+            cycle_start = datetime(year, month - 1, reset_day, 0, 0, 0, tzinfo=target_tz)
+            
+    cycle_start_str = cycle_start.strftime("%Y-%m-%d")
+    
+    # 从vnstat获取详细每日流量
+    used_bytes = 0
+    try:
+        res = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
+        data = json.loads(res.json() if hasattr(res, 'json') else res.stdout)
+        
+        for inf in data.get("interfaces", []):
+            if inf.get("name") in ifaces:
+                days_list = inf.get("traffic", {}).get("days", [])
+                for d in days_list:
+                    d_date = d.get("date", {})
+                    dy = d_date.get("year")
+                    dm = d_date.get("month")
+                    dd = d_date.get("day")
+                    try:
+                        record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
+                        if record_date >= cycle_start:
+                            rx = d.get("rx", 0)
+                            tx = d.get("tx", 0)
+                            if traffic_type == 1:
+                                used_bytes += (rx + tx)
+                            elif traffic_type == 2:
+                                used_bytes += tx
+                            elif traffic_type == 3:
+                                used_bytes += rx
+                    except Exception as ex:
+                        continue
+    except Exception as e:
+        # 降级方案：如果json解析失败，通过vnstat简易获取本月流量
+        pass
+
+    # 如果上述json累加为0（例如新装环境或vnstat无当月天数据），尝试用 vnstat -m 获取当月总量
+    if used_bytes == 0:
+        try:
+            for iface in ifaces:
+                res = subprocess.run(["vnstat", "-i", iface, "-m", "--json"], capture_output=True, text=True, check=True)
+                m_data = json.loads(res.stdout)
+                for inf in m_data.get("interfaces", []):
+                    months = inf.get("traffic", {}.get("months", []))
+                    if months:
+                        latest = months[0] # 当前月
+                        rx = latest.get("rx", 0)
+                        tx = latest.get("tx", 0)
+                        if traffic_type == 1:
+                            used_bytes += (rx + tx)
+                        elif traffic_type == 2:
+                            used_bytes += tx
+                        elif traffic_type == 3:
+                            used_bytes += rx
+        except:
+            pass
+
+    used_gb = used_bytes / (1024 ** 3)
+    return used_gb, cycle_start_str, now
+
+def main():
+    config = load_config()
+    if not config:
+        return
+        
+    server_name = config.get("SERVER_NAME", "Server")
+    total_gb = float(config.get("TOTAL_GB", 1000))
+    token = config.get("TG_BOT_TOKEN", "")
+    chat_id = config.get("TG_CHAT_ID", "")
+    
+    used_gb, cycle_start_str, now = calculate_traffic()
+    
+    if total_gb > 0:
+        percent = (used_gb / total_gb) * 100
+    else:
+        percent = 0.0
+        
+    state = load_state()
+    
+    # 跨周期重置状态检查
+    if state.get("cycle_start") != cycle_start_str:
+        state = {
+            "cycle_start": cycle_start_str,
+            "warn_90": False,
+            "shutdown_95": False,
+            "last_daily_date": ""
+        }
+        save_state(state)
+        
+    # 1. 每日 08:10 北京时间报告推送
+    current_time_str = now.strftime("%Y-%m-%d %H:%M")
+    today_date_str = now.strftime("%Y-%m-%d")
+    
+    # 判断是否为北京时间 08:10（脚本每分钟运行一次，检查小时和分钟）
+    if now.hour == 8 and now.minute == 10:
+        if state.get("last_daily_date") != today_date_str:
+            msg = (
+                f"📊 <b>每日流量报告</b>\n"
+                f"🏷 <b>名称:</b> {server_name}\n"
+                f"📈 <b>已用 / 总计:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
+                f"🔄 <b>统计周期起止:</b> {cycle_start_str} 至今\n"
+                f"⏰ <b>当前时间:</b> {current_time_str}"
+            )
+            send_tg(token, chat_id, msg)
+            state["last_daily_date"] = today_date_str
+            save_state(state)
+
+    # 2. 90% 预警推送通知
+    if percent >= 90.0 and not state.get("warn_90", False):
+        msg = (
+            f"⚠️ <b>流量预警通知 (90%)</b>\n"
+            f"🏷 <b>名称:</b> {server_name}\n"
+            f"🚨 <b>当前已使用:</b> {percent:.1f}% ({used_gb:.2f} GB / {total_gb:.2f} GB)\n"
+            f"⏰ <b>时间:</b> {current_time_str}"
+        )
+        send_tg(token, chat_id, msg)
+        state["warn_90"] = True
+        save_state(state)
+
+    # 3. 95% 关机报警推送通知
+    if percent >= 95.0 and not state.get("shutdown_95", False):
+        msg = (
+            f"🛑 <b>流量超限关机警报 (95%)</b>\n"
+            f"🏷 <b>名称:</b> {server_name}\n"
+            f"💥 <b>当前已使用:</b> {percent:.1f}% ({used_gb:.2f} GB / {total_gb:.2f} GB)\n"
+            f"⚡ <b>服务器已触发自动关机保护！</b>\n"
+            f"⏰ <b>时间:</b> {current_time_str}"
+        )
+        send_tg(token, chat_id, msg)
+        state["shutdown_95"] = True
+        save_state(state)
+        # 执行关机
+        os.system("shutdown -h now")
+
+if __name__ == "__main__":
+    main()
+EOF_PY
+
+    chmod +x "$SCRIPT_FILE"
+    echo "==> 监控核心脚本已生成并赋予权限。"
+}
+
+setup_cron() {
+    echo "==> 配置定时任务 (每1分钟检查一次)..."
+    # 移除旧的同名定时任务，防止重复
+    crontab -l 2>/dev/null | grep -v "traffic-monitor.py" | { cat; echo "$CRON_JOB"; } | crontab -
+    systemctl restart cron
+    echo "==> 定时任务设置成功！"
+}
+
+show_status() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        echo "============================================="
+        echo "          当前流量监控运行状态"
+        echo "============================================="
+        echo "服务器名称: $SERVER_NAME"
+        echo "监控网卡: $INTERFACES"
+        echo "重置日期: 每月 ${RESET_DAY} 号 ($TIMEZONE_MODE)"
+        echo "流量类型: $TRAFFIC_TYPE (1:总流量 2:上传 3:下载)"
+        echo "总流量限制: $TOTAL_GB GB"
+        echo "---------------------------------------------"
+        python3 /usr/local/bin/traffic-monitor.py
+        echo "============================================="
     else
-        echo "MonthRotate $RESET_DAY" >> /etc/vnstat.conf
+        echo "尚未配置监控，请先运行安装/配置。"
     fi
-    systemctl restart vnstat
-
-    # 确保 vnstat 正在监控选定的所有网口
-    for iface in $INTERFACES; do
-        vnstat -i "$iface" --add 2>/dev/null
-    done
-
-    generate_scripts
-    setup_systemd_timers
-    echo ""
-    echo "=========================================="
-    echo "       初始化/配置更新成功完成！          "
-    echo "=========================================="
 }
 
-# 生成流量检查与预警脚本（支持多网口流量聚合计算）
-generate_scripts() {
-    cat << 'EOF' > "$CHECK_SCRIPT"
-#!/bin/sh
-CONF="/etc/traffic-monitor.conf"
-[ -f "$CONF" ] && . "$CONF"
-
-[ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ] && exit 0
-
-TOTAL_RX=0
-TOTAL_TX=0
-
-# 循环遍历并聚合所有监控网口的本月流量
-for iface in $INTERFACES; do
-    JSON_DATA=$(vnstat -i "$iface" --json 2>/dev/null)
-    [ -z "$JSON_DATA" ] && continue
-    RX=$(echo "$JSON_DATA" | jq -r '.interfaces[0].traffic.month[0].rx // 0')
-    TX=$(echo "$JSON_DATA" | jq -r '.interfaces[0].traffic.month[0].tx // 0')
-    TOTAL_RX=$((TOTAL_RX + RX))
-    TOTAL_TX=$((TOTAL_TX + TX))
-done
-
-TOTAL_BYTES=$((TOTAL_RX + TOTAL_TX))
-TOTAL_GB=$(awk "BEGIN {print $TOTAL_BYTES / 1024 / 1024 / 1024}")
-LIMIT_GB="$MONTHLY_LIMIT_GB"
-
-# 计算使用百分比
-USAGE_PERCENT=$(awk "BEGIN {printf \"%.2f\", ($TOTAL_GB / $LIMIT_GB) * 100}")
-INT_PERCENT=$(echo "$USAGE_PERCENT" | awk -F'.' '{print $1}')
-
-CURRENT_MONTH=$(date +%Y-%m)
-STATE_DIR="/var/lib/traffic-monitor"
-mkdir -p "$STATE_DIR"
-WARN_FLAG="$STATE_DIR/warn_$CURRENT_MONTH.flag"
-
-send_tg() {
-    curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-        -d "chat_id=$TG_CHAT_ID" \
-        -d "parse_mode=Markdown" \
-        -d "text=$1" >/dev/null 2>&1
+menu() {
+    clear
+    echo "============================================="
+    echo "    Debian 13 vnstat 流量监控与报警一键脚本"
+    echo "============================================="
+    echo "1. 安装 / 初始化配置 / 修改配置"
+    echo "2. 查看当前监控状态与流量使用情况"
+    echo "3. 手动触发一次流量测试/每日报告推送"
+    echo "4. 卸载流量监控"
+    echo "0. 退出脚本"
+    echo "============================================="
+    read -p "请选择操作 [0-4]: " choice
+    case "$choice" in
+        1)
+            install_dependencies
+            configure_params
+            deploy_monitor_script
+            setup_cron
+            echo "==> 安装与配置完成！"
+            ;;
+        2)
+            show_status
+            ;;
+        3)
+            echo "==> 正在手动执行监控脚本..."
+            python3 /usr/local/bin/traffic-monitor.py
+            echo "==> 执行完毕。若满足条件已向 Telegram 推送。"
+            ;;
+        4)
+            read -p "确定要卸载流量监控吗？[y/N]: " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                crontab -l 2>/dev/null | grep -v "traffic-monitor.py" | crontab -
+                rm -f "$CONFIG_FILE" "$SCRIPT_FILE"
+                echo "==> 卸载完成。"
+            fi
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo "无效选项，请重新选择。"
+            ;;
+    esac
 }
-
-# 95% 超额关机警报
-if [ "$INT_PERCENT" -ge "$SHUTDOWN_PERCENT" ]; then
-    SHUTDOWN_FLAG="$STATE_DIR/shutdown_$CURRENT_MONTH.flag"
-    if [ ! -f "$SHUTDOWN_FLAG" ]; then
-        MSG="🚨 *【超额关机警报】*
-🌐 监控网口: \`$INTERFACES\`
-📊 本月已用: \`${TOTAL_GB}GB / ${LIMIT_GB}GB\` (${USAGE_PERCENT}%)
-🛑 已达到关机阈值 (${SHUTDOWN_PERCENT}%)，服务器已执行自动关机保护！"
-        send_tg "$MSG"
-        touch "$SHUTDOWN_FLAG"
-        shutdown -h now
-    fi
-# 90% 流量预警 (仅发送一次)
-elif [ "$INT_PERCENT" -ge "$WARN_PERCENT" ]; then
-    if [ ! -f "$WARN_FLAG" ]; then
-        MSG="⚠️ *【流量预警通知】*
-🌐 监控网口: \`$INTERFACES\`
-📊 本月已用: \`${TOTAL_GB}GB / ${LIMIT_GB}GB\` (${USAGE_PERCENT}%)
-🚨 已达到预警阈值 (${WARN_PERCENT}%)，请注意控制流量！"
-        send_tg "$MSG"
-        touch "$WARN_FLAG"
-    fi
-fi
-EOF
-    chmod +x "$CHECK_SCRIPT"
-
-    # 生成每日报告脚本（严格按设置时区统计前一天整天流量，避开 0 点日切冲突）
-    cat << 'EOF' > "$REPORT_SCRIPT"
-#!/bin/sh
-CONF="/etc/traffic-monitor.conf"
-[ -f "$CONF" ] && . "$CONF"
-
-[ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ] && exit 0
-
-# 根据设置的时区获取昨天的准确日期 (YYYY-MM-DD)
-YESTERDAY=$(TZ="$TIMEZONE" date -d "yesterday" +%Y-%m-%d)
-
-DAY_RX_TOTAL=0
-DAY_TX_TOTAL=0
-M_RX_TOTAL=0
-M_TX_TOTAL=0
-
-for iface in $INTERFACES; do
-    # 查询昨天指定时区整天的流量
-    JSON_DAY=$(vnstat -i "$iface" --days --begin "$YESTERDAY" --end "$YESTERDAY" --json 2>/dev/null)
-    D_RX=$(echo "$JSON_DAY" | jq -r '.interfaces[0].days[0].rx // 0')
-    D_TX=$(echo "$JSON_DAY" | jq -r '.interfaces[0].days[0].tx // 0')
-    DAY_RX_TOTAL=$((DAY_RX_TOTAL + D_RX))
-    DAY_TX_TOTAL=$((DAY_TX_TOTAL + D_TX))
-
-    # 查询本月累计流量
-    JSON_MONTH=$(vnstat -i "$iface" --json 2>/dev/null)
-    M_RX=$(echo "$JSON_MONTH" | jq -r '.interfaces[0].traffic.month[0].rx // 0')
-    M_TX=$(echo "$JSON_MONTH" | jq -r '.interfaces[0].traffic.month[0].tx // 0')
-    M_RX_TOTAL=$((M_RX_TOTAL + M_RX))
-    M_TX_TOTAL=$((M_TX_TOTAL + M_TX))
-done
-
-DAY_TOTAL=$((DAY_RX_TOTAL + DAY_TX_TOTAL))
-DAY_GB=$(awk "BEGIN {printf \"\%.2f\", $DAY_TOTAL / 1024 / 1024 / 1024}")
-DAY_RX_GB=$(awk "BEGIN {printf \"\%.2f\", $DAY_RX_TOTAL / 1024 / 1024 / 1024}")
-DAY_TX_GB=$(awk "BEGIN {printf \"\%.2f\", $DAY_TX_TOTAL / 1024 / 1024 / 1024}")
-
-M_TOTAL=$((M_RX_TOTAL + M_TX_TOTAL))
-M_GB=$(awk "BEGIN {printf \"\%.2f\", $M_TOTAL / 1024 / 1024 / 1024}")
-M_PERCENT=$(awk "BEGIN {printf \"%.2f\", ($M_GB / $MONTHLY_LIMIT_GB) * 100}")
-
-MSG="📊 *【每日流量报告】*
-📅 统计日期: \`$YESTERDAY\` (时区: \`$TIMEZONE\`)
-🌐 监控网口: \`$INTERFACES\`
-
----
-📥 *昨日下载*: \`${DAY_RX_GB} GB\`
-📤 *昨日上传*: \`${DAY_TX_GB} GB\`
-📦 *昨日合计*: \`${DAY_GB} GB\`
-
-📈 *本月累计*: \`${M_GB} GB / $MONTHLY_LIMIT_GB GB\` (${M_PERCENT}%)"
-
-curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
-    -d "chat_id=$TG_CHAT_ID" \
-    -d "parse_mode=Markdown" \
-    -d "text=$MSG" >/dev/null 2>&1
-EOF
-    chmod +x "$REPORT_SCRIPT"
-}
-
-# 配置 systemd 定时器与服务
-setup_systemd_timers() {
-    # 1. 流量检查服务与定时器：每 1 分钟运行一次
-    cat << 'EOF' > /etc/systemd/system/traffic-check.service
-[Unit]
-Description=Traffic Limit Check and Alert Service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/traffic-monitor-check.sh
-EOF
-
-    cat << 'EOF' > /etc/systemd/system/traffic-check.timer
-[Unit]
-Description=Run Traffic Check every 1 minute
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    # 2. 每日报告服务与定时器：改为北京时间每天 08:10:00 运行（避开 0点整点日切冲突）
-    cat << 'EOF' > /etc/systemd/system/traffic-report.service
-[Unit]
-Description=Daily Telegram Traffic Report Service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/traffic-monitor-report.sh
-EOF
-
-    cat << 'EOF' > /etc/systemd/system/traffic-report.timer
-[Unit]
-Description=Daily Traffic Report at 08:10 Beijing Time
-
-[Timer]
-OnCalendar=*-*-* 08:10:00 Asia/Shanghai
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now traffic-check.timer
-    systemctl enable --now traffic-report.timer
-}
-
-# 主菜单管理界面
-main_menu() {
-    while true; do
-        clear
-        echo "=========================================="
-        echo "      Debian 13 流量监控与 TG 报警管理       "
-        echo "=========================================="
-        if [ -f "$CONF_FILE" ]; then
-            echo "状态: [已配置并运行中]"
-        else
-            echo "状态: [未配置]"
-        fi
-        echo "------------------------------------------"
-        echo "  1. 首次安装 / 修改配置参数"
-        echo "  2. 手动执行一次流量检查与预警测试"
-        echo "  3. 手动发送一次今日流量报告"
-        echo "  4. 查看当前网口实时流量状态"
-        echo "  5. 卸载流量监控系统"
-        echo "  0. 退出脚本"
-        echo "=========================================="
-        printf "请输入选项 [0-5]: "
-        read choice
-
-        case "$choice" in
-            1)
-                install_dependencies
-                configure_menu
-                echo ""
-                printf "按回车键继续..."
-                read dummy
-                ;;
-            2)
-                if [ -f "$CHECK_SCRIPT" ]; then
-                    sh "$CHECK_SCRIPT"
-                    echo "检查脚本已手动执行完成。"
-                else
-                    echo "错误：脚本未安装。"
-                fi
-                printf "按回车键继续..."
-                read dummy
-                ;;
-            3)
-                if [ -f "$REPORT_SCRIPT" ]; then
-                    sh "$REPORT_SCRIPT"
-                    echo "日报脚本已手动执行完成，请检查 Telegram 接收。"
-                else
-                    echo "错误：脚本未安装。"
-                fi
-                printf "按回车键继续..."
-                read dummy
-                ;;
-            4)
-                if [ -f "$CONF_FILE" ]; then
-                    . "$CONF_FILE"
-                    for iface in $INTERFACES; do
-                        echo "--- 网口: $iface ---"
-                        vnstat -i "$iface"
-                    done
-                else
-                    echo "尚未配置。"
-                fi
-                echo ""
-                printf "按回车键继续..."
-                read dummy
-                ;;
-            5)
-                echo "正在卸载..."
-                systemctl disable --now traffic-check.timer traffic-check.service 2>/dev/null
-                systemctl disable --now traffic-report.timer traffic-report.service 2>/dev/null
-                rm -f /etc/systemd/system/traffic-check.* /etc/systemd/system/traffic-report.*
-                rm -f "$CHECK_SCRIPT" "$REPORT_SCRIPT" "$CONF_FILE"
-                systemctl daemon-reload
-                echo "卸载完成。"
-                exit 0
-                ;;
-            0)
-                exit 0
-                ;;
-            *)
-                echo "无效选项，请重新选择。"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-main_menu
