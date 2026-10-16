@@ -3,7 +3,7 @@
 # Script Name: traffic-monitor.sh
 # Description: Debian 13 Traffic Monitor & Telegram Alert System using vnstat
 # Author: DarkerLab
-# Version: 1.2.0
+# Version: 1.2.1
 # ==============================================================================
 
 # 颜色定义
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 STATE_DIR="/var/lib/traffic-monitor"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
 GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # 检查Root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
@@ -84,13 +84,14 @@ send_tg_msg() {
     fi
 }
 
-# 交互式配置向导
+# 交互式配置向导（已修复：默认优先加载旧配置，避免修改时参数丢失）
 configure_parameters() {
     clear
+    load_config # 核心修复：进入配置向导前先加载现有配置
     echo -e "${BLUE}=== 流量监控参数配置向导 ===${PLAIN}"
     
     # 1. 服务器名称
-    default_name="${SERVER_NAME:-Debian-Server}"
+    local default_name="${SERVER_NAME:-Debian-Server}"
     read -p "请输入自定义服务器名称 [默认: $default_name]: " input_name
     SERVER_NAME="${input_name:-$default_name}"
 
@@ -100,9 +101,10 @@ configure_parameters() {
     for i in "${!available_ifs[@]}"; do
         echo " [$i] ${available_ifs[$i]}"
     done
-    read -p "请选择网卡编号（多个网卡请用空格隔开，如 0 1）[默认: 0]: " if_indices
+    local default_if="${INTERFACES:-${available_ifs[0]}}"
+    read -p "请选择网卡编号（多个网卡请用空格隔开，如 0 1）[默认已选: $default_if]: " if_indices
     if [ -z "$if_indices" ]; then
-        INTERFACES="${available_ifs[0]}"
+        INTERFACES="$default_if"
     else
         INTERFACES=""
         for idx in $if_indices; do
@@ -115,15 +117,18 @@ configure_parameters() {
     [ -z "$INTERFACES" ] && INTERFACES="${available_ifs[0]}"
 
     # 3. 每月流量重置日
-    default_reset_day="${RESET_DAY:-1}"
+    local default_reset_day="${RESET_DAY:-1}"
     read -p "请输入每月流量重置日期 (1-31) [默认: $default_reset_day]: " input_day
     RESET_DAY="${input_day:-$default_reset_day}"
 
     # 4. 结算时区选择
+    local default_tz_choice="2"
+    [ "$RESET_TZ" = "UTC0" ] && default_tz_choice="1"
     echo -e "请选择流量统计与重置时区："
     echo " 1) UTC+0 (世界标准时间)"
     echo " 2) UTC+8 (北京时间)"
-    read -p "请选择 [1-2] [默认: 2]: " tz_choice
+    read -p "请选择 [1-2] [默认: $default_tz_choice]: " tz_choice
+    tz_choice="${tz_choice:-$default_tz_choice}"
     if [ "$tz_choice" = "1" ]; then
         RESET_TZ="UTC0"
     else
@@ -131,23 +136,28 @@ configure_parameters() {
     fi
 
     # 5. 流量统计类型
+    local default_type="${TRAFFIC_TYPE:-1}"
     echo -e "请选择流量统计类型："
     echo " 1) 总流量 (上传 + 下载)"
     echo " 2) 仅上传流量 (Upload)"
     echo " 3) 仅下载流量 (Download)"
-    read -p "请选择 [1-3] [默认: 1]: " type_choice
-    TRAFFIC_TYPE="${type_choice:-1}"
+    read -p "请选择 [1-3] [默认: $default_type]: " type_choice
+    TRAFFIC_TYPE="${type_choice:-$default_type}"
 
     # 6. 总流量阈值 (GB)
-    default_quota="${TOTAL_QUOTA_GB:-1000}"
+    local default_quota="${TOTAL_QUOTA_GB:-1000}"
     read -p "请输入每月总流量额度 (GB) [默认: $default_quota]: " input_quota
     TOTAL_QUOTA_GB="${input_quota:-$default_quota}"
 
-    # 7. Telegram 配置
-    read -p "请输入 Telegram Bot Token: " input_token
+    # 7. Telegram 配置（保留旧配置提示）
+    local token_hint="${TG_BOT_TOKEN:0:6}***(已配置)"
+    [ -z "$TG_BOT_TOKEN" ] && token_hint="未配置"
+    read -p "请输入 Telegram Bot Token [当前: $token_hint，直接回车保留]: " input_token
     [ -n "$input_token" ] && TG_BOT_TOKEN="$input_token"
 
-    read -p "请输入 Telegram Chat ID: " input_chatid
+    local chatid_hint="${TG_CHAT_ID:0:4}***(已配置)"
+    [ -z "$TG_CHAT_ID" ] && chatid_hint="未配置"
+    read -p "请输入 Telegram Chat ID [当前: $chatid_hint，直接回车保留]: " input_chatid
     [ -n "$input_chatid" ] && TG_CHAT_ID="$input_chatid"
 
     save_config
@@ -162,13 +172,13 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | { cat; echo "$cron_cmd"; } | crontab -
 }
 
-# 计算当前周期内的已用流量
+# 计算当前周期内的已用流量（已修复 vnStat JSON 的 day 节点解析路径）
 calculate_traffic() {
     load_config
     [ -z "$INTERFACES" ] && return
 
     # 根据时区获取当前时间参数
-    local cur_date cur_hour cur_min cur_day cur_month cur_year
+    local cur_date cur_day cur_month cur_year
     if [ "$RESET_TZ" = "UTC0" ]; then
         cur_date=$(TZ='UTC' date +'%Y-%m-%d')
         cur_day=$(TZ='UTC' date +'%d')
@@ -212,16 +222,21 @@ calculate_traffic() {
         if_json=$(vnstat -i "$iface" --json 2>/dev/null)
         [ -z "$if_json" ] && continue
 
+        # 核心修复：vnStat 2.x 的 JSON 数组节点名称为 .day 而非 .days
         local parsed
         parsed=$(echo "$if_json" | jq -r --arg start "$start_date_str" '
-            .interfaces[0].traffic.days[] |
-            select(
-                (.date.year | tostring) + "-" + 
-                ((.date.month | tostring) | if length == 1 then "0" + . else . end) + "-" + 
-                ((.date.day | tostring) | if length == 1 then "0" + . else . end) >= $start
-            ) |
-            [.rx, .tx] | @tsv
-        ')
+            if .interfaces[0].traffic.day? then
+                .interfaces[0].traffic.day[] |
+                select(
+                    (.date.year | tostring) + "-" + 
+                    ((.date.month | tostring) | if length == 1 then "0" + . else . end) + "-" + 
+                    ((.date.day | tostring) | if length == 1 then "0" + . else . end) >= $start
+                ) |
+                [.rx, .tx] | @tsv
+            else
+                empty
+            end
+        ' 2>/dev/null)
 
         while IFS=$'\t' read -r rx tx; do
             [ -n "$rx" ] && [ "$rx" -gt 0 ] && total_rx=$((total_rx + rx))
@@ -231,7 +246,6 @@ calculate_traffic() {
 
     local used_bytes=0
     case "$TRAFFIC_TYPE" in
-        1) used_bytes=$((total_rx + total_tx)) ;;
         2) used_bytes=$total_tx ;; 3) used_bytes=$total_rx ;;
         *) used_bytes=$((total_rx + total_tx)) ;;
     esac
@@ -241,7 +255,7 @@ calculate_traffic() {
     used_gb=$(echo "scale=2; $used_bytes / (1024 * 1024 * 1024)" | bc)
     quota_bytes=$(echo "$TOTAL_QUOTA_GB * 1024 * 1024 * 1024" | bc | cut -d'.' -f1)
     
-    if [ "$quota_bytes" -gt 0 ]; then
+    if [ -n "$quota_bytes" ] && [ "$quota_bytes" -gt 0 ]; then
         percentage=$(echo "scale=1; ($used_bytes * 100) /$quota_bytes" | bc)
     else
         percentage=0
@@ -250,22 +264,20 @@ calculate_traffic() {
     echo "$used_gb$percentage $start_date_str$cur_date"
 }
 
-# 后台定时检测主逻辑（每分钟触发）
+# 后台定时检测主逻辑
 check_traffic_daemon() {
     load_config
     [ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ] && exit 0
 
-    # 获取北京时间判断日报推送时间 (08:10)
     local bj_hour bj_min bj_date
     bj_hour=$(TZ='Asia/Shanghai' date +'%H')
     bj_min=$(TZ='Asia/Shanghai' date +'%M')
     bj_date=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
 
-    # 计算流量数据
     read -r used_gb percentage start_date cur_date < <(calculate_traffic)
     [ -z "$used_gb" ] && exit 0
 
-    # 1. 每日流量报告 (北京时间 08:10 推送一次)
+    # 1. 每日流量报告 (北京时间 08:10 推送)
     local report_file="$STATE_DIR/last_report_date"
     local last_report=""
     [ -f "$report_file" ] && last_report=$(cat "$report_file")
@@ -278,7 +290,7 @@ check_traffic_daemon() {
         local msg="📊 *服务器每日流量报告*
 🏷️ *服务器名称*: \`$SERVER_NAME\`
 🌐 *监控网口*: \`$INTERFACES\`
-📈 *流量统计类型*: \`$type_str\`
+📈 *统计类型*: \`$type_str\`
 🔄 *统计周期*: \`$start_date\` 至 \`$bj_date 08:10\`
 📊 *已用流量*: \`$used_gb GB\` / \`$TOTAL_QUOTA_GB GB\` (\`$percentage%\`)
 ⏱️ *当前时间*: \`$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')\`"
@@ -288,7 +300,7 @@ check_traffic_daemon() {
         fi
     fi
 
-    # 2. 90% 流量预警推送
+    # 2. 90% 流量预警
     local warn_file="$STATE_DIR/last_warning_month"
     local current_month_key
     current_month_key=$(date +'%Y-%m')
@@ -309,7 +321,7 @@ check_traffic_daemon() {
         fi
     fi
 
-    # 3. 95% 关机报警推送与自动关机
+    # 3. 95% 安全关机报警
     local shutdown_file="$STATE_DIR/last_shutdown_month"
     local last_shutdown_month=""
     [ -f "$shutdown_file" ] && last_shutdown_month=$(cat "$shutdown_file")
@@ -323,7 +335,6 @@ check_traffic_daemon() {
 📊 *已用流量*: \`$used_gb GB\` / \`$TOTAL_QUOTA_GB GB\`
 ⏱️ *时间*: \`$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')\`"
 
-        # 核心要求：检查关机通知是否正常发送成功再执行关机命令
         if send_tg_msg "$shutdown_msg"; then
             echo "$current_month_key" > "$shutdown_file"
             sync
@@ -360,10 +371,12 @@ view_status() {
     echo -e "总流量额度: ${GREEN}$TOTAL_QUOTA_GB GB${PLAIN}"
     echo "--------------------------------------------------"
     if [ -n "$INTERFACES" ]; then
-        read -r used_gb percentage start_date cur_date < <(calculate_traffic)
-        echo -e "统计周期起止: $start_date 至 $cur_date"
-        echo -e "已使用流量:   ${YELLOW}${used_gb} GB${PLAIN}"
-        echo -e "使用百分比:   ${YELLOW}${percentage}\%${PLAIN}"
+        local calc_result
+        calc_result=$(calculate_traffic)
+        read -r used_gb percentage start_date cur_date <<< "$calc_result"
+        echo -e "统计周期起止: ${GREEN}${start_date:-N/A}${PLAIN} 至 ${GREEN}${cur_date:-N/A}${PLAIN}"
+        echo -e "已使用流量:   ${YELLOW}${used_gb:-0} GB${PLAIN}"
+        echo -e "使用百分比:   ${YELLOW}${percentage:-0}\%${PLAIN}"
     else
         echo -e "${RED}尚未配置监控网口！${PLAIN}"
     fi
@@ -442,5 +455,4 @@ case "$1" in
     *)
         main_menu
         ;;
-esac
-
+es:
