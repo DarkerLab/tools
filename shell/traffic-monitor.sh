@@ -31,7 +31,7 @@ detect_interfaces() {
 
 configure_params() {
     echo "============================================="
-    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.0"
+    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.2"
     echo "============================================="
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -158,10 +158,10 @@ def parse_size_to_bytes(s):
         elif 'mi' in unit: mult = 1024.0**2
         elif 'gi' in unit: mult = 1024.0**3
         elif 'ti' in unit: mult = 1024.0**4
-        elif unit == 'kb': mult = 1000.0
-        elif unit == 'mb': mult = 1000.0**2
-        elif unit == 'gb': mult = 1000.0**3
-        elif unit == 'tb': mult = 1000.0**4
+        elif 'kb' in unit: mult = 1000.0
+        elif 'mb' in unit: mult = 1000.0**2
+        elif 'gb' in unit: mult = 1000.0**3
+        elif 'tb' in unit: mult = 1000.0**4
         return val * mult
     except:
         return 0.0
@@ -193,18 +193,27 @@ def calculate_traffic():
     
     used_bytes = 0.0
     combined_iface = "+".join(ifaces) # 例如 ens18+ens19
-    target_ym = now.strftime("%Y-%m") # 例如 2026-10
     
     try:
-        # 直接调用您验证完全正常的文本表格命令
         res = subprocess.run(["vnstat", "-i", combined_iface, "-m"], capture_output=True, text=True, check=True)
         for line in res.stdout.splitlines():
-            if target_ym in line and "|" in line:
+            line_lower = line.lower()
+            # 识别包含流量单位且带有 '|' 分隔符的有效数据行
+            if "|" in line and any(u in line_lower for u in ['gib', 'mib', 'kib', 'tib', 'gb', 'mb', 'kb', 'tb']):
                 parts = [p.strip() for p in line.split("|")]
-                if len(parts) >= 4:
-                    rx_bytes = parse_size_to_bytes(parts[1])
-                    tx_bytes = parse_size_to_bytes(parts[2])
-                    total_bytes = parse_size_to_bytes(parts[3])
+                if len(parts) >= 3:
+                    # parts[0] 包含月份和 rx，例如 "2026-10   1.89 GiB"
+                    sub_parts = parts[0].split()
+                    rx_str = "0"
+                    if len(sub_parts) >= 3:
+                        rx_str = f"{sub_parts[1]} {sub_parts[2]}"
+                    
+                    tx_str = parts[1]   # parts[1] 是 tx
+                    total_str = parts[2] # parts[2] 是 total
+                    
+                    rx_bytes = parse_size_to_bytes(rx_str)
+                    tx_bytes = parse_size_to_bytes(tx_str)
+                    total_bytes = parse_size_to_bytes(total_str)
                     
                     if traffic_type == 1:
                         used_bytes = total_bytes
@@ -359,7 +368,7 @@ menu() {
     while true; do
         clear
         echo "============================================="
-        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.0"
+        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.2"
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
