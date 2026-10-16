@@ -31,7 +31,7 @@ detect_interfaces() {
 
 configure_params() {
     echo "============================================="
-    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.6"
+    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.7"
     echo "============================================="
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -170,63 +170,62 @@ def calculate_traffic():
     cycle_start_str = cycle_start.strftime("%Y-%m-%d")
     
     used_bytes = 0.0
+    # 核心修复：自动将多网卡用 + 号拼接，完全契合 vnstat 多网卡联合查询语法（如 ens18+ens19）
+    combined_iface = "+".join(ifaces)
     
     try:
-        # 全局获取所有网卡的 vnstat JSON 数据，确保 100% 兼容多网卡
-        res = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
+        res = subprocess.run(["vnstat", "-i", combined_iface, "--json"], capture_output=True, text=True, check=True)
         data = json.loads(res.stdout)
         
         for inf in data.get("interfaces", []):
-            if_name = inf.get("name")
-            if if_name in ifaces:
-                traffic = inf.get("traffic", {})
-                
-                # 1. 尝试通过每日明细精确统计周期流量
-                days_list = traffic.get("days", [])
-                if_bytes_days = 0.0
-                for d in days_list:
-                    d_date = d.get("date", {})
-                    dy = d_date.get("year")
-                    dm = d_date.get("month")
-                    dd = d_date.get("day")
-                    if dy and dm and dd:
-                        try:
-                            record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
-                            if record_date >= cycle_start:
-                                rx = d.get("rx", 0)
-                                tx = d.get("tx", 0)
-                                if traffic_type == 1:
-                                    if_bytes_days += (rx + tx)
-                                elif traffic_type == 2:
-                                    if_bytes_days += tx
-                                elif traffic_type == 3:
-                                    if_bytes_days += rx
-                        except Exception:
-                            continue
-                            
-                # 2. 如果重置日为1号或天数明细为空，直接采用当前月份统计兜底
-                if if_bytes_days == 0.0 or reset_day == 1:
-                    months_list = traffic.get("months", [])
-                    if_bytes_months = 0.0
-                    for m in months_list:
-                        m_date = m.get("date", {})
-                        if m_date.get("year") == year and m_date.get("month") == month:
-                            rx = m.get("rx", 0)
-                            tx = m.get("tx", 0)
+            traffic = inf.get("traffic", {})
+            
+            # 1. 尝试通过每日明细精确统计周期流量
+            days_list = traffic.get("days", [])
+            if_bytes_days = 0.0
+            for d in days_list:
+                d_date = d.get("date", {})
+                dy = d_date.get("year")
+                dm = d_date.get("month")
+                dd = d_date.get("day")
+                if dy and dm and dd:
+                    try:
+                        record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
+                        if record_date >= cycle_start:
+                            rx = d.get("rx", 0)
+                            tx = d.get("tx", 0)
                             if traffic_type == 1:
-                                if_bytes_months += (rx + tx)
+                                if_bytes_days += (rx + tx)
                             elif traffic_type == 2:
-                                if_bytes_months += tx
+                                if_bytes_days += tx
                             elif traffic_type == 3:
-                                if_bytes_months += rx
-                            break
-                    if if_bytes_days == 0.0 or reset_day == 1:
-                        used_bytes += max(if_bytes_days, if_bytes_months)
-                    else:
-                        used_bytes += if_bytes_days
+                                if_bytes_days += rx
+                    except Exception:
+                        continue
+                        
+            # 2. 如果重置日为1号或天数明细为空，直接采用当前月份统计兜底
+            if if_bytes_days == 0.0 or reset_day == 1:
+                months_list = traffic.get("months", [])
+                if_bytes_months = 0.0
+                for m in months_list:
+                    m_date = m.get("date", {})
+                    if m_date.get("year") == year and m_date.get("month") == month:
+                        rx = m.get("rx", 0)
+                        tx = m.get("tx", 0)
+                        if traffic_type == 1:
+                            if_bytes_months += (rx + tx)
+                        elif traffic_type == 2:
+                            if_bytes_months += tx
+                        elif traffic_type == 3:
+                            if_bytes_months += rx
+                        break
+                if if_bytes_days == 0.0 or reset_day == 1:
+                    used_bytes = max(if_bytes_days, if_bytes_months)
                 else:
-                    used_bytes += if_bytes_days
-                    
+                    used_bytes = if_bytes_days
+            else:
+                used_bytes = if_bytes_days
+                
     except Exception as e:
         print(f"[Warning] 获取 vnstat JSON 数据失败: {e}")
 
@@ -373,7 +372,7 @@ menu() {
     while true; do
         clear
         echo "============================================="
-        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.6"
+        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.7"
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
@@ -393,7 +392,7 @@ menu() {
                 ;;
             2)
                 show_status
-                read -p "按回space键返回主菜单..."
+                read -p "按回车键返回主菜单..."
                 ;;
             3)
                 echo "==> 正在向 Telegram 发送测试消息..."
