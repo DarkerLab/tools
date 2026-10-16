@@ -3,7 +3,7 @@
 # Script Name: traffic-monitor.sh
 # Description: Debian 13 Traffic Monitor & Telegram Alert System using vnstat
 # Author: DarkerLab
-# Version: 1.2.3
+# Version: 1.2.4
 # ==============================================================================
 
 # 颜色定义
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 STATE_DIR="/var/lib/traffic-monitor"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
 GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-VERSION="1.2.3"
+VERSION="1.2.4"
 
 # 检查Root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
@@ -183,7 +183,7 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | { cat; echo "$cron_cmd"; } | crontab -
 }
 
-# 计算当前周期内的已用流量（已增强容错与网卡自动初始化）
+# 计算当前周期内的已用流量
 calculate_traffic() {
     load_config
     [ -z "$INTERFACES" ] && echo "0.00 0 N/A N/A" && return
@@ -231,7 +231,6 @@ calculate_traffic() {
         local if_json
         if_json=$(vnstat -i "$iface" --json 2>/dev/null)
         
-        # 验证是否为合法 JSON
         if ! echo "$if_json" | jq empty >/dev/null 2>&1; then
             continue
         fi
@@ -277,6 +276,45 @@ calculate_traffic() {
     fi
 
     echo "$used_gb$percentage $start_date_str$cur_date"
+}
+
+# Telegram 每日流量推送测试功能
+test_tg_report() {
+    clear
+    load_config
+    echo -e "${BLUE}=== Telegram 每日流量推送测试 ===${PLAIN}"
+    if [ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ]; then
+        echo -e "${RED}错误：尚未配置 Telegram Bot Token 或 Chat ID！请先通过选项 3 配置参数。${PLAIN}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+
+    echo -e "正在向 Telegram 发送测试推送，请稍候..."
+    local calc_result
+    calc_result=$(calculate_traffic)
+    read -r used_gb percentage start_date cur_date <<< "$calc_result"
+
+    local type_str="总流量(上传+下载)"
+    [ "$TRAFFIC_TYPE" = "2" ] && type_str="仅上传流量"
+    [ "$TRAFFIC_TYPE" = "3" ] && type_str="仅下载流量"
+
+    local bj_datetime
+    bj_datetime=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
+
+    local msg="📊 *服务器每日流量测试报告*
+🏷️ *服务器名称*: \`$SERVER_NAME\`
+🌐 *监控网口*: \`$INTERFACES\`
+📈 *统计类型*: \`$type_str\`
+🔄 *统计周期*: \`$start_date\` 至 \`$bj_datetime\`
+📊 *已用流量*: \`$used_gb GB\` / \`$TOTAL_QUOTA_GB GB\` (\`$percentage%\`)
+⏱️ *当前时间*: \`$bj_datetime\`"
+
+    if send_tg_msg "$msg"; then
+        echo -e "${GREEN}Telegram 测试报告发送成功！请检查您的 Telegram 聊天窗口。${PLAIN}"
+    else
+        echo -e "${RED}Telegram 测试报告发送失败！请检查 Bot Token、Chat ID 是否正确或网络是否连通。${PLAIN}"
+    fi
+    read -p "按回车键返回主菜单..."
 }
 
 # 后台定时检测主逻辑
@@ -359,16 +397,18 @@ check_traffic_daemon() {
     fi
 }
 
-# 脚本更新功能
+# 强制拉取 GitHub 最新版脚本
 update_script() {
-    echo -e "${BLUE}正在检查并更新一键脚本...${PLAIN}"
+    echo -e "${BLUE}正在强制从 GitHub 拉取最新版一键脚本...${PLAIN}"
     if [ -f "$SCRIPT_PATH" ]; then
         rm -f "$SCRIPT_PATH"
     fi
-    if curl -sL "${GITHUB_URL}?t=$(date +\%s)" -o "$SCRIPT_PATH"; then
+    # 核心：通过追加唯一时间戳参数彻底绕过 GitHub CDN 缓存
+    if curl -sL --compressed "${GITHUB_URL}?t=$(date +\%s)" -o "$SCRIPT_PATH"; then
         chmod +x "$SCRIPT_PATH"
-        source "$SCRIPT_PATH" check >/dev/null 2>&1
-        echo -e "${GREEN}脚本更新成功！当前版本: v$VERSION${PLAIN}"
+        echo -e "${GREEN}脚本强制更新成功！${PLAIN}"
+        # 重新加载新脚本以应用新版本信息
+        exec "$SCRIPT_PATH"
     else
         echo -e "${RED}脚本更新失败，请检查网络连接或 GitHub 链接是否正确。${PLAIN}"
     fi
@@ -421,13 +461,14 @@ main_menu() {
         echo -e "        版本: v$VERSION                              "
         echo -e "=================================================="
         echo -e " 1. ${GREEN}安装 / 初始化部署流量监控${PLAIN}"
-        echo -e " 2. ${BLUE}检查更新一键脚本${PLAIN}"
+        echo -e " 2. ${BLUE}强制拉取 GitHub 更新最新版${PLAIN}"
         echo -e " 3. ${YELLOW}修改配置参数${PLAIN}"
         echo -e " 4. ${BLUE}查看当前流量统计与状态${PLAIN}"
-        echo -e " 5. ${RED}卸载流量监控${PLAIN}"
+        echo -e " 5. ${BLUE}测试 Telegram 每日流量推送${PLAIN}"
+        echo -e " 6. ${RED}卸载流量监控${PLAIN}"
         echo -e " 0. 退出脚本"
         echo -e "=================================================="
-        read -p "请输入选项 [0-5]: " choice
+        read -p "请输入选项 [0-6]: " choice
 
         case "$choice" in
             1)
@@ -445,6 +486,9 @@ main_menu() {
                 view_status
                 ;;
             5)
+                test_tg_report
+                ;;
+            6)
                 uninstall_monitor
                 ;;
             0)
