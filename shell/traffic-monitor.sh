@@ -14,7 +14,8 @@ CRON_FILE="/etc/cron.d/traffic-monitor"
 LOCK_FILE="/var/lock/traffic-monitor.lock"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-SCRIPT_VERSION="1.7"
+SHORTCUT_PATH="/usr/local/bin/traffic"
+SCRIPT_VERSION="1.8"
 BASE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
@@ -130,11 +131,12 @@ EOF
 
     echo -e "${GREEN}[√] 配置文件已成功保存至 $CONFIG_FILE${NC}"
 
-    # 配置定时任务与脚本自复制
+    # 配置定时任务与脚本自复制，并自动创建全局快捷命令 `traffic`
     if [ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]; then
         cp "$0" "$SCRIPT_PATH"
     fi
     chmod +x "$SCRIPT_PATH"
+    ln -sf "$SCRIPT_PATH" "$SHORTCUT_PATH"
 
     cat << EOF > "$CRON_FILE"
 * * * * * root /usr/local/bin/traffic-monitor.sh check >/dev/null 2>&1
@@ -144,6 +146,7 @@ EOF
     mkdir -p /var/lib/traffic-monitor
     
     echo -e "${GREEN}[√] 监控定时任务已部署（每1分钟检查一次）。${NC}"
+    echo -e "${GREEN}[√] 全局快捷命令已创建，以后直接输入 ${YELLOW}traffic${NC}${GREEN} 即可打开菜单！${NC}"
     read -p "按回车键返回主菜单..."
     show_menu
 }
@@ -151,7 +154,7 @@ EOF
 # ==================== 2. 发送 Telegram 通知函数 ====================
 send_tg_msg() {
     local message="$1"
-    if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+    if [ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ]; then
         return 1
     fi
     response=$(curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
@@ -179,10 +182,9 @@ get_current_traffic_bytes() {
         p_year=$((c_year - 1))
     fi
 
-    # 查询网卡状态，若查询失败或网卡不存在则记录日志并返回0
     json_data=$(vnstat -i "$INTERFACES" --json 2>/dev/null)
-    if [ $? -ne 0 ] || [ -z "$json_data" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] vnstat query failed or interface '$INTERFACES' not found." >> "$LOG_FILE"
+    if [ $? -ne 0 ] \vert{}\vert{} [ -z "$json_data" ]; then
+        echo "$(date '+\%Y-\%m-\%d \%H:\%M:\%S') [WARN] vnstat query failed or interface '$INTERFACES' not found." >> "$LOG_FILE"
         echo "0"
         return
     fi
@@ -190,40 +192,40 @@ get_current_traffic_bytes() {
     if [ "$RESET_DAY" -eq 1 ]; then
         rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
             .interfaces[0].traffic.month | 
-            map(select(.date.year == $yr and .date.month == $mo)) | 
+            map(select(.date.year == $yr and .date.month ==$mo)) | 
             .[0].rx // 0
         ' 2>/dev/null)
         tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
             .interfaces[0].traffic.month | 
-            map(select(.date.year == $yr and .date.month == $mo)) | 
+            map(select(.date.year == $yr and .date.month ==$mo)) | 
             .[0].tx // 0
         ' 2>/dev/null)
     else
         if [ "$c_day" -ge "$RESET_DAY" ]; then
             rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
-                map(select(.date.year == $yr and .date.month == $mo and .date.day >= $rday)) | 
+                map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
                 map(.rx) | add // 0
             ' 2>/dev/null)
             tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
-                map(select(.date.year == $yr and .date.month == $mo and .date.day >= $rday)) | 
+                map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
                 map(.tx) | add // 0
             ' 2>/dev/null)
         else
             rx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
                 map(select(
-                    (.date.year == $pyr and .date.month == $pmo and .date.day >= $rday) or
-                    (.date.year == $cyr and .date.month == $cmo and .date.day < $rday)
+                    (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
+                    (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
                 )) | 
                 map(.rx) | add // 0
             ' 2>/dev/null)
             tx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
                 map(select(
-                    (.date.year == $pyr and .date.month == $pmo and .date.day >= $rday) or
-                    (.date.year == $cyr and .date.month == $cmo and .date.day < $rday)
+                    (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
+                    (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
                 )) | 
                 map(.tx) | add // 0
             ' 2>/dev/null)
@@ -261,7 +263,7 @@ run_checker() {
     [ ! -f "$CONFIG_FILE" ] && exit 0
     source "$CONFIG_FILE"
 
-    # 自动清理 /var/lib/traffic-monitor/ 下超过 60 天的旧状态标记文件，防止无限堆积
+    # 自动清理 /var/lib/traffic-monitor/ 下超过 60 天的旧状态标记文件
     find /var/lib/traffic-monitor/ -type f -mtime +60 -delete 2>/dev/null
 
     current_bytes=$(get_current_traffic_bytes)
@@ -294,26 +296,26 @@ run_checker() {
 
     # 2. 90% 预警检查
     warning_flag="/var/lib/traffic-monitor/warning_sent_${RESET_DAY}_$(date '+%Y%m')"
-    is_above_90=$(awk "BEGIN {print ($percent >= 90 && $percent < 95) ? 1 : 0}")
+    is_above_90=$(awk "BEGIN {print ($percent >= 90 &&$percent < 95) ? 1 : 0}")
     if [ "$is_above_90" -eq 1 ] && [ ! -f "$warning_flag" ]; then
         msg="⚠️ *[${SERVER_NAME}] 流量预警通知*
 
 - 状态: 已使用流量达到 *${percent}%*
-- 流量: ${used_str} / ${total_str}
+- 流量: ${used_str} /${total_str}
 - 时间: ${current_time}"
         if send_tg_msg "$msg"; then
             touch "$warning_flag"
         fi
     fi
 
-    # 3. 95% 超阈值延时关机告警检查（带双重校验与防误触缓冲）
+    # 3. 95% 超阈值延时关机告警检查
     shutdown_flag="/var/lib/traffic-monitor/shutdown_sent_${RESET_DAY}_$(date '+%Y%m')"
     is_above_95=$(awk "BEGIN {print ($percent >= 95) ? 1 : 0}")
     if [ "$is_above_95" -eq 1 ] && [ ! -f "$shutdown_flag" ]; then
         msg="🛑 *[${SERVER_NAME}] 超流量关机告警*
 
 - 状态: 流量已超 95% (*${percent}%*)
-- 流量: ${used_str} / ${total_str}
+- 流量: ${used_str} /${total_str}
 - 操作: 服务器将在1分钟后执行安全关机 (可输入 shutdown -c 撤销)
 - 时间: ${current_time}"
 
@@ -327,7 +329,6 @@ run_checker() {
                 touch "$shutdown_flag"
                 sync
                 sleep 2
-                # 延时1分钟关机，允许通过 shutdown -c 撤销
                 shutdown -h +1 "Traffic limit exceeded (95%), shutting down in 1 minute."
             else
                 sleep 3
@@ -337,7 +338,7 @@ run_checker() {
                 shutdown -h +1 "Traffic limit exceeded (95%), shutting down in 1 minute."
             fi
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Recheck passed: traffic dropped or new cycle started (${recheck_percent}%), shutdown canceled." >> "$LOG_FILE"
+            echo "$(date '+\%Y-\%m-\%d \%H:\%M:\%S') [INFO] Recheck passed: traffic dropped or new cycle started (${recheck_percent}%), shutdown canceled." >> "$LOG_FILE"
         fi
     fi
 }
@@ -400,7 +401,7 @@ view_traffic() {
     echo -e "每月重置日: ${GREEN}每月 ${RESET_DAY} 号${NC}"
     echo -e "已用流量:   ${GREEN}${used_str}${NC}"
     echo -e "总流量限额: ${GREEN}${total_str}${NC}"
-    echo -e "当前使用率: ${GREEN}${percent}%${NC}"
+    echo -e "当前使用率: ${GREEN}${percent}\%${NC}"
     echo "----------------------------------------"
     echo -e "${YELLOW}vnstat 详细接口状态：${NC}"
     vnstat -i "$INTERFACES"
@@ -415,6 +416,7 @@ update_script() {
     
     if curl -sSL "$FORCE_URL" -o "$SCRIPT_PATH"; then
         chmod +x "$SCRIPT_PATH"
+        ln -sf "$SCRIPT_PATH" "$SHORTCUT_PATH"
         if [ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]; then
             cp "$SCRIPT_PATH" "$0"
         fi
@@ -434,6 +436,7 @@ uninstall() {
         rm -f "$CONFIG_FILE"
         rm -f "$CRON_FILE"
         rm -f "$SCRIPT_PATH"
+        rm -f "$SHORTCUT_PATH"
         rm -f "$LOCK_FILE"
         rm -rf "/var/lib/traffic-monitor"
         systemctl restart cron
