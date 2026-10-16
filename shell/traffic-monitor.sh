@@ -2,7 +2,7 @@
 
 # 确保以root权限运行
 if [ "$EUID" -ne 0 ]; then
-  echo "请以 root 权限运行此脚本 (sudo bash install.sh)"
+  echo "请以 root 权限运行此脚本 (sudo bash 或 root 直接运行)"
   exit 1
 fi
 
@@ -46,7 +46,6 @@ configure_params() {
     detect_interfaces
     read -p "请输入要监控的网卡接口(多个网卡用空格或逗号分隔) [当前: ${INTERFACES:-eth0}]: " input_ifaces
     INTERFACES="${input_ifaces:-${INTERFACES:-eth0}}"
-    # 统一转换空格为逗号或保持格式
     INTERFACES=$(echo "$INTERFACES" | tr ',' ' ')
 
     read -p "请输入每月流量重置日期 (1-31) [当前: ${RESET_DAY:-1}]: " input_day
@@ -142,40 +141,6 @@ def send_tg(token, chat_id, message):
     except Exception as e:
         print(f"Telegram send error: {e}")
 
-def get_vnstat_data(interfaces):
-    ifaces = interfaces.split()
-    total_rx = 0
-    total_tx = 0
-    
-    # 聚合所有选定网卡的每日流量数据
-    for iface in ifaces:
-        try:
-            cmd = ["vnstat", "-i", iface, "--days", "--json"]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            data = json.loads(res.stdout)
-            for inf in data.get("interfaces", []):
-                if inf.get("name") == iface:
-                    for day_rec in inf.get("traffic", {}).get("days", []):
-                        # 收集所有日记录，后续在Python中精确按时区和重置日过滤
-                        pass
-        except Exception as e:
-            continue
-            
-    # 为了更稳妥，直接使用 vnstat --json 全局获取
-    try:
-        res = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
-        data = json.loads(res.stdout)
-        for inf in data.get("interfaces", []):
-            if inf.get("name") in ifaces:
-                for day_rec in inf.get("traffic", {}).get("days", []):
-                    d_date = day_rec.get("date")
-                    d_rx = day_rec.get("rx", 0)
-                    d_tx = day_rec.get("tx", 0)
-                    # 可以在这里累加或暂存
-        return data
-    except Exception as e:
-        return None
-
 def calculate_traffic():
     config = load_config()
     ifaces = config.get("INTERFACES", "eth0").split()
@@ -183,7 +148,6 @@ def calculate_traffic():
     tz_mode = config.get("TIMEZONE_MODE", "UTC8")
     traffic_type = int(config.get("TRAFFIC_TYPE", 1))
     
-    # 时区设置
     if tz_mode == "UTC0":
         target_tz = timezone.utc
     else:
@@ -192,7 +156,6 @@ def calculate_traffic():
     now = datetime.now(target_tz)
     year, month, day = now.year, now.month, now.day
     
-    # 计算当前流量重置周期的开始时间
     if day >= reset_day:
         cycle_start = datetime(year, month, reset_day, 0, 0, 0, tzinfo=target_tz)
     else:
@@ -203,11 +166,10 @@ def calculate_traffic():
             
     cycle_start_str = cycle_start.strftime("%Y-%m-%d")
     
-    # 从vnstat获取详细每日流量
     used_bytes = 0
     try:
         res = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
-        data = json.loads(res.json() if hasattr(res, 'json') else res.stdout)
+        data = json.loads(res.stdout)
         
         for inf in data.get("interfaces", []):
             if inf.get("name") in ifaces:
@@ -228,22 +190,20 @@ def calculate_traffic():
                                 used_bytes += tx
                             elif traffic_type == 3:
                                 used_bytes += rx
-                    except Exception as ex:
+                    except Exception:
                         continue
-    except Exception as e:
-        # 降级方案：如果json解析失败，通过vnstat简易获取本月流量
+    except Exception:
         pass
 
-    # 如果上述json累加为0（例如新装环境或vnstat无当月天数据），尝试用 vnstat -m 获取当月总量
     if used_bytes == 0:
         try:
             for iface in ifaces:
                 res = subprocess.run(["vnstat", "-i", iface, "-m", "--json"], capture_output=True, text=True, check=True)
                 m_data = json.loads(res.stdout)
                 for inf in m_data.get("interfaces", []):
-                    months = inf.get("traffic", {}.get("months", []))
+                    months = inf.get("traffic", {}).get("months", [])
                     if months:
-                        latest = months[0] # 当前月
+                        latest = months[0]
                         rx = latest.get("rx", 0)
                         tx = latest.get("tx", 0)
                         if traffic_type == 1:
@@ -277,7 +237,6 @@ def main():
         
     state = load_state()
     
-    # 跨周期重置状态检查
     if state.get("cycle_start") != cycle_start_str:
         state = {
             "cycle_start": cycle_start_str,
@@ -287,11 +246,10 @@ def main():
         }
         save_state(state)
         
-    # 1. 每日 08:10 北京时间报告推送
     current_time_str = now.strftime("%Y-%m-%d %H:%M")
     today_date_str = now.strftime("%Y-%m-%d")
     
-    # 判断是否为北京时间 08:10（脚本每分钟运行一次，检查小时和分钟）
+    # 每日 08:10 北京时间报告推送
     if now.hour == 8 and now.minute == 10:
         if state.get("last_daily_date") != today_date_str:
             msg = (
@@ -305,7 +263,7 @@ def main():
             state["last_daily_date"] = today_date_str
             save_state(state)
 
-    # 2. 90% 预警推送通知
+    # 90% 预警推送通知
     if percent >= 90.0 and not state.get("warn_90", False):
         msg = (
             f"⚠️ <b>流量预警通知 (90%)</b>\n"
@@ -317,7 +275,7 @@ def main():
         state["warn_90"] = True
         save_state(state)
 
-    # 3. 95% 关机报警推送通知
+    # 95% 关机报警推送通知
     if percent >= 95.0 and not state.get("shutdown_95", False):
         msg = (
             f"🛑 <b>流量超限关机警报 (95%)</b>\n"
@@ -329,7 +287,6 @@ def main():
         send_tg(token, chat_id, msg)
         state["shutdown_95"] = True
         save_state(state)
-        # 执行关机
         os.system("shutdown -h now")
 
 if __name__ == "__main__":
@@ -342,7 +299,6 @@ EOF_PY
 
 setup_cron() {
     echo "==> 配置定时任务 (每1分钟检查一次)..."
-    # 移除旧的同名定时任务，防止重复
     crontab -l 2>/dev/null | grep -v "traffic-monitor.py" | { cat; echo "$CRON_JOB"; } | crontab -
     systemctl restart cron
     echo "==> 定时任务设置成功！"
@@ -368,46 +324,55 @@ show_status() {
 }
 
 menu() {
-    clear
-    echo "============================================="
-    echo "    Debian 13 vnstat 流量监控与报警一键脚本"
-    echo "============================================="
-    echo "1. 安装 / 初始化配置 / 修改配置"
-    echo "2. 查看当前监控状态与流量使用情况"
-    echo "3. 手动触发一次流量测试/每日报告推送"
-    echo "4. 卸载流量监控"
-    echo "0. 退出脚本"
-    echo "============================================="
-    read -p "请选择操作 [0-4]: " choice
-    case "$choice" in
-        1)
-            install_dependencies
-            configure_params
-            deploy_monitor_script
-            setup_cron
-            echo "==> 安装与配置完成！"
-            ;;
-        2)
-            show_status
-            ;;
-        3)
-            echo "==> 正在手动执行监控脚本..."
-            python3 /usr/local/bin/traffic-monitor.py
-            echo "==> 执行完毕。若满足条件已向 Telegram 推送。"
-            ;;
-        4)
-            read -p "确定要卸载流量监控吗？[y/N]: " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                crontab -l 2>/dev/null | grep -v "traffic-monitor.py" | crontab -
-                rm -f "$CONFIG_FILE" "$SCRIPT_FILE"
-                echo "==> 卸载完成。"
-            fi
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo "无效选项，请重新选择。"
-            ;;
-    esac
+    while true; do
+        clear
+        echo "============================================="
+        echo "    Debian 13 vnstat 流量监控与报警一键脚本"
+        echo "============================================="
+        echo "1. 安装 / 初始化配置 / 修改配置"
+        echo "2. 查看当前监控状态与流量使用情况"
+        echo "3. 手动触发一次流量测试/每日报告推送"
+        echo "4. 卸载流量监控"
+        echo "0. 退出脚本"
+        echo "============================================="
+        read -p "请选择操作 [0-4]: " choice
+        case "$choice" in
+            1)
+                install_dependencies
+                configure_params
+                deploy_monitor_script
+                setup_cron
+                echo "==> 安装与配置完成！"
+                read -p "按回车键返回主菜单..."
+                ;;
+            2)
+                show_status
+                read -p "按回车键返回主菜单..."
+                ;;
+            3)
+                echo "==> 正在手动执行监控脚本..."
+                python3 /usr/local/bin/traffic-monitor.py
+                echo "==> 执行完毕。若满足条件已向 Telegram 推送。"
+                read -p "按回车键返回主菜单..."
+                ;;
+            4)
+                read -p "确定要卸载流量监控吗？[y/N]: " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    crontab -l 2>/dev/null | grep -v "traffic-monitor.py" | crontab -
+                    rm -f "$CONFIG_FILE" "$SCRIPT_FILE"
+                    echo "==> 卸载完成。"
+                fi
+                read -p "按回车键返回主菜单..."
+                ;;
+            0)
+                exit 0
+                ;;
+            *)
+                echo "无效选项，请重新选择。"
+                sleep 1
+                ;;
+        esac
+    done
 }
+
+menu
