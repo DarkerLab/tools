@@ -6,11 +6,14 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# 显式定义环境变量，确保 crontab 后台执行时能够找到所有依赖命令
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 CONFIG_FILE="/etc/traffic-monitor.conf"
 CRON_FILE="/etc/cron.d/traffic-monitor"
-LOG_FILE="/var/log/traffic-monitor.log"
+LOCK_FILE="/var/lock/traffic-monitor.lock"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-SCRIPT_VERSION="1.4"
+SCRIPT_VERSION="1.5"
 BASE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
@@ -71,7 +74,7 @@ install_or_config() {
         echo -e "${GREEN}[√] 检测到已有配置文件，已成功加载历史配置用于更新。${NC}"
     fi
 
-    # 交互式参数配置（完美支持历史配置回填）
+    # 交互式参数配置
     read -p "请输入自定义监控服务器名称 [默认: ${DEFAULT_SERVER_NAME}]: " input_name
     SERVER_NAME="${input_name:-$DEFAULT_SERVER_NAME}"
 
@@ -111,7 +114,7 @@ install_or_config() {
     read -p "请输入Telegram Chat ID [默认: ${DEFAULT_CHAT_ID}]: " input_chatid
     TG_CHAT_ID="${input_chatid:-$DEFAULT_CHAT_ID}"
 
-    # 保存配置文件
+    # 保存配置文件并严格限制权限（保护 Token 安全）
     cat << EOF > "$CONFIG_FILE"
 SERVER_NAME="$SERVER_NAME"
 INTERFACES="$INTERFACES"
@@ -122,6 +125,7 @@ TOTAL_LIMIT_GB="$TOTAL_LIMIT_GB"
 TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 EOF
+    chmod 600 "$CONFIG_FILE"
 
     echo -e "${GREEN}[√] 配置文件已成功保存至 $CONFIG_FILE${NC}"
 
@@ -149,7 +153,7 @@ send_tg_msg() {
     if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
         return 1
     fi
-    response=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    response=$(curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         -d "chat_id=${TG_CHAT_ID}" \
         -d "parse_mode=Markdown" \
         -d "text=${message}")
@@ -185,24 +189,24 @@ get_current_traffic_bytes() {
             .interfaces[0].traffic.month | 
             map(select(.date.year == $yr and .date.month == $mo)) | 
             .[0].rx // 0
-        ')
+        ' 2>/dev/null)
         tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
             .interfaces[0].traffic.month | 
             map(select(.date.year == $yr and .date.month == $mo)) | 
             .[0].tx // 0
-        ')
+        ' 2>/dev/null)
     else
         if [ "$c_day" -ge "$RESET_DAY" ]; then
             rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
                 map(select(.date.year == $yr and .date.month == $mo and .date.day >= $rday)) | 
                 map(.rx) | add // 0
-            ')
+            ' 2>/dev/null)
             tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
                 map(select(.date.year == $yr and .date.month == $mo and .date.day >= $rday)) | 
                 map(.tx) | add // 0
-            ')
+            ' 2>/dev/null)
         else
             rx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
@@ -211,7 +215,7 @@ get_current_traffic_bytes() {
                     (.date.year == $cyr and .date.month == $cmo and .date.day < $rday)
                 )) | 
                 map(.rx) | add // 0
-            ')
+            ' 2>/dev/null)
             tx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
                 .interfaces[0].traffic.day | 
                 map(select(
@@ -219,14 +223,17 @@ get_current_traffic_bytes() {
                     (.date.year == $cyr and .date.month == $cmo and .date.day < $rday)
                 )) | 
                 map(.tx) | add // 0
-            ')
+            ' 2>/dev/null)
         fi
     fi
 
+    rx=${rx:-0}
+    tx=${tx:-0}
+
     case "$TRAFFIC_TYPE" in
-        2) echo "${tx:-0}" ;;
-        3) echo "${rx:-0}" ;;
-        *) echo $(( ${rx:-0} + ${tx:-0} )) ;;
+        2) echo "$tx" ;;
+        3) echo "$rx" ;;
+        *) echo $(( rx + tx )) ;;
     esac
 }
 
@@ -243,8 +250,12 @@ format_bytes() {
     fi
 }
 
-# ==================== 4. 后台检查与定时推送逻辑 (已优化通知样式) ====================
+# ==================== 4. 后台检查与定时推送逻辑 ====================
 run_checker() {
+    # 启用单实例锁，防止每分钟定时任务由于网络延迟产生并发堆积
+    exec 200>/var/lock/traffic-monitor.lock
+    flock -n 200 || exit 0
+
     [ ! -f "$CONFIG_FILE" ] && exit 0
     source "$CONFIG_FILE"
 
@@ -265,7 +276,7 @@ run_checker() {
     current_hm=$(date '+%H:%M')
     daily_flag="/var/lib/traffic-monitor/daily_${today_date}.flag"
 
-    # 1. 每日 08:10 定时报告（采用全新简洁美观样式）
+    # 1. 每日 08:10 定时报告（精简美观通知样式）
     if [ "$current_hm" = "08:10" ] && [ ! -f "$daily_flag" ]; then
         msg="📊 *[${SERVER_NAME}] 每日流量日报*
 
@@ -407,6 +418,7 @@ uninstall() {
         rm -f "$CONFIG_FILE"
         rm -f "$CRON_FILE"
         rm -f "$SCRIPT_PATH"
+        rm -f "$LOCK_FILE"
         rm -rf "/var/lib/traffic-monitor"
         systemctl restart cron
         echo -e "${GREEN}[√] 监控程序已完全卸载。${NC}"
