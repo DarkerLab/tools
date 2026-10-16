@@ -3,7 +3,7 @@
 # Script Name: traffic-monitor.sh
 # Description: Debian 13 Traffic Monitor & Telegram Alert System using vnstat
 # Author: DarkerLab
-# Version: 1.2.8
+# Version: 1.2.9
 # ==============================================================================
 
 # 颜色定义
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 STATE_DIR="/var/lib/traffic-monitor"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
 GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-VERSION="1.2.8"
+VERSION="1.2.9"
 
 # 检查Root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
@@ -174,10 +174,10 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | { cat; echo "$cron_cmd"; } | crontab -
 }
 
-# 计算当前周期内的已用流量（已修复多网口 JSON 聚合解析）
+# 计算当前周期内的已用流量（v1.2.9 完美重构版：纯 jq 计算 + TSV 稳定传输）
 calculate_traffic() {
     load_config
-    [ -z "$INTERFACES" ] && echo "0.00 0 N/A N/A" && return
+    [ -z "$INTERFACES" ] && echo -e "0.00\t0\tN/A\tN/A" && return
 
     local cur_date cur_day cur_month cur_year
     if [ "$RESET_TZ" = "UTC0" ]; then
@@ -222,57 +222,41 @@ calculate_traffic() {
     if_json=$(vnstat -i "$vnstat_target" --json 2>/dev/null)
 
     if ! echo "$if_json" | jq empty >/dev/null 2>&1; then
-        echo "0.00 0 $start_date_str$cur_date"
+        echo -e "0.00\t0\t$start_date_str\t$cur_date"
         return
     fi
 
-    local total_rx=0
-    local total_tx=0
-
-    # 核心修复：遍历所有网口并按日期聚合求和
-    local parsed
-    parsed=$(echo "$if_json" | jq -r --arg start "$start_date_str" '
-        [ .interfaces[]? | select(.traffic.day?) | .traffic.day[] ] |
-        group_by(.date.year, .date.month, .date.day) |
-        map({
-            date: .[0].date,
-            rx: (map(.rx) | add),
-            tx: (map(.tx) | add)
-        }) |
-        .[] |
-        select(
-            (.date.year | tostring) + "-" + 
-            ((.date.month | tostring) | if length == 1 then "0" + . else . end) + "-" + 
-            ((.date.day | tostring) | if length == 1 then "0" + . else . end) >= $start
-        ) |
-        [.rx, .tx] | @tsv
-    ' 2>/dev/null)
-
-    while IFS=$'\t' read -r rx tx; do
-        [ -n "$rx" ] && [ "$rx" -gt 0 ] && total_rx=$((total_rx + rx))
-        [ -n "$tx" ] && [ "$tx" -gt 0 ] && total_tx=$((total_tx + tx))
-    done <<< "$parsed"
-
-    local used_bytes=0
-    case "$TRAFFIC_TYPE" in
-        2) used_bytes=$total_tx ;; 3) used_bytes=$total_rx ;;
-        *) used_bytes=$((total_rx + total_tx)) ;;
-    esac
-
-    local used_gb quota_bytes percentage
-    used_gb=$(echo "scale=2; $used_bytes / (1024 * 1024 * 1024)" | bc)
-    [[ "$used_gb" == .* ]] && used_gb="0$used_gb"
-
-    quota_bytes=$(echo "$TOTAL_QUOTA_GB * 1024 * 1024 * 1024" | bc | cut -d'.' -f1)
-    
-    if [ -n "$quota_bytes" ] && [ "$quota_bytes" -gt 0 ]; then
-        percentage=$(echo "scale=1; ($used_bytes * 100) /$quota_bytes" | bc)
-        [[ "$percentage" == .* ]] && percentage="0$percentage"
-    else
-        percentage=0
-    fi
-
-    echo "$used_gb$percentage $start_date_str$cur_date"
+    # 核心：利用 jq 直接在底层完成日期过滤、求和及百分比计算，输出纯净的 TSV 格式
+    jq -r --arg start "$start_date_str" \
+          --arg cur "$cur_date" \
+          --arg type "${TRAFFIC_TYPE:-1}" \
+          --arg quota "${TOTAL_QUOTA_GB:-1000}" '
+        ([ .interfaces[0].traffic.day?[]? | 
+           select(
+               ((.date.year | tostring) + "-" + 
+               ((.date.month | tostring) | if length == 1 then "0" + . else . end) + "-" + 
+               ((.date.day | tostring) | if length == 1 then "0" + . else . end)) >= $start
+           )
+        ] // []) as $days |
+        
+        ($days \vert{} map(.rx) \vert{} add // 0) as$total_rx |
+        ($days \vert{} map(.tx) \vert{} add // 0) as$total_tx |
+        
+        (if $type == "2" then $total_tx
+         elif $type == "3" then $total_rx
+         else ($total_rx + $total_tx) end) as$used_bytes |
+         
+        ($used_bytes / 1073741824) as$used_gb |
+        (($quota \vert{} tonumber) // 1000) as$q_gb |
+        
+        (if $q_gb > 0 then ($used_gb * 100 / $q_gb) else 0 end) as$percent |
+        
+        [
+            ($used_gb | . * 100 | round / 100 | tostring),
+            ($percent | . * 10 | round / 10 | tostring),
+            $start,$cur
+        ] | @tsv
+    ' <<< "$if_json" 2>/dev/null
 }
 
 # Telegram 每日流量推送测试功能
@@ -287,9 +271,7 @@ test_tg_report() {
     fi
 
     echo -e "正在向 Telegram 发送测试推送，请稍候..."
-    local calc_result
-    calc_result=$(calculate_traffic)
-    read -r used_gb percentage start_date cur_date <<< "$calc_result"
+    IFS=$'\t' read -r used_gb percentage start_date cur_date <<< "$(calculate_traffic)"
 
     local type_str="总流量(上传+下载)"
     [ "$TRAFFIC_TYPE" = "2" ] && type_str="仅上传流量"
@@ -324,7 +306,7 @@ check_traffic_daemon() {
     bj_min=$(TZ='Asia/Shanghai' date +'%M')
     bj_date=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
 
-    read -r used_gb percentage start_date cur_date < <(calculate_traffic)
+    IFS=$'\t' read -r used_gb percentage start_date cur_date <<< "$(calculate_traffic)"
     [ -z "$used_gb" ] && exit 0
 
     # 1. 每日流量报告 (北京时间 08:10 推送)
@@ -396,13 +378,14 @@ check_traffic_daemon() {
 
 # 强制拉取 GitHub 最新版脚本
 update_script() {
-    echo -e "${BLUE}正在强制从 GitHub 拉取最新版一键脚本...${PLAIN}"
+    echo -e "${BLUE}=== 强制拉取 GitHub 最新版 ===${PLAIN}"
     if [ -f "$SCRIPT_PATH" ]; then
         rm -f "$SCRIPT_PATH"
     fi
     if curl -sL --compressed "${GITHUB_URL}?t=$(date +\%s)" -o "$SCRIPT_PATH"; then
         chmod +x "$SCRIPT_PATH"
-        echo -e "${GREEN}脚本强制更新成功！${PLAIN}"
+        echo -e "${GREEN}脚本强制更新成功！正在重新加载...${PLAIN}"
+        sleep 1
         exec "$SCRIPT_PATH"
     else
         echo -e "${RED}脚本更新失败，请检查网络连接或 GitHub 链接是否正确。${PLAIN}"
@@ -422,9 +405,8 @@ view_status() {
     echo -e "总流量额度: ${GREEN}$TOTAL_QUOTA_GB GB${PLAIN}"
     echo "--------------------------------------------------"
     if [ -n "$INTERFACES" ]; then
-        local calc_result
-        calc_result=$(calculate_traffic)
-        read -r used_gb percentage start_date cur_date <<< "$calc_result"
+        # 核心：使用 IFS=$'\t' 精准接收 TSV 格式数据，杜绝字段错位与乱码
+        IFS=$'\t' read -r used_gb percentage start_date cur_date <<< "$(calculate_traffic)"
         echo -e "统计周期起止: ${GREEN}${start_date:-N/A}${PLAIN} 至 ${GREEN}${cur_date:-N/A}${PLAIN}"
         echo -e "已使用流量:   ${YELLOW}${used_gb:-0} GB${PLAIN}"
         echo -e "使用百分比:   ${YELLOW}${percentage:-0}\%${PLAIN}"
