@@ -3,7 +3,7 @@
 # Script Name: traffic-monitor.sh
 # Description: Debian 13 Traffic Monitor & Telegram Alert System using vnstat
 # Author: DarkerLab
-# Version: 1.2.7
+# Version: 1.2.8
 # ==============================================================================
 
 # 颜色定义
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 STATE_DIR="/var/lib/traffic-monitor"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
 GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-VERSION="1.2.7"
+VERSION="1.2.8"
 
 # 检查Root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
@@ -43,7 +43,6 @@ install_dependencies() {
     systemctl enable --now vnstat
     systemctl enable --now cron
     
-    # 自动为所有可用网卡初始化 vnstat 监控
     mapfile -t available_ifs < <(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo')
     for iface in "${available_ifs[@]}"; do
         vnstat -i "$iface" >/dev/null 2>&1
@@ -96,12 +95,10 @@ configure_parameters() {
     load_config
     echo -e "${BLUE}=== 流量监控参数配置向导 ===${PLAIN}"
     
-    # 1. 服务器名称
     local default_name="${SERVER_NAME:-Debian-Server}"
     read -p "请输入自定义服务器名称 [默认: $default_name]: " input_name
     SERVER_NAME="${input_name:-$default_name}"
 
-    # 2. 网卡接口检测与选择
     echo -e "\n${BLUE}当前系统可用网卡接口：${PLAIN}"
     mapfile -t available_ifs < <(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo')
     for i in "${!available_ifs[@]}"; do
@@ -122,17 +119,14 @@ configure_parameters() {
     fi
     [ -z "$INTERFACES" ] && INTERFACES="${available_ifs[0]}"
 
-    # 确保所选网卡已被 vnstat 初始化
     for iface in $INTERFACES; do
         vnstat -i "$iface" >/dev/null 2>&1
     done
 
-    # 3. 每月流量重置日
     local default_reset_day="${RESET_DAY:-1}"
     read -p "请输入每月流量重置日期 (1-31) [默认: $default_reset_day]: " input_day
     RESET_DAY="${input_day:-$default_reset_day}"
 
-    # 4. 结算时区选择
     local default_tz_choice="2"
     [ "$RESET_TZ" = "UTC0" ] && default_tz_choice="1"
     echo -e "请选择流量统计与重置时区："
@@ -146,7 +140,6 @@ configure_parameters() {
         RESET_TZ="UTC8"
     fi
 
-    # 5. 流量统计类型
     local default_type="${TRAFFIC_TYPE:-1}"
     echo -e "请选择流量统计类型："
     echo " 1) 总流量 (上传 + 下载)"
@@ -155,12 +148,10 @@ configure_parameters() {
     read -p "请选择 [1-3] [默认: $default_type]: " type_choice
     TRAFFIC_TYPE="${type_choice:-$default_type}"
 
-    # 6. 总流量阈值 (GB)
     local default_quota="${TOTAL_QUOTA_GB:-1000}"
     read -p "请输入每月总流量额度 (GB) [默认: $default_quota]: " input_quota
     TOTAL_QUOTA_GB="${input_quota:-$default_quota}"
 
-    # 7. Telegram 配置
     local token_hint="${TG_BOT_TOKEN:0:6}***(已配置)"
     [ -z "$TG_BOT_TOKEN" ] && token_hint="未配置"
     read -p "请输入 Telegram Bot Token [当前: $token_hint，直接回车保留]: " input_token
@@ -183,7 +174,7 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | { cat; echo "$cron_cmd"; } | crontab -
 }
 
-# 计算当前周期内的已用流量
+# 计算当前周期内的已用流量（已修复多网口 JSON 聚合解析）
 calculate_traffic() {
     load_config
     [ -z "$INTERFACES" ] && echo "0.00 0 N/A N/A" && return
@@ -223,7 +214,7 @@ calculate_traffic() {
     local start_date_str
     start_date_str=$(printf "\%04d-\%02d-\%02d" "$start_year" "$start_month" "$start_day")
 
-    # 多网口使用 '+' 拼接查询
+    # 多网口使用 '+' 拼接查询（如 ens18+ens19）
     local vnstat_target
     vnstat_target=$(echo "$INTERFACES" | tr ' ' '+')
 
@@ -238,19 +229,23 @@ calculate_traffic() {
     local total_rx=0
     local total_tx=0
 
+    # 核心修复：遍历所有网口并按日期聚合求和
     local parsed
     parsed=$(echo "$if_json" | jq -r --arg start "$start_date_str" '
-        if .interfaces[0].traffic.day? then
-            .interfaces[0].traffic.day[] |
-            select(
-                (.date.year | tostring) + "-" + 
-                ((.date.month | tostring) | if length == 1 then "0" + . else . end) + "-" + 
-                ((.date.day | tostring) | if length == 1 then "0" + . else . end) >= $start
-            ) |
-            [.rx, .tx] | @tsv
-        else
-            empty
-        end
+        [ .interfaces[]? | select(.traffic.day?) | .traffic.day[] ] |
+        group_by(.date.year, .date.month, .date.day) |
+        map({
+            date: .[0].date,
+            rx: (map(.rx) | add),
+            tx: (map(.tx) | add)
+        }) |
+        .[] |
+        select(
+            (.date.year | tostring) + "-" + 
+            ((.date.month | tostring) | if length == 1 then "0" + . else . end) + "-" + 
+            ((.date.day | tostring) | if length == 1 then "0" + . else . end) >= $start
+        ) |
+        [.rx, .tx] | @tsv
     ' 2>/dev/null)
 
     while IFS=$'\t' read -r rx tx; do
@@ -502,7 +497,7 @@ main_menu() {
     done
 }
 
-# 入口分发（已严格核对闭合语法）
+# 入口分发
 case "$1" in
     check)
         check_traffic_daemon
