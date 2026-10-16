@@ -31,7 +31,7 @@ detect_interfaces() {
 
 configure_params() {
     echo "============================================="
-    echo "       Debian 13 流量监控与告警脚本配置 v0.1     "
+    echo "       Debian 13 流量监控与告警脚本配置v0.1"
     echo "============================================="
 
     if [ -f "$CONFIG_FILE" ]; then
