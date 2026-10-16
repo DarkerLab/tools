@@ -10,6 +10,7 @@ CONF_FILE="/etc/traffic-monitor.conf"
 STATE_FILE="/etc/traffic-monitor.state"
 PY_SCRIPT="/usr/local/bin/traffic-monitor-calc.py"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
+GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
 RED='\033[31m'
@@ -65,10 +66,10 @@ install_or_update() {
     read -p "请输入自定义服务器名称 [默认: $(hostname)]: " INPUT_SERVER_NAME
     SERVER_NAME="${INPUT_SERVER_NAME:-$(hostname)}"
 
-    read -p "请输入监控网卡接口（多网卡可用逗号或加号隔开，例: ens18,ens19 或 ens18+ens19） [默认: $(echo $AVAILABLE_IFACES | awk '{print $1}')]: " INPUT_IFACES
+    read -p "请输入监控网卡接口（多网卡可用加号或逗号隔开，例: ens18+ens19 或 ens18,ens19） [默认: $(echo $AVAILABLE_IFACES | awk '{print $1}')]: " INPUT_IFACES
     INTERFACES="${INPUT_IFACES:-$(echo $AVAILABLE_IFACES | awk '{print $1}')}"
-    # 统一将用户输入的 + 或空格规范处理为逗号存储，方便后续 Python 处理
-    INTERFACES=$(echo "$INTERFACES" | tr '+' ',' | tr ' ' ',')
+    # 统一将用户输入的逗号或空格规范处理为加号存储，方便 vnstat 联查
+    INTERFACES=$(echo "$INTERFACES" | tr ',' '+' | tr ' ' '+')
 
     read -p "请输入每月流量重置日期 (1-31) [默认: 1]: " INPUT_RESET_DAY
     RESET_DAY="${INPUT_RESET_DAY:-1}"
@@ -135,7 +136,7 @@ def get_traffic_data(interfaces, reset_day, tz_mode, traffic_type, limit_gb):
     total_rx = 0
     total_tx = 0
     
-    ifaces = [iface.strip() for iface in interfaces.replace('+', ',').split(',') if iface.strip()]
+    ifaces = [iface.strip() for iface in interfaces.replace(',', '+').split('+') if iface.strip()]
     
     for iface in ifaces:
         try:
@@ -277,14 +278,80 @@ test_daily_push() {
     read -p "按回车键返回主菜单..."
 }
 
-# 3. 测试运行阈值检测
-test_threshold_check() {
-    echo -e "${YELLOW}[信息] 正在手动执行阈值检测...${NC}"
-    do_threshold_check "test"
+# 3. 查看当前流量数据
+show_traffic() {
+    clear
+    echo -e "${CYAN}======================================================${NC}"
+    echo -e "${GREEN}${BOLD}                 当前流量数据看板                     ${NC}"
+    echo -e "${CYAN}======================================================${NC}"
+    if [ ! -f "$CONF_FILE" ]; then
+        echo -e "${RED}[错误] 请先完成安装部署与配置！${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+    source "$CONF_FILE"
+
+    stats_json=$(fetch_stats)
+    if [ "$stats_json" = "{}" ]; then
+        echo -e "${RED}[错误] 无法获取流量数据，请检查 vnstat 是否正常运行。${NC}"
+        read -p "按回车键返回主菜单..."
+        return
+    fi
+
+    start_date=$(echo "$stats_json" | jq -r '.start_date')
+    end_date=$(echo "$stats_json" | jq -r '.end_date')
+    used_gb=$(echo "$stats_json" | jq -r '.used_gb')
+    rx_gb=$(echo "$stats_json" | jq -r '.rx_gb')
+    tx_gb=$(echo "$stats_json" | jq -r '.tx_gb')
+    limit_gb=$(echo "$stats_json" | jq -r '.limit_gb')
+    pct=$(echo "$stats_json" | jq -r '.percentage')
+
+    echo -e "服务器名称: ${GREEN}${SERVER_NAME}${NC}"
+    echo -e "监控网卡:   ${GREEN}${INTERFACES}${NC}"
+    echo -e "计费周期:   ${GREEN}${start_date} ~ ${end_date}${NC}"
+    echo -e "流量总限额: ${GREEN}${limit_gb} GB${NC}"
+    echo -e "已用总流量: ${GREEN}${used_gb} GB${NC} (${CYAN}${pct}%${NC})"
+    echo -e "  ├── 上传: ${GREEN}${tx_gb} GB${NC}"
+    echo -e "  └── 下载: ${GREEN}${rx_gb} GB${NC}"
+    echo -e "${CYAN}======================================================${NC}"
+    
+    echo -e "\n${YELLOW}vnstat 实时快照:${NC}"
+    vnstat -i "$INTERFACES" 2>/dev/null || vnstat
+
+    echo ""
     read -p "按回车键返回主菜单..."
 }
 
-# 阈值检测核心逻辑
+# 4. 强制刷新更新脚本
+force_update_script() {
+    echo -e "${YELLOW}[信息] 正在从 GitHub 强制拉取最新脚本...${NC}"
+    if curl -sL "$GITHUB_URL" -o "$SCRIPT_PATH"; then
+        chmod +x "$SCRIPT_PATH"
+        echo -e "${GREEN}[√] 脚本已成功从 GitHub 强制更新至最新版！${NC}"
+        echo -e "${YELLOW}正在重新加载脚本...${NC}"
+        sleep 1.5
+        exec "$SCRIPT_PATH"
+    else
+        echo -e "${RED}[×] 更新失败，请检查网络连接或 GitHub 链接是否正确。${NC}"
+    fi
+    read -p "按回车键返回主菜单..."
+}
+
+# 5. 卸载监控程序
+do_uninstall() {
+    echo -e "${RED}警告: 即将卸载流量监控程序及清理相关配置、定时任务！${NC}"
+    read -p "确认卸载？(y/n): " confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | crontab -
+        rm -f "$CONF_FILE" "$STATE_FILE" "$PY_SCRIPT" "$SCRIPT_PATH"
+        echo -e "${GREEN}[√] 流量监控助手已成功卸载。${NC}"
+    else
+        echo -e "${YELLOW}取消卸载。${NC}"
+    fi
+    read -p "按回车键返回主菜单..."
+}
+
+# 后台阈值检测核心逻辑 (供 Cron 每1分钟调用)
 do_threshold_check() {
     local mode="$1"
     if [ ! -f "$CONF_FILE" ]; then
@@ -331,16 +398,11 @@ EOF
 <b>时间:</b> $(date '+%Y-%m-%d %H:%M:%S')"
             
             if send_tg "$msg"; then
-                echo -e "${GREEN}[√] 95% 关机警报通知发送成功！${NC}"
                 sed -i 's/^SHUTDOWN_95=.*/SHUTDOWN_95=1/' "$STATE_FILE"
                 if [ "$mode" != "test" ]; then
                     shutdown -h now
                 fi
-            else
-                echo -e "${RED}[×] 关机通知发送失败！为确保安全，取消关机操作。${NC}"
             fi
-        else
-            [ "$mode" = "test" ] && echo "95% 关机警报在本周期内已发送过。"
         fi
         return
     fi
@@ -359,77 +421,10 @@ EOF
 <b>时间:</b> $(date '+%Y-%m-%d %H:%M:%S')"
             
             if send_tg "$msg"; then
-                echo -e "${GREEN}[√] 90% 预警通知发送成功！${NC}"
                 sed -i 's/^WARN_90=.*/WARN_90=1/' "$STATE_FILE"
-            else
-                echo -e "${RED}[×] 90% 预警通知发送失败。${NC}"
             fi
-        else
-            [ "$mode" = "test" ] && echo "90% 预警通知在本周期内已发送过。"
         fi
     fi
-
-    [ "$mode" = "test" ] && echo -e "${GREEN}当前流量使用率: ${pct}% (未达到预警/关机线)${NC}"
-}
-
-# 4. 查看当前流量数据（使用 vnstat 原生支持的加号语法 ens18+ens19 查询）
-show_traffic() {
-    clear
-    echo -e "${CYAN}======================================================${NC}"
-    echo -e "${GREEN}${BOLD}                 当前流量数据看板                     ${NC}"
-    echo -e "${CYAN}======================================================${NC}"
-    if [ ! -f "$CONF_FILE" ]; then
-        echo -e "${RED}[错误] 请先完成安装部署与配置！${NC}"
-        read -p "按回车键返回主菜单..."
-        return
-    fi
-    source "$CONF_FILE"
-
-    stats_json=$(fetch_stats)
-    if [ "$stats_json" = "{}" ]; then
-        echo -e "${RED}[错误] 无法获取流量数据，请检查 vnstat 是否正常运行。${NC}"
-        read -p "按回车键返回主菜单..."
-        return
-    fi
-
-    start_date=$(echo "$stats_json" | jq -r '.start_date')
-    end_date=$(echo "$stats_json" | jq -r '.end_date')
-    used_gb=$(echo "$stats_json" | jq -r '.used_gb')
-    rx_gb=$(echo "$stats_json" | jq -r '.rx_gb')
-    tx_gb=$(echo "$stats_json" | jq -r '.tx_gb')
-    limit_gb=$(echo "$stats_json" | jq -r '.limit_gb')
-    pct=$(echo "$stats_json" | jq -r '.percentage')
-
-    echo -e "服务器名称: ${GREEN}${SERVER_NAME}${NC}"
-    echo -e "监控网卡:   ${GREEN}${INTERFACES}${NC}"
-    echo -e "计费周期:   ${GREEN}${start_date} ~ ${end_date}${NC}"
-    echo -e "流量总限额: ${GREEN}${limit_gb} GB${NC}"
-    echo -e "已用总流量: ${GREEN}${used_gb} GB${NC} (${CYAN}${pct}%${NC})"
-    echo -e "  ├── 上传: ${GREEN}${tx_gb} GB${NC}"
-    echo -e "  └── 下载: ${GREEN}${rx_gb} GB${NC}"
-    echo -e "${CYAN}======================================================${NC}"
-    
-    echo -e "\n${YELLOW}vnstat 实时快照:${NC}"
-    # 自动将配置中的网卡转换为 ens18+ens19 的原生联查格式
-    vnstat_ifaces=$(echo "$INTERFACES" | tr ',' '+')
-    vnstat -i "$vnstat_ifaces" 2>/dev/null || vnstat
-
-    echo ""
-    read -p "按回车键返回主菜单..."
-}
-
-# 5. 卸载监控程序
-do_uninstall() {
-    echo -e "${RED}警告: 即将卸载流量监控程序及清理相关配置、定时任务！${NC}"
-    read -p "确认卸载？(y/n): " confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | crontab -
-        rm -f "$CONF_FILE" "$STATE_FILE" "$PY_SCRIPT" "$SCRIPT_PATH"
-        echo -e "${GREEN}[√] 流量监控助手已成功卸载。${NC}"
-    else
-        echo -e "${YELLOW}取消卸载。${NC}"
-    fi
-    read -p "按回车键返回主菜单..."
 }
 
 # 定时任务每日推送入口
@@ -485,8 +480,8 @@ while true; do
     print_logo
     echo -e "1. 安装部署/修改配置"
     echo -e "2. 测试发送每日流量推送"
-    echo -e "3. 测试运行阈值检测"
-    echo -e "4. 查看当前流量数据"
+    echo -e "3. 查看当前流量数据"
+    echo -e "4. 强制刷新更新脚本"
     echo -e "5. 卸载监控程序"
     echo -e "0. 退出"
     echo -e "${CYAN}======================================================${NC}"
@@ -495,10 +490,10 @@ while true; do
     case "$choice" in
         1) install_or_update ;;
         2) test_daily_push ;;
-        3) test_threshold_check ;;
-        4) show_traffic ;;
+        3) show_traffic ;;
+        4) force_update_script ;;
         5) do_uninstall ;;
-        0) echo -e "${GREEN}再见！${NC}; exit 0 ;;
+        0) echo -e "${GREEN}再见！${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选项，请重新输入！${NC}"; sleep 1 ;;
     esac
 done
