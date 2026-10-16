@@ -198,7 +198,6 @@ def calculate_traffic():
     except Exception:
         pass
 
-    # 兜底方案：如果通过days统计为0，尝试使用vnstat各网卡当前月统计
     if used_bytes == 0:
         try:
             for iface in ifaces:
@@ -207,7 +206,7 @@ def calculate_traffic():
                 for inf in m_data.get("interfaces", []):
                     months = inf.get("traffic", {}).get("months", [])
                     if months:
-                        latest = months[-1] # 取最新月份
+                        latest = months[-1]
                         rx = latest.get("rx", 0)
                         tx = latest.get("tx", 0)
                         if traffic_type == 1:
@@ -241,34 +240,6 @@ def print_status():
     print(f"⏰ 当前检测时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 def main():
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--status":
-            print_status()
-            return
-        elif sys.argv[1] == "--test":
-            config = load_config()
-            server_name = config.get("SERVER_NAME", "Server")
-            total_gb = float(config.get("TOTAL_GB", 1000))
-            token = config.get("TG_BOT_TOKEN", "")
-            chat_id = config.get("TG_CHAT_ID", "")
-            used_gb, cycle_start_str, now = calculate_traffic()
-            percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
-            
-            msg = (
-                f"🧪 <b>Telegram 手动测试报告</b>\n"
-                f"🏷 <b>名称:</b> {server_name}\n"
-                f"📈 <b>已用 / 总计:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
-                f"🔄 <b>统计周期起止:</b> {cycle_start_str} 至今\n"
-                f"⏰ <b>当前时间:</b> {now.strftime('%Y-%m-%d %H:%M')}"
-            )
-            success = send_tg(token, chat_id, msg)
-            if success:
-                print("==> 测试消息已成功发送至 Telegram，请检查接收！")
-            else:
-                print("==> 发送失败，请检查您的 Bot Token 和 Chat ID 是否正确。")
-            return
-
-    # 定时后台常规检查逻辑
     config = load_config()
     if not config:
         return
@@ -277,12 +248,29 @@ def main():
     total_gb = float(config.get("TOTAL_GB", 1000))
     token = config.get("TG_BOT_TOKEN", "")
     chat_id = config.get("TG_CHAT_ID", "")
+    tz_mode = config.get("TIMEZONE_MODE", "UTC8")
     
     used_gb, cycle_start_str, now = calculate_traffic()
     percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
-        
-    state = load_state()
     
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--status":
+            print_status()
+            return
+        elif sys.argv[1] == "--test":
+            msg = (
+                f"📊 <b>[{server_name}]每日流量日报</b>\n\n"
+                f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.2f}%)\n"
+                f"- 统计时间: {now.strftime('%Y-%m-%d %H:%M:%S')} {tz_mode}"
+            )
+            success = send_tg(token, chat_id, msg)
+            if success:
+                print("==> 测试日报已成功发送至 Telegram，请检查接收！")
+            else:
+                print("==> 发送失败，请检查您的 Bot Token 和 Chat ID 是否正确。")
+            return
+
+    state = load_state()
     if state.get("cycle_start") != cycle_start_str:
         state = {
             "cycle_start": cycle_start_str,
@@ -292,18 +280,16 @@ def main():
         }
         save_state(state)
         
-    current_time_str = now.strftime("%Y-%m-%d %H:%M")
+    current_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
     today_date_str = now.strftime("%Y-%m-%d")
     
-    # 1. 每日 08:10 北京时间报告推送
+    # 1. 每日 08:10 推送日报
     if now.hour == 8 and now.minute == 10:
         if state.get("last_daily_date") != today_date_str:
             msg = (
-                f"📊 <b>每日流量报告</b>\n"
-                f"🏷 <b>名称:</b> {server_name}\n"
-                f"📈 <b>已用 / 总计:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
-                f"🔄 <b>统计周期起止:</b> {cycle_start_str} 至今\n"
-                f"⏰ <b>当前时间:</b> {current_time_str}"
+                f"📊 <b>[{server_name}]每日流量日报</b>\n\n"
+                f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.2f}%)\n"
+                f"- 统计时间: {current_time_str} {tz_mode}"
             )
             send_tg(token, chat_id, msg)
             state["last_daily_date"] = today_date_str
@@ -312,10 +298,9 @@ def main():
     # 2. 90% 预警推送通知
     if percent >= 90.0 and not state.get("warn_90", False):
         msg = (
-            f"⚠️ <b>流量预警通知 (90%)</b>\n"
-            f"🏷 <b>名称:</b> {server_name}\n"
-            f"🚨 <b>当前已使用:</b> {percent:.1f}% ({used_gb:.2f} GB / {total_gb:.2f} GB)\n"
-            f"⏰ <b>时间:</b> {current_time_str}"
+            f"⚠️ <b>[{server_name}] 流量预警通知 (90%)</b>\n\n"
+            f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB (已用 {percent:.2f}%)\n"
+            f"- 报警时间: {current_time_str} {tz_mode}"
         )
         send_tg(token, chat_id, msg)
         state["warn_90"] = True
@@ -324,11 +309,10 @@ def main():
     # 3. 95% 关机报警推送通知
     if percent >= 95.0 and not state.get("shutdown_95", False):
         msg = (
-            f"🛑 <b>流量超限关机警报 (95%)</b>\n"
-            f"🏷 <b>名称:</b> {server_name}\n"
-            f"💥 <b>当前已使用:</b> {percent:.1f}% ({used_gb:.2f} GB / {total_gb:.2f} GB)\n"
-            f"⚡ <b>服务器已触发自动关机保护！</b>\n"
-            f"⏰ <b>时间:</b> {current_time_str}"
+            f"🛑 <b>[{server_name}] 流量超限关机警报 (95%)</b>\n\n"
+            f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB (已用 {percent:.2f}%)\n"
+            f"- <b>服务器已触发自动关机保护！</b>\n"
+            f"- 报警时间: {current_time_str} {tz_mode}时区"
         )
         send_tg(token, chat_id, msg)
         state["shutdown_95"] = True
@@ -370,7 +354,7 @@ menu() {
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
-        echo "3. 手动触发一次 Telegram 测试推送"
+        echo "3. 手动触发一次 Telegram 日报测试推送"
         echo "4. 卸载流量监控"
         echo "0. 退出脚本"
         echo "============================================="
@@ -389,7 +373,7 @@ menu() {
                 read -p "按回车键返回主菜单..."
                 ;;
             3)
-                echo "==> 正在向 Telegram 发送测试消息..."
+                echo "==> 正在向 Telegram 发送日报测试消息..."
                 python3 /usr/local/bin/traffic-monitor.py --test
                 read -p "按回车键返回主菜单..."
                 ;;
