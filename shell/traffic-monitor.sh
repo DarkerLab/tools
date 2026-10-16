@@ -179,7 +179,7 @@ get_current_traffic_bytes() {
         2) echo "$total_tx" ;;
         3) echo "$total_rx" ;;
         *) echo $((total_rx + total_tx)) ;;
-    es
+    esas
 }
 
 format_bytes() {
