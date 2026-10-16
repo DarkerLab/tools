@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script Name: traffic-monitor.sh
-# Description: Advanced Traffic Monitor & Telegram Alert System for Debian 13
-# Version: v1.1.0
-# Author: DarkerLab
-# GitHub Raw URL: https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
+# 脚本名称: traffic-monitor.sh
+# 适用系统: Debian 13 / Linux
+# 脚本版本: v1.2.0
+# 脚本作者: DarkerLab
+# GitHub Raw 链接: https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 # ==============================================================================
 
-# Ensure script is run as root
+# 确保以 root 权限运行
 if [ "$EUID" -ne 0 ]; then
-    echo "[-] Please run this script as root (sudo ./traffic-monitor.sh)"
+    echo -e "\033[0;31m[-] 请以 root 权限运行此脚本 (例如: sudo ./traffic-monitor.sh)\033[0m"
     exit 1
 fi
 
@@ -17,49 +17,49 @@ CONFIG_FILE="/etc/traffic-monitor/config.json"
 STATE_FILE="/etc/traffic-monitor/state.json"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-VERSION="v1.1.0"
+VERSION="v1.2.0"
 
-# Colors
+# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m' # 清除颜色
 
 # ------------------------------------------------------------------------------
-# 1. System Environment Check & Dependencies
+# 1. 系统环境检查与依赖安装
 # ------------------------------------------------------------------------------
 init_system() {
-    echo -e "${BLUE}[+] Checking system environment and dependencies...${NC}"
+    echo -e "${BLUE}[+] 正在检查系统环境与依赖工具...${NC}"
     
-    # Check Timezone
+    # 检查并设置系统时区为 Asia/Shanghai
     CURRENT_TZ=$(timedatectl show --property=Timezone --value)
     if [ "$CURRENT_TZ" != "Asia/Shanghai" ]; then
-        echo -e "${YELLOW}[*] Current timezone is$CURRENT_TZ. Changing to Asia/Shanghai...${NC}"
+        echo -e "${YELLOW}[*] 当前系统时区为 $CURRENT_TZ，正在修改为 Asia/Shanghai...${NC}"
         timedatectl set-timezone Asia/Shanghai
     else
-        echo -e "${GREEN}[+] Timezone is correctly set to Asia/Shanghai.${NC}"
+        echo -e "${GREEN}[+] 当前系统时区已正确设置为 Asia/Shanghai。${NC}"
     fi
 
-    # Update package list and install dependencies
+    # 更新软件包列表并安装依赖
     apt-get update -y
     DEBIAN_FRONTEND=noninteractive apt-get install -y vnstat curl jq bc cron gawk
 
-    # Ensure vnstat service is running and enabled
+    # 启动并开机自启 vnstat 服务
     systemctl enable --now vnstat
     
-    # Create configuration directory
+    # 创建配置目录与日志文件
     mkdir -p /etc/traffic-monitor
     touch "$LOG_FILE"
 }
 
 # ------------------------------------------------------------------------------
-# 2. Configuration Management
+# 2. 配置读取与保存
 # ------------------------------------------------------------------------------
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
-        SERVER_NAME=$(jq -r '.server_name // "MyServer"' "$CONFIG_FILE")
+        SERVER_NAME=$(jq -r '.server_name // "我的服务器"' "$CONFIG_FILE")
         INTERFACES=$(jq -r '.interfaces // "eth0"' "$CONFIG_FILE")
         RESET_DAY=$(jq -r '.reset_day // 1' "$CONFIG_FILE")
         RESET_TZ=$(jq -r '.reset_tz // "UTC8"' "$CONFIG_FILE")
@@ -68,7 +68,7 @@ load_config() {
         TG_BOT_TOKEN=$(jq -r '.tg_bot_token // ""' "$CONFIG_FILE")
         TG_CHAT_ID=$(jq -r '.tg_chat_id // ""' "$CONFIG_FILE")
     else
-        SERVER_NAME="MyServer"
+        SERVER_NAME="我的服务器"
         INTERFACES="eth0"
         RESET_DAY=1
         RESET_TZ="UTC8"
@@ -103,68 +103,68 @@ save_config() {
 }
 
 # ------------------------------------------------------------------------------
-# 3. Interactive Configuration Wizard
+# 3. 中文交互式配置向导
 # ------------------------------------------------------------------------------
 configure_wizard() {
     clear
     echo -e "${CYAN}======================================================${NC}"
-    echo -e "${CYAN}      Traffic Monitor & Alert System Setup Wizard${NC}"
-    echo -e "${CYAN}      Version: $VERSION${NC}"
+    echo -e "${CYAN}      流量监控与预警系统 - 参数配置向导              ${NC}"
+    echo -e "${CYAN}      版本号: $VERSION${NC}"
     echo -e "${CYAN}======================================================${NC}"
     
     load_config
 
-    read -p "Enter Server Name [Current: $SERVER_NAME]: " input_name
+    read -p "请输入服务器自定义名称 [当前: $SERVER_NAME]: " input_name
     [ -n "$input_name" ] && SERVER_NAME="$input_name"
 
-    echo -e "\n${YELLOW}Available Network Interfaces:${NC}"
+    echo -e "\n${YELLOW}当前系统可用的网络接口如下:${NC}"
     ip -o link show | awk -F': ' '{print $2}'
-    read -p "Enter monitored interface(s), space-separated for multiple [Current: $INTERFACES]: " input_ifaces
+    read -p "请输入要监控的网卡名称(多网口请用空格隔开) [当前: $INTERFACES]: " input_ifaces
     [ -n "$input_ifaces" ] && INTERFACES="$input_ifaces"
 
-    read -p "Enter monthly traffic reset day (1-31) [Current: $RESET_DAY]: " input_day
+    read -p "请输入每月流量重置日期 (1-31) [当前: $RESET_DAY]: " input_day
     if [ -n "$input_day" ]; then
         RESET_DAY="$input_day"
     fi
 
-    echo -e "\nSelect Reset Timezone:"
-    echo "1) UTC+0"
-    echo "2) UTC+8 (Beijing Time)"
-    read -p "Enter choice (1-2) [Current: $RESET_TZ]: " input_tz_choice
+    echo -e "\n请选择流量统计与重置时区:"
+    echo "1) UTC+0 时区"
+    echo "2) UTC+8 时区 (北京时间)"
+    read -p "请输入选项 (1-2) [当前: $RESET_TZ]: " input_tz_choice
     if [ "$input_tz_choice" = "1" ]; then
         RESET_TZ="UTC0"
     elif [ "$input_tz_choice" = "2" ]; then
         RESET_TZ="UTC8"
     fi
 
-    echo -e "\nSelect Traffic Statistics Type:"
-    echo "1) Total Traffic (Upload + Download)"
-    echo "2) Upload Traffic Only"
-    echo "3) Download Traffic Only"
-    read -p "Enter choice (1-3) [Current: $TRAFFIC_TYPE]: " input_type
+    echo -e "\n请选择流量统计类型:"
+    echo "1) 总流量 (上传 + 下载)"
+    echo "2) 仅统计上传流量"
+    echo "3) 仅统计下载流量"
+    read -p "请输入选项 (1-3) [当前: $TRAFFIC_TYPE]: " input_type
     [ -n "$input_type" ] && TRAFFIC_TYPE="$input_type"
 
-    read -p "Enter Monthly Traffic Limit in GB [Current: $TOTAL_LIMIT_GB]: " input_limit
+    read -p "请输入每月流量上限阈值 (单位: GB) [当前: $TOTAL_LIMIT_GB]: " input_limit
     [ -n "$input_limit" ] && TOTAL_LIMIT_GB="$input_limit"
 
-    read -p "Enter Telegram Bot Token [Current: $TG_BOT_TOKEN]: " input_token
+    read -p "请输入 Telegram Bot Token [当前: $TG_BOT_TOKEN]: " input_token
     [ -n "$input_token" ] && TG_BOT_TOKEN="$input_token"
 
-    read -p "Enter Telegram Chat ID [Current: $TG_CHAT_ID]: " input_chat_id
+    read -p "请输入 Telegram Chat ID [当前: $TG_CHAT_ID]: " input_chat_id
     [ -n "$input_chat_id" ] && TG_CHAT_ID="$input_chat_id"
 
     save_config
     setup_cron_and_script
     
-    # Create symlink for quick global access
+    # 创建全局快捷命令
     ln -sf "$SCRIPT_PATH" /usr/local/bin/traffic-monitor
 
-    echo -e "\n${GREEN}[+] Configuration saved successfully and cron job updated!${NC}"
-    read -p "Press Enter to return to menu..."
+    echo -e "\n${GREEN}[+] 参数配置已成功保存！定时任务与执行脚本已更新。${NC}"
+    read -p "按回车键返回主菜单..."
 }
 
 # ------------------------------------------------------------------------------
-# 4. Setup Cron and Script Copy
+# 4. 设置 Cron 定时任务与脚本文件同步
 # ------------------------------------------------------------------------------
 setup_cron_and_script() {
     if [ "$0" != "$SCRIPT_PATH" ]; then
@@ -172,13 +172,13 @@ setup_cron_and_script() {
         chmod +x "$SCRIPT_PATH"
     fi
 
-    # Set up 1-minute cron job
+    # 设置 1 分钟执行一次的定时任务
     CRON_JOB="* * * * * $SCRIPT_PATH --monitor >>$LOG_FILE 2>&1"
     (crontab -l 2>/dev/null | grep -v "traffic-monitor.sh") | { cat; echo "$CRON_JOB"; } | crontab -
 }
 
 # ------------------------------------------------------------------------------
-# 5. Telegram Notification Function
+# 5. Telegram 消息推送函数
 # ------------------------------------------------------------------------------
 send_telegram() {
     local message="$1"
@@ -199,7 +199,7 @@ send_telegram() {
 }
 
 # ------------------------------------------------------------------------------
-# 6. Traffic Calculation Logic
+# 6. vnstat 流量计算核心逻辑
 # ------------------------------------------------------------------------------
 get_current_traffic_bytes() {
     local total_rx=0
@@ -271,7 +271,7 @@ bytes_to_gb() {
 }
 
 # ------------------------------------------------------------------------------
-# 7. Monitor & Alert Core Execution (Called every 1 minute)
+# 7. 流量监控核心与报警任务（每1分钟由Cron调用）
 # ------------------------------------------------------------------------------
 run_monitor() {
     load_config
@@ -312,54 +312,57 @@ run_monitor() {
         state_cycle="$current_cycle"
     fi
 
-    # 1. Telegram Daily Report at 08:10 Beijing Time (UTC+8)
+    # 1. Telegram 每日流量报告（北京时间 08:10 准时推送）
     bj_hm=$(TZ='Asia/Shanghai' date "+%H:%M")
     bj_date=$(TZ='Asia/Shanghai' date "+%Y-%m-%d")
     
     if [ "$bj_hm" = "08:10" ] && [ "$last_daily_date" != "$bj_date" ]; then
-        report_msg="📊 *服务器流量日报*
-----------------------------------
-🏷️ *服务器名称*: \`$SERVER_NAME\`
-🌐 *监控网口*: \`$INTERFACES\`
-📈 *统计类型*: \`$( [ "$TRAFFIC_TYPE" = "2" ] && echo "上传流量" || ( [ "$TRAFFIC_TYPE" = "3" ] && echo "下载流量" || echo "总流量 (上传+下载)" ) )\`
-📦 *已用 / 总流量*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
-⏱️ *时区与重置*: \`$RESET_TZ (每月 ${RESET_DAY} 号重置)\`
-🕒 *推送时间*: \`$current_time\`
-----------------------------------
-🟢 *系统状态*: 运行正常"
+        report_msg="📊 *【服务器每日流量报告】*
+━━━━━━━━━━━━━━━━━━
+🖥️ *服务器名称*: \`$SERVER_NAME\`
+🌐 *监控网卡接口*: \`$INTERFACES\`
+📈 *流量统计类型*: \`$( [ "$TRAFFIC_TYPE" = "2" ] && echo "仅上传" || ( [ "$TRAFFIC_TYPE" = "3" ] && echo "仅下载" || echo "总流量 (上传+下载)" ) )\ `
+📦 *当前已用 / 总限额*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\`
+📊 *使用百分比*: \`${percentage}%\`
+📅 *重置规则*: \`每月 ${RESET_DAY} 号 ($RESET_TZ)\`
+🕒 *统计时间*: \`$current_time\`
+━━━━━━━━━━━━━━━━━━
+🟢 *运行状态*: 系统正常监控中"
 
         if send_telegram "$report_msg"; then
             last_daily_date="$bj_date"
         fi
     fi
 
-    # 2. 90% Warning Push Notification
+    # 2. 90% 流量预警推送
     is_above_90=$(echo "$percentage >= 90 &&$percentage < 95" | bc)
     if [ "$is_above_90" -eq 1 ] && [ "$warn_90_sent" = "false" ]; then
-        warn_msg="⚠️ *流量预警通知 (90%)*
-----------------------------------
-🏷️ *服务器名称*: \`$SERVER_NAME\`
-📦 *当前已用流量*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
+        warn_msg="⚠️ *【流量使用 90% 预警通知】*
+━━━━━━━━━━━━━━━━━━
+🖥️ *服务器名称*: \`$SERVER_NAME\`
+📦 *已用 / 总限额*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\`
+📊 *使用百分比*: \`${percentage}%\`
 🕒 *触发时间*: \`$current_time\`
-----------------------------------
-💡 *提示*: 流量已达到 90%，请注意控制流量消耗！"
+━━━━━━━━━━━━━━━━━━
+💡 *温馨提示*: 本周期流量已消耗超过 90%，请合理控制网络使用！"
         if send_telegram "$warn_msg"; then
             warn_90_sent="true"
         fi
     fi
 
-    # 3. 95% Shutdown Alarm Push Notification
+    # 3. 95% 流量超限自动关机推送
     is_above_95=$(echo "$percentage >= 95" | bc)
     if [ "$is_above_95" -eq 1 ] && [ "$shutdown_95_sent" = "false" ]; then
-        shutdown_msg="🚨 *流量超限关机报警 (95%)*
-----------------------------------
-🏷️ *服务器名称*: \`$SERVER_NAME\`
-📦 *当前已用流量*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
+        shutdown_msg="🚨 *【流量超限自动关机报警】*
+━━━━━━━━━━━━━━━━━━
+🖥️ *服务器名称*: \`$SERVER_NAME\`
+📦 *已用 / 总限额*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\`
+📊 *使用百分比*: \`${percentage}%\`
 🕒 *触发时间*: \`$current_time\`
-----------------------------------
-❌ *警告*: 流量已超过 95% 阈值，服务器即将执行关机保护！"
+━━━━━━━━━━━━━━━━━━
+🛑 *严重警告*: 流量使用已达到或超过 95% 阈值，为了防止超出流量产生额外扣费，系统即将执行自动关机！"
         
-        # Verify notification success before executing shutdown
+        # 先校验 Telegram 关机通知是否正常发送成功，成功后再执行关机
         if send_telegram "$shutdown_msg"; then
             shutdown_95_sent="true"
             jq -n \
@@ -382,35 +385,36 @@ run_monitor() {
 }
 
 # ------------------------------------------------------------------------------
-# 8. One-Click Script Update
+# 8. GitHub 一键更新脚本
 # ------------------------------------------------------------------------------
 update_script() {
-    echo -e "${BLUE}[+] Checking for script updates from GitHub...${NC}"
+    echo -e "${BLUE}[+] 正在从 GitHub 检查并拉取最新脚本...${NC}"
     TEMP_SCRIPT="/tmp/traffic-monitor.sh"
     
+    # 检查本地是否存在 traffic-monitor.sh 脚本，若存在则先执行删除
     if [ -f "$SCRIPT_PATH" ]; then
-        echo -e "${YELLOW}[*] Removing local script before update...${NC}"
+        echo -e "${YELLOW}[*] 检测到本地已存在脚本文件，正在执行删除并拉取更新...${NC}"
         rm -f "$SCRIPT_PATH"
     fi
 
     if curl -s -o "$TEMP_SCRIPT" "https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"; then
-        if grep -q "version" "$TEMP_SCRIPT"; then
+        if grep -q "VERSION=" "$TEMP_SCRIPT"; then
             cp "$TEMP_SCRIPT" "$SCRIPT_PATH"
             chmod +x "$SCRIPT_PATH"
             rm -f "$TEMP_SCRIPT"
             ln -sf "$SCRIPT_PATH" /usr/local/bin/traffic-monitor
-            echo -e "${GREEN}[+] Script updated successfully!${NC}"
+            echo -e "${GREEN}[+] 脚本已成功更新至最新版本！${NC}"
         else
-            echo -e "${RED}[-] Downloaded script seems invalid.${NC}"
+            echo -e "${RED}[-] 下载的文件格式异常，更新失败。${NC}"
         fi
     else
-        echo -e "${RED}[-] Failed to download script from GitHub.${NC}"
+        echo -e "${RED}[-] 从 GitHub 下载脚本失败，请检查网络连接。${NC}"
     fi
-    read -p "Press Enter to return to menu..."
+    read -p "按回车键返回主菜单..."
 }
 
 # ------------------------------------------------------------------------------
-# 9. Interactive Main Menu
+# 9. 中文交互主菜单
 # ------------------------------------------------------------------------------
 show_menu() {
     while true; do
@@ -425,22 +429,22 @@ show_menu() {
         fi
 
         echo -e "${CYAN}======================================================${NC}"
-        echo -e "${CYAN}        Traffic Monitor & Alert Management Panel      ${NC}v$VERSION"
+        echo -e "${CYAN}        流量监控与 Telegram 预警管理面板             ${NC}${YELLOW}$VERSION${NC}"
         echo -e "${CYAN}======================================================${NC}"
-        echo -e " Server Name    : ${GREEN}$SERVER_NAME${NC}"
-        echo -e " Monitored Iface: ${GREEN}$INTERFACES${NC}"
-        echo -e " Reset Day      : ${GREEN}Monthly on day$RESET_DAY ($RESET_TZ)${NC}"
-        echo -e " Traffic Type   : ${GREEN}$( [ "$TRAFFIC_TYPE" = "2" ] && echo "Upload Only" || ( [ "$TRAFFIC_TYPE" = "3" ] && echo "Download Only" || echo "Total (Up+Down)" ) )${NC}"
-        echo -e " Current Usage  : ${YELLOW}${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}\%)${NC}"
+        echo -e " 🖥️  服务器名称   : ${GREEN}$SERVER_NAME${NC}"
+        echo -e " 🌐 监控网卡接口 : ${GREEN}$INTERFACES${NC}"
+        echo -e " 📅 流量重置规则 : ${GREEN}每月 ${RESET_DAY} 号 ($RESET_TZ)${NC}"
+        echo -e " 📈 流量统计类型 : ${GREEN}$( [ "$TRAFFIC_TYPE" = "2" ] && echo "仅统计上传" || ( [ "$TRAFFIC_TYPE" = "3" ] && echo "仅统计下载" \vert{}\vert{} echo "总流量 (上传+下载)" ) )${NC}"
+        echo -e " 📦 本周期已用流量: ${YELLOW}${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}\%)${NC}"
         echo -e "${CYAN}------------------------------------------------------${NC}"
-        echo -e " 1) Configure / Modify Parameters"
-        echo -e " 2) View Current Traffic Status"
-        echo -e " 3) Test Telegram Notification"
-        echo -e " 4) Run Manual Monitor Check"
-        echo -e " 5) Update Script (Pull from GitHub)"
-        echo -e " 0) Exit"
+        echo -e " ${GREEN}1.${NC} 修改/设置监控参数"
+        echo -e " ${GREEN}2.${NC} 查看当前详细流量统计"
+        echo -e " ${GREEN}3.${NC} 测试 Telegram 机器人通知"
+        echo -e " ${GREEN}4.${NC} 手动触发一次流量检查"
+        echo -e " ${GREEN}5.${NC} 一键更新脚本 (GitHub 最新版)"
+        echo -e " ${RED}0.${NC} 退出脚本"
         echo -e "${CYAN}======================================================${NC}"
-        read -p "Please enter your choice (0-5): " choice
+        read -p "请输入对应的操作编号 [0-5]: " choice
 
         case $choice in
             1)
@@ -448,41 +452,41 @@ show_menu() {
                 ;;
             2)
                 clear
-                echo -e "${CYAN}=== Current Traffic Status ===${NC}"
+                echo -e "${CYAN}=== vnstat 原始流量统计结果 ===${NC}"
                 vnstat -i "$INTERFACES"
-                echo -e "\nCalculated Current Cycle Usage: ${GREEN}${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}\%)${NC}"
-                read -p "Press Enter to return to menu..."
+                echo -e "\n当前周期计算得出使用量: ${GREEN}${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}\%)${NC}"
+                read -p "按回车键返回主菜单..."
                 ;;
             3)
-                echo -e "${BLUE}[+] Sending test notification to Telegram...${NC}"
-                if send_telegram "🔔 *Traffic Monitor Test Notification*
-----------------------------------
-🏷️ *Server Name*: \`$SERVER_NAME\`
-📦 *Current Usage*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
-🕒 *Time*: \`$(date)\`
-----------------------------------
-✅ *Status*: Telegram Bot is working properly!"; then
-                    echo -e "${GREEN}[+] Test message sent successfully!${NC}"
+                echo -e "${BLUE}[+] 正在向 Telegram 发送测试消息...${NC}"
+                if send_telegram "🔔 *【流量监控测试通知】*
+━━━━━━━━━━━━━━━━━━
+🖥️ *服务器名称*: \`$SERVER_NAME\`
+📦 *当前已用流量*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
+🕒 *测试时间*: \`$(date '+%Y-%m-%d %H:%M:%S')\`
+━━━━━━━━━━━━━━━━━━
+✅ *状态提示*: Telegram 机器人配置正确，推送正常！"; then
+                    echo -e "${GREEN}[+] 测试消息发送成功！请检查 Telegram 聊天窗口。${NC}"
                 else
-                    echo -e "${RED}[-] Failed to send test message. Check Bot Token and Chat ID.${NC}"
+                    echo -e "${RED}[-] 测试消息发送失败，请检查 Bot Token 和 Chat ID 是否正确。${NC}"
                 fi
-                read -p "Press Enter to return to menu..."
+                read -p "按回车键返回主菜单..."
                 ;;
             4)
-                echo -e "${BLUE}[+] Running manual monitor check...${NC}"
+                echo -e "${BLUE}[+] 正在执行手动流量检查...${NC}"
                 run_monitor
-                echo -e "${GREEN}[+] Manual check completed. Check logs at $LOG_FILE${NC}"
-                read -p "Press Enter to return to menu..."
+                echo -e "${GREEN}[+] 手动检查完成！如需查看日志请运行: tail -f $LOG_FILE${NC}"
+                read -p "按回车键返回主菜单..."
                 ;;
             5)
                 update_script
                 ;;
             0)
-                echo -e "${GREEN}Goodbye!${NC}"
+                echo -e "${GREEN}感谢使用，再见！${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}[-] Invalid option, please try again.${NC}"
+                echo -e "${RED}[-] 输入有误，请输入 0-5 之间的数字。${NC}"
                 sleep 1
                 ;;
         esac
@@ -490,8 +494,8 @@ show_menu() {
 }
 
 # ------------------------------------------------------------------------------
-# 10. Entry Point
-# ---------------------------------------------------
+# 10. 脚本入口点处理
+# ------------------------------------------------------------------------------
 case "$1" in
     --monitor)
         run_monitor
