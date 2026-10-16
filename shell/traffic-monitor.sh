@@ -3,7 +3,7 @@
 # Script Name: traffic-monitor.sh
 # Description: Debian 13 Traffic Monitor & Telegram Alert System using vnstat
 # Author: DarkerLab
-# Version: 1.2.1
+# Version: 1.2.2
 # ==============================================================================
 
 # 颜色定义
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 STATE_DIR="/var/lib/traffic-monitor"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
 GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 # 检查Root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
@@ -84,10 +84,10 @@ send_tg_msg() {
     fi
 }
 
-# 交互式配置向导（已修复：默认优先加载旧配置，避免修改时参数丢失）
+# 交互式配置向导
 configure_parameters() {
     clear
-    load_config # 核心修复：进入配置向导前先加载现有配置
+    load_config
     echo -e "${BLUE}=== 流量监控参数配置向导 ===${PLAIN}"
     
     # 1. 服务器名称
@@ -149,7 +149,7 @@ configure_parameters() {
     read -p "请输入每月总流量额度 (GB) [默认: $default_quota]: " input_quota
     TOTAL_QUOTA_GB="${input_quota:-$default_quota}"
 
-    # 7. Telegram 配置（保留旧配置提示）
+    # 7. Telegram 配置
     local token_hint="${TG_BOT_TOKEN:0:6}***(已配置)"
     [ -z "$TG_BOT_TOKEN" ] && token_hint="未配置"
     read -p "请输入 Telegram Bot Token [当前: $token_hint，直接回车保留]: " input_token
@@ -166,18 +166,17 @@ configure_parameters() {
     read -p "按回车键返回主菜单..."
 }
 
-# 设置Cron定时任务（每分钟执行一次检查）
+# 设置Cron定时任务
 setup_cron() {
     local cron_cmd="* * * * * /usr/local/bin/traffic-monitor.sh check >/dev/null 2>&1"
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | { cat; echo "$cron_cmd"; } | crontab -
 }
 
-# 计算当前周期内的已用流量（已修复 vnStat JSON 的 day 节点解析路径）
+# 计算当前周期内的已用流量
 calculate_traffic() {
     load_config
     [ -z "$INTERFACES" ] && return
 
-    # 根据时区获取当前时间参数
     local cur_date cur_day cur_month cur_year
     if [ "$RESET_TZ" = "UTC0" ]; then
         cur_date=$(TZ='UTC' date +'%Y-%m-%d')
@@ -191,7 +190,6 @@ calculate_traffic() {
         cur_year=$(TZ='Asia/Shanghai' date +'%Y')
     fi
 
-    # 计算结算周期起始日
     local c_day=$((10#$cur_day))
     local c_month=$((10#$cur_month))
     local c_year=$((10#$cur_year))
@@ -222,7 +220,6 @@ calculate_traffic() {
         if_json=$(vnstat -i "$iface" --json 2>/dev/null)
         [ -z "$if_json" ] && continue
 
-        # 核心修复：vnStat 2.x 的 JSON 数组节点名称为 .day 而非 .days
         local parsed
         parsed=$(echo "$if_json" | jq -r --arg start "$start_date_str" '
             if .interfaces[0].traffic.day? then
@@ -250,7 +247,6 @@ calculate_traffic() {
         *) used_bytes=$((total_rx + total_tx)) ;;
     esac
 
-    # 计算 GB 与百分比
     local used_gb quota_bytes percentage
     used_gb=$(echo "scale=2; $used_bytes / (1024 * 1024 * 1024)" | bc)
     quota_bytes=$(echo "$TOTAL_QUOTA_GB * 1024 * 1024 * 1024" | bc | cut -d'.' -f1)
@@ -350,8 +346,9 @@ update_script() {
     if [ -f "$SCRIPT_PATH" ]; then
         rm -f "$SCRIPT_PATH"
     fi
-    if curl -sL "$GITHUB_URL" -o "$SCRIPT_PATH"; then
+    if curl -sL "${GITHUB_URL}?t=$(date +\%s)" -o "$SCRIPT_PATH"; then
         chmod +x "$SCRIPT_PATH"
+        source "$SCRIPT_PATH" check >/dev/null 2>&1
         echo -e "${GREEN}脚本更新成功！当前版本: v$VERSION${PLAIN}"
     else
         echo -e "${RED}脚本更新失败，请检查网络连接或 GitHub 链接是否正确。${PLAIN}"
@@ -455,4 +452,4 @@ case "$1" in
     *)
         main_menu
         ;;
-es:
+esac
