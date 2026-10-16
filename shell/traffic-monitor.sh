@@ -86,7 +86,6 @@ TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 EOF_CONF
 
-    # 安全加固：设置配置文件权限仅 root 可读写
     chmod 600 "$CONFIG_FILE"
     echo "==> 配置文件已保存至 $CONFIG_FILE 并完成权限加固。"
 }
@@ -171,13 +170,19 @@ def calculate_traffic():
     cycle_start_str = cycle_start.strftime("%Y-%m-%d")
     
     used_bytes = 0
-    try:
-        res = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
-        data = json.loads(res.stdout)
-        
-        for inf in data.get("interfaces", []):
-            if inf.get("name") in ifaces:
-                days_list = inf.get("traffic", {}).get("days", [])
+    
+    # 逐个网卡查询并聚合流量，确保多网卡兼容性
+    for iface in ifaces:
+        iface_bytes = 0
+        try:
+            res = subprocess.run(["vnstat", "-i", iface, "--json"], capture_output=True, text=True, check=True)
+            data = json.loads(res.stdout)
+            
+            for inf in data.get("interfaces", []):
+                traffic = inf.get("traffic", {})
+                
+                # 1. 尝试通过天数明细精确匹配周期
+                days_list = traffic.get("days", [])
                 for d in days_list:
                     d_date = d.get("date", {})
                     dy = d_date.get("year")
@@ -190,35 +195,34 @@ def calculate_traffic():
                                 rx = d.get("rx", 0)
                                 tx = d.get("tx", 0)
                                 if traffic_type == 1:
-                                    used_bytes += (rx + tx)
+                                    iface_bytes += (rx + tx)
                                 elif traffic_type == 2:
-                                    used_bytes += tx
+                                    iface_bytes += tx
                                 elif traffic_type == 3:
-                                    used_bytes += rx
+                                    iface_bytes += rx
                         except Exception:
                             continue
-    except Exception:
-        pass
-
-    if used_bytes == 0:
-        try:
-            for iface in ifaces:
-                res = subprocess.run(["vnstat", "-i", iface, "--json"], capture_output=True, text=True, check=True)
-                m_data = json.loads(res.stdout)
-                for inf in m_data.get("interfaces", []):
-                    months = inf.get("traffic", {}).get("months", [])
-                    if months:
-                        latest = months[-1]
-                        rx = latest.get("rx", 0)
-                        tx = latest.get("tx", 0)
-                        if traffic_type == 1:
-                            used_bytes += (rx + tx)
-                        elif traffic_type == 2:
-                            used_bytes += tx
-                        elif traffic_type == 3:
-                            used_bytes += rx
-        except:
-            pass
+                
+                # 2. 如果天数明细未统计到且重置日为1号，直接取当月月份流量兜底
+                if iface_bytes == 0 and reset_day == 1:
+                    months_list = traffic.get("months", [])
+                    if months_list:
+                        latest = months_list[-1]
+                        m_date = latest.get("date", {})
+                        if m_date.get("year") == year and m_date.get("month") == month:
+                            rx = latest.get("rx", 0)
+                            tx = latest.get("tx", 0)
+                            if traffic_type == 1:
+                                iface_bytes += (rx + tx)
+                            elif traffic_type == 2:
+                                iface_bytes += tx
+                            elif traffic_type == 3:
+                                iface_bytes += rx
+                                
+        except Exception as e:
+            print(f"[Warning] 查询网卡 {iface} 失败: {e}")
+            
+        used_bytes += iface_bytes
 
     used_gb = used_bytes / (1024 ** 3)
     return used_gb, cycle_start_str, now
@@ -319,7 +323,7 @@ def main():
             state["warn_90"] = True
             save_state(state)
 
-    # 3. 95% 关机报警推送通知（优化：必须确认Telegram发送成功再关机）
+    # 3. 95% 关机报警推送通知
     if percent >= 95.0 and not state.get("shutdown_95", False):
         msg = (
             f"🛑 <b>[{server_name}] 流量超限关机 (95%)</b>\n\n"
