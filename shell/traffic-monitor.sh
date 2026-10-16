@@ -144,6 +144,28 @@ def send_tg(token, chat_id, message):
         print(f"[Error] Telegram 发送失败: {e}")
         return False
 
+def parse_size(s):
+    if not s or "--" in s: 
+        return 0.0
+    parts = s.split()
+    if len(parts) < 2:
+        return 0.0
+    try:
+        val = float(parts[0])
+        unit = parts[1].lower()
+        mult = 1.0
+        if 'ki' in unit: mult = 1024.0
+        elif 'mi' in unit: mult = 1024.0**2
+        elif 'gi' in unit: mult = 1024.0**3
+        elif 'ti' in unit: mult = 1024.0**4
+        elif unit == 'kb': mult = 1000.0
+        elif unit == 'mb': mult = 1000.0**2
+        elif unit == 'gb': mult = 1000.0**3
+        elif unit == 'tb': mult = 1000.0**4
+        return val * mult
+    except:
+        return 0.0
+
 def calculate_traffic():
     config = load_config()
     ifaces = config.get("INTERFACES", "eth0").split()
@@ -169,62 +191,33 @@ def calculate_traffic():
             
     cycle_start_str = cycle_start.strftime("%Y-%m-%d")
     
-    used_bytes = 0
+    used_bytes = 0.0
+    combined_iface = "+".join(ifaces)
     
-    # 逐个网卡查询并聚合流量，确保多网卡兼容性
-    for iface in ifaces:
-        iface_bytes = 0
-        try:
-            res = subprocess.run(["vnstat", "-i", iface, "--json"], capture_output=True, text=True, check=True)
-            data = json.loads(res.stdout)
-            
-            for inf in data.get("interfaces", []):
-                traffic = inf.get("traffic", {})
-                
-                # 1. 尝试通过天数明细精确匹配周期
-                days_list = traffic.get("days", [])
-                for d in days_list:
-                    d_date = d.get("date", {})
-                    dy = d_date.get("year")
-                    dm = d_date.get("month")
-                    dd = d_date.get("day")
-                    if dy and dm and dd:
-                        try:
-                            record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
-                            if record_date >= cycle_start:
-                                rx = d.get("rx", 0)
-                                tx = d.get("tx", 0)
-                                if traffic_type == 1:
-                                    iface_bytes += (rx + tx)
-                                elif traffic_type == 2:
-                                    iface_bytes += tx
-                                elif traffic_type == 3:
-                                    iface_bytes += rx
-                        except Exception:
-                            continue
-                
-                # 2. 如果天数明细未统计到且重置日为1号，直接取当月月份流量兜底
-                if iface_bytes == 0 and reset_day == 1:
-                    months_list = traffic.get("months", [])
-                    if months_list:
-                        latest = months_list[-1]
-                        m_date = latest.get("date", {})
-                        if m_date.get("year") == year and m_date.get("month") == month:
-                            rx = latest.get("rx", 0)
-                            tx = latest.get("tx", 0)
-                            if traffic_type == 1:
-                                iface_bytes += (rx + tx)
-                            elif traffic_type == 2:
-                                iface_bytes += tx
-                            elif traffic_type == 3:
-                                iface_bytes += rx
-                                
-        except Exception as e:
-            print(f"[Warning] 查询网卡 {iface} 失败: {e}")
-            
-        used_bytes += iface_bytes
+    try:
+        # 使用 vnstat 文本表格查询，完美支持多网卡聚合（如 ens18+ens19）
+        res = subprocess.run(["vnstat", "-i", combined_iface, "-m"], capture_output=True, text=True, check=True)
+        target_ym = now.strftime("%Y-%m")
+        
+        for line in res.stdout.splitlines():
+            if target_ym in line and "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 4:
+                    rx_bytes = parse_size(parts[1])
+                    tx_bytes = parse_size(parts[2])
+                    total_bytes = parse_size(parts[3])
+                    
+                    if traffic_type == 1:
+                        used_bytes = total_bytes
+                    elif traffic_type == 2:
+                        used_bytes = tx_bytes
+                    elif traffic_type == 3:
+                        used_bytes = rx_bytes
+                    break
+    except Exception as e:
+        print(f"[Warning] 获取 vnstat 数据失败: {e}")
 
-    used_gb = used_bytes / (1024 ** 3)
+    used_gb = used_bytes / (1024.0 ** 3)
     return used_gb, cycle_start_str, now
 
 def print_status():
