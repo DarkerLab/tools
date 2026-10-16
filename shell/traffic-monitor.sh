@@ -10,7 +10,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 CRON_FILE="/etc/cron.d/traffic-monitor"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-SCRIPT_VERSION="1.1"
+SCRIPT_VERSION="1.2"
 BASE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
@@ -57,7 +57,7 @@ install_or_config() {
     read -p "请输入自定义监控服务器名称 [默认: $(hostname)]: " SERVER_NAME
     SERVER_NAME="${SERVER_NAME:-$(hostname)}"
 
-    read -p "请输入监控网口（单网口如 eth0，多网口可用空格或逗号分隔如 ens18,ens19）[默认: $(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)]: " INTERFACES
+    read -p "请输入监控网口（单网口如 ens18，多网口可用空格或逗号分隔如 ens18,ens19）[默认: $(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)]: " INTERFACES
     INTERFACES="${INTERFACES:-$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)}"
 
     read -p "请输入每月流量重置日期 (1-31) [默认: 1]: " RESET_DAY
@@ -139,12 +139,23 @@ send_tg_msg() {
     fi
 }
 
-# ==================== 3. 流量计算核心逻辑 ====================
+# ==================== 3. 流量计算核心逻辑 (已修复) ====================
 get_current_traffic_bytes() {
     local total_rx=0
     local total_tx=0
     
-    IFS=', ' read -r -a if_array <<< "$INTERFACES"
+    local c_year=$(date +%Y)
+    local c_month=$(date +%m | sed 's/^0//')
+    local c_day=$(date +%d | sed 's/^0//')
+    
+    local p_year=$c_year
+    local p_month=$((c_month - 1))
+    if [ "$p_month" -eq 0 ]; then
+        p_month=12
+        p_year=$((c_year - 1))
+    fi
+    
+    IFS=',+' read -r -a if_array <<< "$INTERFACES"
     
     for iface in "${if_array[@]}"; do
         iface=$(echo "$iface" | xargs)
@@ -155,19 +166,51 @@ get_current_traffic_bytes() {
             continue
         fi
         
-        rx=$(echo "$json_data" | jq --argjson rday "$RESET_DAY" '
-            .interfaces[0].traffic.month | 
-            map(select(.date.day >= $rday)) | 
-            map(.rx) | add // 0
-        ')
-        tx=$(echo "$json_data" | jq --argjson rday "$RESET_DAY" '
-            .interfaces[0].traffic.month | 
-            map(select(.date.day >= $rday)) | 
-            map(.tx) | add // 0
-        ')
+        if [ "$RESET_DAY" -eq 1 ]; then
+            rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
+                .interfaces[0].traffic.month | 
+                map(select(.date.year == $yr and .date.month ==$mo)) | 
+                .[0].rx // 0
+            ')
+            tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
+                .interfaces[0].traffic.month | 
+                map(select(.date.year == $yr and .date.month ==$mo)) | 
+                .[0].tx // 0
+            ')
+        else
+            if [ "$c_day" -ge "$RESET_DAY" ]; then
+                rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
+                    .interfaces[0].traffic.day | 
+                    map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
+                    map(.rx) | add // 0
+                ')
+                tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
+                    .interfaces[0].traffic.day | 
+                    map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
+                    map(.tx) | add // 0
+                ')
+            else
+                rx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
+                    .interfaces[0].traffic.day | 
+                    map(select(
+                        (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
+                        (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
+                    )) | 
+                    map(.rx) | add // 0
+                ')
+                tx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
+                    .interfaces[0].traffic.day | 
+                    map(select(
+                        (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
+                        (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
+                    )) | 
+                    map(.tx) | add // 0
+                ')
+            fi
+        fi
         
-        total_rx=$((total_rx + rx))
-        total_tx=$((total_tx + tx))
+        total_rx=$((total_rx +${rx:-0}))
+        total_tx=$((total_tx +${tx:-0}))
     done
 
     case "$TRAFFIC_TYPE" in
@@ -324,7 +367,7 @@ view_traffic() {
     echo -e "当前使用率: ${GREEN}${percent}\%${NC}"
     echo "----------------------------------------"
     echo -e "${YELLOW}vnstat 详细接口状态：${NC}"
-    vnstat -i "$(echo "$INTERFACES" | awk -F',' '{print $1}' | xargs)"
+    vnstat -i "$(echo "$INTERFACES" | awk -F'[,+]' '{print $1}' | xargs)"
     echo "----------------------------------------"
     read -p "按回车键返回主菜单..."
     show_menu
@@ -332,7 +375,6 @@ view_traffic() {
 
 update_script() {
     echo -e "${YELLOW}正在从 GitHub 强制刷新拉取最新脚本（已启用防CDN缓存机制）...${NC}"
-    # 核心优化：拼接动态时间戳参数 ?v=$(date +%s)，强制 CDN 丢弃旧缓存拉取最新代码
     FORCE_URL="${BASE_URL}?v=$(date +%s)"
     
     if curl -sSL "$FORCE_URL" -o "$SCRIPT_PATH"; then
