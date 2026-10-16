@@ -34,7 +34,6 @@ configure_params() {
     echo "       Debian 13 流量监控与告警脚本配置"
     echo "============================================="
 
-    # 读取现有配置（如果存在）
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
     fi
@@ -67,8 +66,8 @@ configure_params() {
     read -p "请选择 [当前: ${TRAFFIC_TYPE:-1}]: " input_type
     TRAFFIC_TYPE="${input_type:-${TRAFFIC_TYPE:-1}}"
 
-    read -p "请输入每月总流量限制额度 (单位: GB，例如 1000) [当前: ${TOTAL_GB:-1000}]: " input_total
-    TOTAL_GB="${input_total:-${TOTAL_GB:-1000}}"
+    read -p "请输入每月总流量限制额度 (单位: GB，例如 2000) [当前: ${TOTAL_GB:-2000}]: " input_total
+    TOTAL_GB="${input_total:-${TOTAL_GB:-2000}}"
 
     read -p "请输入 Telegram Bot Token [当前: ${TG_BOT_TOKEN}]: " input_token
     TG_BOT_TOKEN="${input_token:-$TG_BOT_TOKEN}"
@@ -76,7 +75,6 @@ configure_params() {
     read -p "请输入 Telegram Chat ID [当前: ${TG_CHAT_ID}]: " input_chat
     TG_CHAT_ID="${input_chat:-$TG_CHAT_ID}"
 
-    # 写入配置文件
     cat << EOF_CONF > "$CONFIG_FILE"
 SERVER_NAME="$SERVER_NAME"
 INTERFACES="$INTERFACES"
@@ -107,7 +105,7 @@ STATE_FILE = "/var/lib/traffic-monitor/state.json"
 def load_config():
     config = {}
     if not os.path.exists(CONFIG_FILE):
-        sys.exit(0)
+        return {}
     with open(CONFIG_FILE, "r") as f:
         for line in f:
             if "=" in line and not line.startswith("#"):
@@ -131,15 +129,19 @@ def save_state(state):
 
 def send_tg(token, chat_id, message):
     if not token or not chat_id:
-        return
+        print("[Error] Telegram Token 或 Chat ID 未配置！")
+        return False
     import urllib.request
     import urllib.parse
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": message, "parse_mode": "HTML"}).encode()
     try:
-        urllib.request.urlopen(url, data=data, timeout=10)
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return True
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        print(f"[Error] Telegram 发送失败: {e}")
+        return False
 
 def calculate_traffic():
     config = load_config()
@@ -179,31 +181,33 @@ def calculate_traffic():
                     dy = d_date.get("year")
                     dm = d_date.get("month")
                     dd = d_date.get("day")
-                    try:
-                        record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
-                        if record_date >= cycle_start:
-                            rx = d.get("rx", 0)
-                            tx = d.get("tx", 0)
-                            if traffic_type == 1:
-                                used_bytes += (rx + tx)
-                            elif traffic_type == 2:
-                                used_bytes += tx
-                            elif traffic_type == 3:
-                                used_bytes += rx
-                    except Exception:
-                        continue
+                    if dy and dm and dd:
+                        try:
+                            record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
+                            if record_date >= cycle_start:
+                                rx = d.get("rx", 0)
+                                tx = d.get("tx", 0)
+                                if traffic_type == 1:
+                                    used_bytes += (rx + tx)
+                                elif traffic_type == 2:
+                                    used_bytes += tx
+                                elif traffic_type == 3:
+                                    used_bytes += rx
+                        except Exception:
+                            continue
     except Exception:
         pass
 
+    # 兜底方案：如果通过days统计为0，尝试使用vnstat各网卡当前月统计
     if used_bytes == 0:
         try:
             for iface in ifaces:
-                res = subprocess.run(["vnstat", "-i", iface, "-m", "--json"], capture_output=True, text=True, check=True)
+                res = subprocess.run(["vnstat", "-i", iface, "--json"], capture_output=True, text=True, check=True)
                 m_data = json.loads(res.stdout)
                 for inf in m_data.get("interfaces", []):
                     months = inf.get("traffic", {}).get("months", [])
                     if months:
-                        latest = months[0]
+                        latest = months[-1] # 取最新月份
                         rx = latest.get("rx", 0)
                         tx = latest.get("tx", 0)
                         if traffic_type == 1:
@@ -218,7 +222,53 @@ def calculate_traffic():
     used_gb = used_bytes / (1024 ** 3)
     return used_gb, cycle_start_str, now
 
+def print_status():
+    config = load_config()
+    server_name = config.get("SERVER_NAME", "Server")
+    total_gb = float(config.get("TOTAL_GB", 1000))
+    used_gb, cycle_start_str, now = calculate_traffic()
+    percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
+    
+    print(f"服务器名称: {server_name}")
+    print(f"监控网卡: {config.get('INTERFACES', 'N/A')}")
+    print(f"重置日期: 每月 {config.get('RESET_DAY', 1)} 号 ({config.get('TIMEZONE_MODE', 'UTC8')})")
+    print(f"统计周期起点: {cycle_start_str}")
+    print(f"流量类型: {config.get('TRAFFIC_TYPE', '1')} (1:总流量 2:上传 3:下载)")
+    print(f"总流量限制: {total_gb:.2f} GB")
+    print(f"---------------------------------------------")
+    print(f"📊 当前已用流量: {used_gb:.2f} GB")
+    print(f"📈 流量使用占比: {percent:.2f}%")
+    print(f"⏰ 当前检测时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+
 def main():
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--status":
+            print_status()
+            return
+        elif sys.argv[1] == "--test":
+            config = load_config()
+            server_name = config.get("SERVER_NAME", "Server")
+            total_gb = float(config.get("TOTAL_GB", 1000))
+            token = config.get("TG_BOT_TOKEN", "")
+            chat_id = config.get("TG_CHAT_ID", "")
+            used_gb, cycle_start_str, now = calculate_traffic()
+            percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
+            
+            msg = (
+                f"🧪 <b>Telegram 手动测试报告</b>\n"
+                f"🏷 <b>名称:</b> {server_name}\n"
+                f"📈 <b>已用 / 总计:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
+                f"🔄 <b>统计周期起止:</b> {cycle_start_str} 至今\n"
+                f"⏰ <b>当前时间:</b> {now.strftime('%Y-%m-%d %H:%M')}"
+            )
+            success = send_tg(token, chat_id, msg)
+            if success:
+                print("==> 测试消息已成功发送至 Telegram，请检查接收！")
+            else:
+                print("==> 发送失败，请检查您的 Bot Token 和 Chat ID 是否正确。")
+            return
+
+    # 定时后台常规检查逻辑
     config = load_config()
     if not config:
         return
@@ -229,11 +279,7 @@ def main():
     chat_id = config.get("TG_CHAT_ID", "")
     
     used_gb, cycle_start_str, now = calculate_traffic()
-    
-    if total_gb > 0:
-        percent = (used_gb / total_gb) * 100
-    else:
-        percent = 0.0
+    percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
         
     state = load_state()
     
@@ -249,7 +295,7 @@ def main():
     current_time_str = now.strftime("%Y-%m-%d %H:%M")
     today_date_str = now.strftime("%Y-%m-%d")
     
-    # 每日 08:10 北京时间报告推送
+    # 1. 每日 08:10 北京时间报告推送
     if now.hour == 8 and now.minute == 10:
         if state.get("last_daily_date") != today_date_str:
             msg = (
@@ -263,7 +309,7 @@ def main():
             state["last_daily_date"] = today_date_str
             save_state(state)
 
-    # 90% 预警推送通知
+    # 2. 90% 预警推送通知
     if percent >= 90.0 and not state.get("warn_90", False):
         msg = (
             f"⚠️ <b>流量预警通知 (90%)</b>\n"
@@ -275,7 +321,7 @@ def main():
         state["warn_90"] = True
         save_state(state)
 
-    # 95% 关机报警推送通知
+    # 3. 95% 关机报警推送通知
     if percent >= 95.0 and not state.get("shutdown_95", False):
         msg = (
             f"🛑 <b>流量超限关机警报 (95%)</b>\n"
@@ -306,17 +352,10 @@ setup_cron() {
 
 show_status() {
     if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
         echo "============================================="
         echo "          当前流量监控运行状态"
         echo "============================================="
-        echo "服务器名称: $SERVER_NAME"
-        echo "监控网卡: $INTERFACES"
-        echo "重置日期: 每月 ${RESET_DAY} 号 ($TIMEZONE_MODE)"
-        echo "流量类型: $TRAFFIC_TYPE (1:总流量 2:上传 3:下载)"
-        echo "总流量限制: $TOTAL_GB GB"
-        echo "---------------------------------------------"
-        python3 /usr/local/bin/traffic-monitor.py
+        python3 /usr/local/bin/traffic-monitor.py --status
         echo "============================================="
     else
         echo "尚未配置监控，请先运行安装/配置。"
@@ -331,7 +370,7 @@ menu() {
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
-        echo "3. 手动触发一次流量测试/每日报告推送"
+        echo "3. 手动触发一次 Telegram 测试推送"
         echo "4. 卸载流量监控"
         echo "0. 退出脚本"
         echo "============================================="
@@ -350,9 +389,8 @@ menu() {
                 read -p "按回车键返回主菜单..."
                 ;;
             3)
-                echo "==> 正在手动执行监控脚本..."
-                python3 /usr/local/bin/traffic-monitor.py
-                echo "==> 执行完毕。若满足条件已向 Telegram 推送。"
+                echo "==> 正在向 Telegram 发送测试消息..."
+                python3 /usr/local/bin/traffic-monitor.py --test
                 read -p "按回车键返回主菜单..."
                 ;;
             4)
