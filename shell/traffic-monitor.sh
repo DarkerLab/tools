@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Script Name: traffic-monitor.sh
-# Description: Debian 13 Traffic Monitor, Daily Telegram Report, and Auto-Shutdown
+# Description: Advanced Traffic Monitor & Telegram Alert System for Debian 13
+# Version: v1.1.0
+# Author: DarkerLab
+# GitHub Raw URL: https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 # ==============================================================================
 
-CONF_FILE="/etc/traffic-monitor.conf"
-STATE_FILE="/var/lib/traffic-monitor/state.json"
-SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then
+    echo "[-] Please run this script as root (sudo ./traffic-monitor.sh)"
+    exit 1
+fi
+
+CONFIG_FILE="/etc/traffic-monitor/config.json"
+STATE_FILE="/etc/traffic-monitor/state.json"
 LOG_FILE="/var/log/traffic-monitor.log"
-VERSION="v1.2.0"
+SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
+VERSION="v1.1.0"
 
 # Colors
 RED='\033[0;31m'
@@ -18,393 +27,485 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Ensure root privilege
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}[Error] Please run this script as root (sudo).${NC}"
-    exit 1
-fi
-
-# Initialize environment and dependencies
-init_environment() {
-    echo -e "${CYAN}[Info] Checking system environment and dependencies...${NC}"
+# ------------------------------------------------------------------------------
+# 1. System Environment Check & Dependencies
+# ------------------------------------------------------------------------------
+init_system() {
+    echo -e "${BLUE}[+] Checking system environment and dependencies...${NC}"
     
-    # Check timezone
+    # Check Timezone
     CURRENT_TZ=$(timedatectl show --property=Timezone --value)
     if [ "$CURRENT_TZ" != "Asia/Shanghai" ]; then
-        echo -e "${YELLOW}[Info] Current timezone is $CURRENT_TZ. Setting timezone to Asia/Shanghai...${NC}"
+        echo -e "${YELLOW}[*] Current timezone is$CURRENT_TZ. Changing to Asia/Shanghai...${NC}"
         timedatectl set-timezone Asia/Shanghai
     else
-        echo -e "${GREEN}[Info] Timezone is already Asia/Shanghai.${NC}"
+        echo -e "${GREEN}[+] Timezone is correctly set to Asia/Shanghai.${NC}"
     fi
 
-    # Update and install dependencies
+    # Update package list and install dependencies
     apt-get update -y
-    apt-get install -y vnstat curl jq bc python3 cron
+    DEBIAN_FRONTEND=noninteractive apt-get install -y vnstat curl jq bc cron gawk
 
-    # Enable and start vnstat
+    # Ensure vnstat service is running and enabled
     systemctl enable --now vnstat
     
-    # Create required directories
-    mkdir -p /var/lib/traffic-monitor
+    # Create configuration directory
+    mkdir -p /etc/traffic-monitor
     touch "$LOG_FILE"
 }
 
-# Load Configuration
+# ------------------------------------------------------------------------------
+# 2. Configuration Management
+# ------------------------------------------------------------------------------
 load_config() {
-    if [ -f "$CONF_FILE" ]; then
-        source "$CONF_FILE"
+    if [ -f "$CONFIG_FILE" ]; then
+        SERVER_NAME=$(jq -r '.server_name // "MyServer"' "$CONFIG_FILE")
+        INTERFACES=$(jq -r '.interfaces // "eth0"' "$CONFIG_FILE")
+        RESET_DAY=$(jq -r '.reset_day // 1' "$CONFIG_FILE")
+        RESET_TZ=$(jq -r '.reset_tz // "UTC8"' "$CONFIG_FILE")
+        TRAFFIC_TYPE=$(jq -r '.traffic_type // 1' "$CONFIG_FILE")
+        TOTAL_LIMIT_GB=$(jq -r '.total_limit_gb // 1000' "$CONFIG_FILE")
+        TG_BOT_TOKEN=$(jq -r '.tg_bot_token // ""' "$CONFIG_FILE")
+        TG_CHAT_ID=$(jq -r '.tg_chat_id // ""' "$CONFIG_FILE")
     else
-        SERVER_NAME=$(hostname)
-        INTERFACES=$(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo' | head -n 1)
+        SERVER_NAME="MyServer"
+        INTERFACES="eth0"
         RESET_DAY=1
-        TZ_OFFSET="UTC8"
+        RESET_TZ="UTC8"
         TRAFFIC_TYPE=1
         TOTAL_LIMIT_GB=1000
-        WARN_PERCENT=90
-        SHUTDOWN_PERCENT=95
         TG_BOT_TOKEN=""
         TG_CHAT_ID=""
     fi
 }
 
-# Save Configuration
 save_config() {
-    cat <<EOF > "$CONF_FILE"
-SERVER_NAME="$SERVER_NAME"
-INTERFACES="$INTERFACES"
-RESET_DAY=$RESET_DAY
-TZ_OFFSET="$TZ_OFFSET"
-TRAFFIC_TYPE=$TRAFFIC_TYPE
-TOTAL_LIMIT_GB=$TOTAL_LIMIT_GB
-WARN_PERCENT=$WARN_PERCENT
-SHUTDOWN_PERCENT=$SHUTDOWN_PERCENT
-TG_BOT_TOKEN="$TG_BOT_TOKEN"
-TG_CHAT_ID="$TG_CHAT_ID"
-EOF
+    mkdir -p /etc/traffic-monitor
+    jq -n \
+        --arg server_name "$SERVER_NAME" \
+        --arg interfaces "$INTERFACES" \
+        --argjson reset_day "$RESET_DAY" \
+        --arg reset_tz "$RESET_TZ" \
+        --argjson traffic_type "$TRAFFIC_TYPE" \
+        --argjson total_limit_gb "$TOTAL_LIMIT_GB" \
+        --arg tg_bot_token "$TG_BOT_TOKEN" \
+        --arg tg_chat_id "$TG_CHAT_ID" \
+        '{
+            server_name: $server_name,
+            interfaces: $interfaces,
+            reset_day: $reset_day,
+            reset_tz: $reset_tz,
+            traffic_type: $traffic_type,
+            total_limit_gb: $total_limit_gb,
+            tg_bot_token: $tg_bot_token,
+            tg_chat_id: $tg_chat_id
+        }' > "$CONFIG_FILE"
 }
 
-# Setup Cron Jobs for 1-min check and daily report (08:10 Beijing time)
-setup_cron() {
-    CRON_CHECK="* * * * * /usr/local/bin/traffic-monitor.sh --check >> /var/log/traffic-monitor.log 2>&1"
-    CRON_REPORT="10 8 * * * /usr/local/bin/traffic-monitor.sh --daily-report >> /var/log/traffic-monitor.log 2>&1"
-    
-    (crontab -l 2>/dev/null | grep -v "traffic-monitor.sh"; echo "$CRON_CHECK"; echo "$CRON_REPORT") | crontab -
-}
-
-# Interactive Configuration Menu
-interactive_menu() {
-    load_config
+# ------------------------------------------------------------------------------
+# 3. Interactive Configuration Wizard
+# ------------------------------------------------------------------------------
+configure_wizard() {
     clear
     echo -e "${CYAN}======================================================${NC}"
-    echo -e "${CYAN}       Debian 13 Traffic Monitor & Alert System       ${NC}"
-    echo -e "${CYAN}       Version: ${VERSION}                             ${NC}"
+    echo -e "${CYAN}      Traffic Monitor & Alert System Setup Wizard${NC}"
+    echo -e "${CYAN}      Version: $VERSION${NC}"
     echo -e "${CYAN}======================================================${NC}"
-    echo " 1. Configure Parameters (Server Name, Interfaces, Limits)"
-    echo " 2. Configure Telegram Bot & Notifications"
-    echo " 3. View Current Traffic Statistics"
-    echo " 4. Test Telegram Notification"
-    echo " 5. Check & Update Script (Self-Update)"
-    echo " 0. Exit & Save"
-    echo -e "${CYAN}======================================================${NC}"
-    read -p "Select an option [0-5]: " choice
-
-    case $choice in
-        1)
-            read -p "Enter Server Name [$SERVER_NAME]: " input_name
-            [ -n "$input_name" ] && SERVER_NAME="$input_name"
-
-            echo "Available network interfaces:"
-            ip -o link show | awk -F': ' '{print " - " $2}'
-            read -p "Enter Monitoring Interface(s) (space separated) [$INTERFACES]: " input_iface
-            [ -n "$input_iface" ] && INTERFACES="$input_iface"
-
-            read -p "Enter Monthly Reset Day (1-31) [$RESET_DAY]: " input_day
-            [[ "$input_day" =~ ^[0-9]+$ ]] && RESET_DAY="$input_day"
-
-            echo "Select Timezone for Traffic Reset:"
-            echo " 1) UTC0"
-            echo " 2) UTC8 (Beijing Time)"
-            read -p "Select [1-2] (default 2): " tz_choice
-            [ "$tz_choice" = "1" ] && TZ_OFFSET="UTC0" || TZ_OFFSET="UTC8"
-
-            echo "Select Traffic Statistic Type:"
-            echo " 1) Total (Upload + Download)"
-            echo " 2) Upload Only"
-            echo " 3) Download Only"
-            read -p "Select [1-3] [$TRAFFIC_TYPE]: " input_ttype
-            [[ "$input_ttype" =~ ^[1-3]$ ]] && TRAFFIC_TYPE="$input_ttype"
-
-            read -p "Enter Monthly Traffic Limit in GB (0 for unlimited) [$TOTAL_LIMIT_GB]: " input_limit
-            [[ "$input_limit" =~ ^[0-9]+$ ]] && TOTAL_LIMIT_GB="$input_limit"
-
-            read -p "Enter Warning Threshold Percentage [$WARN_PERCENT]: " input_warn
-            [[ "$input_warn" =~ ^[0-9]+$ ]] && WARN_PERCENT="$input_warn"
-
-            read -p "Enter Shutdown Threshold Percentage [$SHUTDOWN_PERCENT]: " input_shut
-            [[ "$input_shut" =~ ^[0-9]+$ ]] && SHUTDOWN_PERCENT="$input_shut"
-
-            save_config
-            setup_cron
-            # Copy script to /usr/local/bin if not already there
-            if [ "$0" != "$SCRIPT_PATH" ]; then
-                cp "$0" "$SCRIPT_PATH"
-                chmod +x "$SCRIPT_PATH"
-            fi
-            echo -e "${GREEN}[Success] Configuration updated successfully!${NC}"
-            sleep 2
-            interactive_menu
-            ;;
-        2)
-            read -p "Enter Telegram Bot Token [$TG_BOT_TOKEN]: " input_token
-            [ -n "$input_token" ] && TG_BOT_TOKEN="$input_token"
-
-            read -p "Enter Telegram Chat ID [$TG_CHAT_ID]: " input_chat
-            [ -n "$input_chat" ] && TG_CHAT_ID="$input_chat"
-
-            save_config
-            echo -e "${GREEN}[Success] Telegram settings saved!${NC}"
-            sleep 2
-            interactive_menu
-            ;;
-        3)
-            clear
-            echo -e "${CYAN}=== Current Traffic Statistics ===${NC}"
-            get_traffic_stats
-            echo ""
-            read -p "Press Enter to return to menu..."
-            interactive_menu
-            ;;
-        4)
-            if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-                echo -e "${RED}[Error] Telegram Bot Token and Chat ID are not configured.${NC}"
-            else
-                send_telegram "🔔 <b>Test Notification</b>\nServer: <code>$SERVER_NAME</code>\nStatus: Telegram bot configured successfully!"
-                echo -e "${GREEN}[Info] Test message sent. Check your Telegram.${NC}"
-            fi
-            sleep 2
-            interactive_menu
-            ;;
-        5)
-            echo -e "${CYAN}[Info] Checking for script updates...${NC}"
-            if [ -f "$SCRIPT_PATH" ]; then
-                rm -f "$SCRIPT_PATH"
-            fi
-            if curl -sSL "https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh" -o "$SCRIPT_PATH"; then
-                chmod +x "$SCRIPT_PATH"
-                echo -e "${GREEN}[Success] Script updated successfully! Restarting script...${NC}"
-                sleep 2
-                exec "$SCRIPT_PATH"
-            else
-                echo -e "${RED}[Error] Failed to download update from GitHub.${NC}"
-            fi
-            sleep 2
-            interactive_menu
-            ;;
-        0)
-            echo -e "${GREEN}Exiting. Monitor is running in background.${NC}"
-            exit 0
-            ;;
-        *)
-            interactive_menu
-            ;;
-    esac
-}
-
-# Calculate Traffic using Python for precision and date range filtering
-get_traffic_stats() {
+    
     load_config
-    python3 - "$INTERFACES" "$RESET_DAY" "$TZ_OFFSET" "$TRAFFIC_TYPE" "$TOTAL_LIMIT_GB" << 'EOF'
-import json
-import subprocess
-import sys
-from datetime import datetime, timezone, timedelta
 
-interfaces = sys.argv[1].split()
-reset_day = int(sys.argv[2])
-tz_offset_str = sys.argv[3]
-traffic_type = int(sys.argv[4])
-limit_gb = float(sys.argv[5])
+    read -p "Enter Server Name [Current: $SERVER_NAME]: " input_name
+    [ -n "$input_name" ] && SERVER_NAME="$input_name"
 
-# Determine timezone offset
-if tz_offset_str == "UTC8":
-    tz = timezone(timedelta(hours=8))
-else:
-    tz = timezone.utc
+    echo -e "\n${YELLOW}Available Network Interfaces:${NC}"
+    ip -o link show | awk -F': ' '{print $2}'
+    read -p "Enter monitored interface(s), space-separated for multiple [Current: $INTERFACES]: " input_ifaces
+    [ -n "$input_ifaces" ] && INTERFACES="$input_ifaces"
 
-now = datetime.now(tz)
-current_year = now.year
-current_month = now.month
-current_day = now.day
+    read -p "Enter monthly traffic reset day (1-31) [Current: $RESET_DAY]: " input_day
+    if [ -n "$input_day" ]; then
+        RESET_DAY="$input_day"
+    fi
 
-# Calculate billing cycle start date
-if current_day >= reset_day:
-    start_date = datetime(current_year, current_month, reset_day, tzinfo=tz)
-else:
-    if current_month == 1:
-        start_date = datetime(current_year - 1, 12, reset_day, tzinfo=tz)
-    else:
-        start_date = datetime(current_year, current_month - 1, reset_day, tzinfo=tz)
+    echo -e "\nSelect Reset Timezone:"
+    echo "1) UTC+0"
+    echo "2) UTC+8 (Beijing Time)"
+    read -p "Enter choice (1-2) [Current: $RESET_TZ]: " input_tz_choice
+    if [ "$input_tz_choice" = "1" ]; then
+        RESET_TZ="UTC0"
+    elif [ "$input_tz_choice" = "2" ]; then
+        RESET_TZ="UTC8"
+    fi
 
-total_rx = 0
-total_tx = 0
+    echo -e "\nSelect Traffic Statistics Type:"
+    echo "1) Total Traffic (Upload + Download)"
+    echo "2) Upload Traffic Only"
+    echo "3) Download Traffic Only"
+    read -p "Enter choice (1-3) [Current: $TRAFFIC_TYPE]: " input_type
+    [ -n "$input_type" ] && TRAFFIC_TYPE="$input_type"
 
-for iface in interfaces:
-    try:
-        cmd = ["vnstat", "-i", iface, "--json", "d"]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(res.stdout)
-        
-        for inf in data.get("interfaces", []):
-            for day_entry in inf.get("traffic", {}).get("days", []):
-                d_date = datetime(day_entry["date"]["year"], day_entry["date"]["month"], day_entry["date"]["day"], tzinfo=tz)
-                if d_date >= start_date:
-                    total_rx += day_entry.get("rx", 0)
-                    total_tx += day_entry.get("tx", 0)
-    except Exception as e:
-        pass
+    read -p "Enter Monthly Traffic Limit in GB [Current: $TOTAL_LIMIT_GB]: " input_limit
+    [ -n "$input_limit" ] && TOTAL_LIMIT_GB="$input_limit"
 
-if traffic_type == 1:
-    used_bytes = total_rx + total_tx
-elif traffic_type == 2:
-    used_bytes = total_tx
-else:
-    used_bytes = total_rx
+    read -p "Enter Telegram Bot Token [Current: $TG_BOT_TOKEN]: " input_token
+    [ -n "$input_token" ] && TG_BOT_TOKEN="$input_token"
 
-used_gb = used_bytes / (1024 ** 3)
-limit_bytes = limit_gb * (1024 ** 3) if limit_gb > 0 else 0
-percentage = (used_bytes / limit_bytes * 100) if limit_bytes > 0 else 0
+    read -p "Enter Telegram Chat ID [Current: $TG_CHAT_ID]: " input_chat_id
+    [ -n "$input_chat_id" ] && TG_CHAT_ID="$input_chat_id"
 
-print(f"USED_GB:{used_gb:.2f}")
-print(f"PERCENTAGE:{percentage:.2f}")
-print(f"START_DATE:{start_date.strftime('%Y-%m-%d')}")
-print(f"CURRENT_DATE:{now.strftime('%Y-%m-%d %H:%M')}")
-EOF
+    save_config
+    setup_cron_and_script
+    
+    # Create symlink for quick global access
+    ln -sf "$SCRIPT_PATH" /usr/local/bin/traffic-monitor
+
+    echo -e "\n${GREEN}[+] Configuration saved successfully and cron job updated!${NC}"
+    read -p "Press Enter to return to menu..."
 }
 
-# Send Telegram Message with HTML formatting
+# ------------------------------------------------------------------------------
+# 4. Setup Cron and Script Copy
+# ------------------------------------------------------------------------------
+setup_cron_and_script() {
+    if [ "$0" != "$SCRIPT_PATH" ]; then
+        cp "$0" "$SCRIPT_PATH"
+        chmod +x "$SCRIPT_PATH"
+    fi
+
+    # Set up 1-minute cron job
+    CRON_JOB="* * * * * $SCRIPT_PATH --monitor >>$LOG_FILE 2>&1"
+    (crontab -l 2>/dev/null | grep -v "traffic-monitor.sh") | { cat; echo "$CRON_JOB"; } | crontab -
+}
+
+# ------------------------------------------------------------------------------
+# 5. Telegram Notification Function
+# ------------------------------------------------------------------------------
 send_telegram() {
     local message="$1"
-    if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+    if [ -z "$TG_BOT_TOKEN" ] \vert{}\vert{} [ -z "$TG_CHAT_ID" ]; then
         return 1
-    }
-    response=$(curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TG_CHAT_ID}" \
-        -d "parse_mode=HTML" \
-        -d "text=${message}")
-    
-    if echo "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+    fi
+
+    response=$(curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
+        -d "chat_id=$TG_CHAT_ID" \
+        -d "text=$message" \
+        -d "parse_mode=Markdown")
+
+    if echo "$response" | jq -e '.ok == true' >/dev/null; then
         return 0
     else
         return 1
     fi
 }
 
-# 1-Minute Check Routine (Thresholds & Alerts)
-check_routine() {
-    load_config
-    if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-        return
-    fi
-
-    stats=$(get_traffic_stats)
-    used_gb=$(echo "$stats" | grep "USED_GB" | cut -d':' -f2)
-    percentage=$(echo "$stats" | grep "PERCENTAGE" | cut -d':' -f2)
-    current_date=$(echo "$stats" | grep "CURRENT_DATE" | cut -d':' -f2-)
-
-    # State tracking to avoid duplicate alerts in the same cycle
-    cycle_month=$(date +%Y%m)
-    state_file_path="$STATE_FILE"
+# ------------------------------------------------------------------------------
+# 6. Traffic Calculation Logic
+# ------------------------------------------------------------------------------
+get_current_traffic_bytes() {
+    local total_rx=0
+    local total_tx=0
     
-    warn_sent=false
-    shutdown_sent=false
-    if [ -f "$state_file_path" ]; then
-        saved_month=$(jq -r '.month // ""' "$state_file_path")
-        if [ "$saved_month" = "$cycle_month" ]; then
-            warn_sent=$(jq -r '.warn_sent // false' "$state_file_path")
-            shutdown_sent=$(jq -r '.shutdown_sent // false' "$state_file_path")
+    vnstat -u >/dev/null 2>&1
+
+    for iface in $INTERFACES; do
+        json_data=$(vnstat -i "$iface" --json 2>/dev/null)
+        if [ -z "$json_data" ]; then
+            continue
         fi
-    fi
 
-    # Check Shutdown Threshold (95%)
-    is_shutdown_reached=$(echo "$percentage >= $SHUTDOWN_PERCENT" | bc -l)
-    if [ "$is_shutdown_reached" -eq 1 ] && [ "$shutdown_sent" = "false" ] && [ "$TOTAL_LIMIT_GB" -gt 0 ]; then
-        msg="🚨 <b>CRITICAL: Traffic Exhaustion Shutdown</b>\n"
-        msg+="━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg+="🖥️ Server: <code>$SERVER_NAME</code>\n"
-        msg+="📊 Used: <b>${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}%)</b>\n"
-        msg+="⏰ Time: <code>$current_date</code>\n"
-        msg+="⚠️ Threshold reached <b>${SHUTDOWN_PERCENT}%</b>. Server is shutting down now."
-
-        if send_telegram "$msg"; then
-            # Update state
-            jq -n --arg m "$cycle_month" --argjson w "$warn_sent" --argjson s true '{month: $m, warn_sent: $w, shutdown_sent: $s}' > "$state_file_path"
-            sync
-            sleep 2
-            shutdown now
+        if [ "$RESET_TZ" = "UTC8" ]; then
+            TZ='Asia/Shanghai'
+        else
+            TZ='UTC'
         fi
-        return
-    fi
 
-    # Check Warning Threshold (90%)
-    is_warn_reached=$(echo "$percentage >= $WARN_PERCENT" | bc -l)
-    if [ "$is_warn_reached" -eq 1 ] && [ "$warn_sent" = "false" ] && [ "$TOTAL_LIMIT_GB" -gt 0 ]; then
-        msg="⚠️ <b>TRAFFIC WARNING ALERT</b>\n"
-        msg+="━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg+="🖥️ Server: <code>$SERVER_NAME</code>\n"
-        msg+="📊 Used: <b>${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}%)</b>\n"
-        msg+="⏰ Time: <code>$current_date</code>\n"
-        msg+="💡 Traffic has exceeded <b>${WARN_PERCENT}%</b> of your monthly quota."
+        curr_year=$(TZ=$TZ date +%Y)
+        curr_month=$(TZ=$TZ date +%m)
+        curr_day=$(TZ=$TZ date +%d)
 
-        if send_telegram "$msg"; then
-            jq -n --arg m "$cycle_month" --argjson w true --argjson s "$shutdown_sent" '{month: $m, warn_sent: $w, shutdown_sent: $s}' > "$state_file_path"
+        start_year=$curr_year
+        start_month=$((10#$curr_month - 1))
+        if [ $start_month -eq 0 ]; then
+            start_month=12
+            start_year=$((curr_year - 1))
         fi
-    fi
-}
+        
+        if [ 10#$curr_day -ge 10#$RESET_DAY ]; then
+            start_month=$curr_month
+            start_year=$curr_year
+        fi
 
-# Daily Report Routine (08:10 Beijing Time)
-daily_report_routine() {
-    load_config
-    if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-        return
-    fi
+        while IFS=read -r day_obj; do
+            [ -z "$day_obj" ] && continue
+            d_y=$(echo "$day_obj" | jq '.date.year')
+            d_m=$(echo "$day_obj" | jq '.date.month')
+            d_d=$(echo "$day_obj" | jq '.date.day')
+            
+            d_str=$(printf "\%04d\%02d\%02d" "$d_y" "$d_m" "$d_d")
+            s_str=$(printf "\%04d\%02d\%02d" "$start_year" "$start_month" "$RESET_DAY")
+            c_str=$(printf "\%04d\%02d\%02d" "$curr_year" "$curr_month" "$curr_day")
 
-    stats=$(get_traffic_stats)
-    used_gb=$(echo "$stats" | grep "USED_GB" | cut -d':' -f2)
-    percentage=$(echo "$stats" | grep "PERCENTAGE" | cut -d':' -f2)
-    start_date=$(echo "$stats" | grep "START_DATE" | type=$(echo "$stats" | grep "TRAFFIC_TYPE" | cut -d':' -f2) cut -d':' -f2)
-    current_date=$(echo "$stats" | grep "CURRENT_DATE" | cut -d':' -f2-)
+            if [ "$d_str" -ge "$s_str" ] && [ "$d_str" -le "$c_str" ]; then
+                rx=$(echo "$day_obj" | jq '.rx')
+                tx=$(echo "$day_obj" | jq '.tx')
+                total_rx=$((total_rx + rx))
+                total_tx=$((total_tx + tx))
+            fi
+        done <<EOF
+        $(echo "$json_data" | jq -c '.interfaces[0].traffic.days[]?')
+EOF
+    done
 
-    if [ "$TOTAL_LIMIT_GB" -gt 0 ]; then
-        limit_str="${TOTAL_LIMIT_GB} GB"
-        perc_str="(${percentage}%)"
+    if [ "$TRAFFIC_TYPE" = "2" ]; then
+        echo "$total_tx"
+    elif [ "$TRAFFIC_TYPE" = "3" ]; then
+        echo "$total_rx"
     else
-        limit_str="Unlimited"
-        perc_str=""
+        echo $((total_rx + total_tx))
     fi
-
-    msg="📈 <b>Daily Traffic Report</b>\n"
-    msg+="━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg+="🖥️ Server: <code>$SERVER_NAME</code>\n"
-    msg+="📅 Period: <code>$start_date to Now</code>\n"
-    msg+="📊 Usage: <b>${used_gb} GB / ${limit_str} ${perc_str}</b>\n"
-    msg+="⏰ Time: <code>$current_date (UTC+8)</code>\n"
-    msg+="✅ Status: Normal & Monitored"
-
-    send_telegram "$msg"
 }
 
-# Argument Dispatcher
+bytes_to_gb() {
+    local bytes=$1
+    echo "scale=2; $bytes / 1024 / 1024 / 1024" | bc
+}
+
+# ------------------------------------------------------------------------------
+# 7. Monitor & Alert Core Execution (Called every 1 minute)
+# ------------------------------------------------------------------------------
+run_monitor() {
+    load_config
+    
+    if [ "$RESET_TZ" = "UTC8" ]; then
+        TZ='Asia/Shanghai'
+    else
+        TZ='UTC'
+    fi
+
+    current_time=$(TZ=$TZ date "+%Y-%m-%d %H:%M:%S")
+
+    used_bytes=$(get_current_traffic_bytes)
+    used_gb=$(bytes_to_gb "$used_bytes")
+    
+    if [ "$(echo "$TOTAL_LIMIT_GB > 0" | bc)" -eq 1 ]; then
+        percentage=$(echo "scale=2; ($used_gb / $TOTAL_LIMIT_GB) * 100" | bc)
+    else
+        percentage=0
+    fi
+
+    if [ -f "$STATE_FILE" ]; then
+        last_daily_date=$(jq -r '.last_daily_date // ""' "$STATE_FILE")
+        warn_90_sent=$(jq -r '.warn_90_sent // "false"' "$STATE_FILE")
+        shutdown_95_sent=$(jq -r '.shutdown_95_sent // "false"' "$STATE_FILE")
+        state_cycle=$(jq -r '.state_cycle // ""' "$STATE_FILE")
+    else
+        last_daily_date=""
+        warn_90_sent="false"
+        shutdown_95_sent="false"
+        state_cycle=""
+    fi
+
+    current_cycle=$(TZ=$TZ date "+%Y-%m")
+    if [ "$state_cycle" != "$current_cycle" ]; then
+        warn_90_sent="false"
+        shutdown_95_sent="false"
+        state_cycle="$current_cycle"
+    fi
+
+    # 1. Telegram Daily Report at 08:10 Beijing Time (UTC+8)
+    bj_hm=$(TZ='Asia/Shanghai' date "+%H:%M")
+    bj_date=$(TZ='Asia/Shanghai' date "+%Y-%m-%d")
+    
+    if [ "$bj_hm" = "08:10" ] && [ "$last_daily_date" != "$bj_date" ]; then
+        report_msg="📊 *服务器流量日报*
+----------------------------------
+🏷️ *服务器名称*: \`$SERVER_NAME\`
+🌐 *监控网口*: \`$INTERFACES\`
+📈 *统计类型*: \`$( [ "$TRAFFIC_TYPE" = "2" ] && echo "上传流量" || ( [ "$TRAFFIC_TYPE" = "3" ] && echo "下载流量" || echo "总流量 (上传+下载)" ) )\`
+📦 *已用 / 总流量*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
+⏱️ *时区与重置*: \`$RESET_TZ (每月 ${RESET_DAY} 号重置)\`
+🕒 *推送时间*: \`$current_time\`
+----------------------------------
+🟢 *系统状态*: 运行正常"
+
+        if send_telegram "$report_msg"; then
+            last_daily_date="$bj_date"
+        fi
+    fi
+
+    # 2. 90% Warning Push Notification
+    is_above_90=$(echo "$percentage >= 90 &&$percentage < 95" | bc)
+    if [ "$is_above_90" -eq 1 ] && [ "$warn_90_sent" = "false" ]; then
+        warn_msg="⚠️ *流量预警通知 (90%)*
+----------------------------------
+🏷️ *服务器名称*: \`$SERVER_NAME\`
+📦 *当前已用流量*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
+🕒 *触发时间*: \`$current_time\`
+----------------------------------
+💡 *提示*: 流量已达到 90%，请注意控制流量消耗！"
+        if send_telegram "$warn_msg"; then
+            warn_90_sent="true"
+        fi
+    fi
+
+    # 3. 95% Shutdown Alarm Push Notification
+    is_above_95=$(echo "$percentage >= 95" | bc)
+    if [ "$is_above_95" -eq 1 ] && [ "$shutdown_95_sent" = "false" ]; then
+        shutdown_msg="🚨 *流量超限关机报警 (95%)*
+----------------------------------
+🏷️ *服务器名称*: \`$SERVER_NAME\`
+📦 *当前已用流量*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
+🕒 *触发时间*: \`$current_time\`
+----------------------------------
+❌ *警告*: 流量已超过 95% 阈值，服务器即将执行关机保护！"
+        
+        # Verify notification success before executing shutdown
+        if send_telegram "$shutdown_msg"; then
+            shutdown_95_sent="true"
+            jq -n \
+                --arg last_daily "$last_daily_date" \
+                --arg w90 "$warn_90_sent" \
+                --arg s95 "$shutdown_95_sent" \
+                --arg cyc "$state_cycle" \
+                '{last_daily_date: $last_daily, warn_90_sent: $w90, shutdown_95_sent:$s95, state_cycle: $cyc}' > "$STATE_FILE"
+            
+            shutdown -h now
+        fi
+    fi
+
+    jq -n \
+        --arg last_daily "$last_daily_date" \
+        --arg w90 "$warn_90_sent" \
+        --arg s95 "$shutdown_95_sent" \
+        --arg cyc "$state_cycle" \
+        '{last_daily_date: $last_daily, warn_90_sent: $w90, shutdown_95_sent:$s95, state_cycle: $cyc}' > "$STATE_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# 8. One-Click Script Update
+# ------------------------------------------------------------------------------
+update_script() {
+    echo -e "${BLUE}[+] Checking for script updates from GitHub...${NC}"
+    TEMP_SCRIPT="/tmp/traffic-monitor.sh"
+    
+    if [ -f "$SCRIPT_PATH" ]; then
+        echo -e "${YELLOW}[*] Removing local script before update...${NC}"
+        rm -f "$SCRIPT_PATH"
+    fi
+
+    if curl -s -o "$TEMP_SCRIPT" "https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"; then
+        if grep -q "version" "$TEMP_SCRIPT"; then
+            cp "$TEMP_SCRIPT" "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+            rm -f "$TEMP_SCRIPT"
+            ln -sf "$SCRIPT_PATH" /usr/local/bin/traffic-monitor
+            echo -e "${GREEN}[+] Script updated successfully!${NC}"
+        else
+            echo -e "${RED}[-] Downloaded script seems invalid.${NC}"
+        fi
+    else
+        echo -e "${RED}[-] Failed to download script from GitHub.${NC}"
+    fi
+    read -p "Press Enter to return to menu..."
+}
+
+# ------------------------------------------------------------------------------
+# 9. Interactive Main Menu
+# ------------------------------------------------------------------------------
+show_menu() {
+    while true; do
+        clear
+        load_config
+        used_bytes=$(get_current_traffic_bytes 2>/dev/null || echo 0)
+        used_gb=$(bytes_to_gb "$used_bytes")
+        if [ "$(echo "$TOTAL_LIMIT_GB > 0" | bc)" -eq 1 ]; then
+            percentage=$(echo "scale=2; ($used_gb / $TOTAL_LIMIT_GB) * 100" | bc)
+        else
+            percentage=0
+        fi
+
+        echo -e "${CYAN}======================================================${NC}"
+        echo -e "${CYAN}        Traffic Monitor & Alert Management Panel      ${NC}v$VERSION"
+        echo -e "${CYAN}======================================================${NC}"
+        echo -e " Server Name    : ${GREEN}$SERVER_NAME${NC}"
+        echo -e " Monitored Iface: ${GREEN}$INTERFACES${NC}"
+        echo -e " Reset Day      : ${GREEN}Monthly on day$RESET_DAY ($RESET_TZ)${NC}"
+        echo -e " Traffic Type   : ${GREEN}$( [ "$TRAFFIC_TYPE" = "2" ] && echo "Upload Only" || ( [ "$TRAFFIC_TYPE" = "3" ] && echo "Download Only" || echo "Total (Up+Down)" ) )${NC}"
+        echo -e " Current Usage  : ${YELLOW}${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}\%)${NC}"
+        echo -e "${CYAN}------------------------------------------------------${NC}"
+        echo -e " 1) Configure / Modify Parameters"
+        echo -e " 2) View Current Traffic Status"
+        echo -e " 3) Test Telegram Notification"
+        echo -e " 4) Run Manual Monitor Check"
+        echo -e " 5) Update Script (Pull from GitHub)"
+        echo -e " 0) Exit"
+        echo -e "${CYAN}======================================================${NC}"
+        read -p "Please enter your choice (0-5): " choice
+
+        case $choice in
+            1)
+                configure_wizard
+                ;;
+            2)
+                clear
+                echo -e "${CYAN}=== Current Traffic Status ===${NC}"
+                vnstat -i "$INTERFACES"
+                echo -e "\nCalculated Current Cycle Usage: ${GREEN}${used_gb} GB / ${TOTAL_LIMIT_GB} GB (${percentage}\%)${NC}"
+                read -p "Press Enter to return to menu..."
+                ;;
+            3)
+                echo -e "${BLUE}[+] Sending test notification to Telegram...${NC}"
+                if send_telegram "🔔 *Traffic Monitor Test Notification*
+----------------------------------
+🏷️ *Server Name*: \`$SERVER_NAME\`
+📦 *Current Usage*: \`${used_gb} GB / ${TOTAL_LIMIT_GB} GB\` (${percentage}%)
+🕒 *Time*: \`$(date)\`
+----------------------------------
+✅ *Status*: Telegram Bot is working properly!"; then
+                    echo -e "${GREEN}[+] Test message sent successfully!${NC}"
+                else
+                    echo -e "${RED}[-] Failed to send test message. Check Bot Token and Chat ID.${NC}"
+                fi
+                read -p "Press Enter to return to menu..."
+                ;;
+            4)
+                echo -e "${BLUE}[+] Running manual monitor check...${NC}"
+                run_monitor
+                echo -e "${GREEN}[+] Manual check completed. Check logs at $LOG_FILE${NC}"
+                read -p "Press Enter to return to menu..."
+                ;;
+            5)
+                update_script
+                ;;
+            0)
+                echo -e "${GREEN}Goodbye!${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED}[-] Invalid option, please try again.${NC}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# 10. Entry Point
+# ---------------------------------------------------
 case "$1" in
-    --check)
-        check_routine
+    --monitor)
+        run_monitor
         ;;
-    --daily-report)
-        daily_report_routine
+    --install)
+        init_system
+        configure_wizard
         ;;
     *)
-        if [ ! -f "$CONF_FILE" ]; then
-            init_environment
+        if [ ! -f "$CONFIG_FILE" ]; then
+            init_system
+            configure_wizard
+        else
+            show_menu
         fi
-        interactive_menu
         ;;
 esac
