@@ -86,7 +86,9 @@ TG_BOT_TOKEN="$TG_BOT_TOKEN"
 TG_CHAT_ID="$TG_CHAT_ID"
 EOF_CONF
 
-    echo "==> 配置文件已保存至 $CONFIG_FILE"
+    # 安全加固：设置配置文件权限仅 root 可读写
+    chmod 600 "$CONFIG_FILE"
+    echo "==> 配置文件已保存至 $CONFIG_FILE 并完成权限加固。"
 }
 
 deploy_monitor_script() {
@@ -240,6 +242,32 @@ def print_status():
     print(f"⏰ 当前检测时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
 def main():
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--status":
+            print_status()
+            return
+        elif sys.argv[1] == "--test":
+            config = load_config()
+            server_name = config.get("SERVER_NAME", "Server")
+            total_gb = float(config.get("TOTAL_GB", 1000))
+            token = config.get("TG_BOT_TOKEN", "")
+            chat_id = config.get("TG_CHAT_ID", "")
+            used_gb, cycle_start_str, now = calculate_traffic()
+            percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
+            
+            msg = (
+                f"🧪 <b>[{server_name}] 手动测试报告</b>\n\n"
+                f"▪️ <b>周期用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
+                f"▪️ <b>统计起止:</b> {cycle_start_str} 至今\n"
+                f"▪️ <b>测试时间:</b> {now.strftime('%Y-%m-%d %H:%M')}"
+            )
+            success = send_tg(token, chat_id, msg)
+            if success:
+                print("==> 测试消息已成功发送至 Telegram，请检查接收！")
+            else:
+                print("==> 发送失败，请检查您的 Bot Token 和 Chat ID 是否正确。")
+            return
+
     config = load_config()
     if not config:
         return
@@ -248,29 +276,12 @@ def main():
     total_gb = float(config.get("TOTAL_GB", 1000))
     token = config.get("TG_BOT_TOKEN", "")
     chat_id = config.get("TG_CHAT_ID", "")
-    tz_mode = config.get("TIMEZONE_MODE", "UTC8")
     
     used_gb, cycle_start_str, now = calculate_traffic()
     percent = (used_gb / total_gb * 100) if total_gb > 0 else 0.0
-    
-    if len(sys.argv) > 1:
-        if sys.argv[1] == "--status":
-            print_status()
-            return
-        elif sys.argv[1] == "--test":
-            msg = (
-                f"📊 <b>[{server_name}]每日流量日报</b>\n\n"
-                f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.2f}%)\n"
-                f"- 统计时间: {now.strftime('%Y-%m-%d %H:%M:%S')} {tz_mode}"
-            )
-            success = send_tg(token, chat_id, msg)
-            if success:
-                print("==> 测试日报已成功发送至 Telegram，请检查接收！")
-            else:
-                print("==> 发送失败，请检查您的 Bot Token 和 Chat ID 是否正确。")
-            return
-
+        
     state = load_state()
+    
     if state.get("cycle_start") != cycle_start_str:
         state = {
             "cycle_start": cycle_start_str,
@@ -280,16 +291,17 @@ def main():
         }
         save_state(state)
         
-    current_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    current_time_str = now.strftime("%Y-%m-%d %H:%M")
     today_date_str = now.strftime("%Y-%m-%d")
     
-    # 1. 每日 08:10 推送日报
+    # 1. 每日 08:10 北京时间报告推送
     if now.hour == 8 and now.minute == 10:
         if state.get("last_daily_date") != today_date_str:
             msg = (
-                f"📊 <b>[{server_name}]每日流量日报</b>\n\n"
-                f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.2f}%)\n"
-                f"- 统计时间: {current_time_str} {tz_mode}"
+                f"📊 <b>[{server_name}] 每日流量日报</b>\n\n"
+                f"▪️ <b>周期用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
+                f"▪️ <b>统计起止:</b> {cycle_start_str} 至今\n"
+                f"▪️ <b>统计时间:</b> {current_time_str}"
             )
             send_tg(token, chat_id, msg)
             state["last_daily_date"] = today_date_str
@@ -299,32 +311,36 @@ def main():
     if percent >= 90.0 and not state.get("warn_90", False):
         msg = (
             f"⚠️ <b>[{server_name}] 流量预警通知 (90%)</b>\n\n"
-            f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB (已用 {percent:.2f}%)\n"
-            f"- 报警时间: {current_time_str} {tz_mode}"
+            f"▪️ <b>当前用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
+            f"▪️ <b>告警时间:</b> {current_time_str}"
         )
-        send_tg(token, chat_id, msg)
-        state["warn_90"] = True
-        save_state(state)
+        success = send_tg(token, chat_id, msg)
+        if success:
+            state["warn_90"] = True
+            save_state(state)
 
-    # 3. 95% 关机报警推送通知
+    # 3. 95% 关机报警推送通知（优化：必须确认Telegram发送成功再关机）
     if percent >= 95.0 and not state.get("shutdown_95", False):
         msg = (
-            f"🛑 <b>[{server_name}] 流量超限关机警报 (95%)</b>\n\n"
-            f"- 周期用量: {used_gb:.2f} GB / {total_gb:.2f} GB (已用 {percent:.2f}%)\n"
-            f"- <b>服务器已触发自动关机保护！</b>\n"
-            f"- 报警时间: {current_time_str} {tz_mode}时区"
+            f"🛑 <b>[{server_name}] 流量超限关机 (95%)</b>\n\n"
+            f"▪️ <b>当前用量:</b> {used_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%)\n"
+            f"▪️ <b>触发动作:</b> 已执行自动关机保护\n"
+            f"▪️ <b>报警时间:</b> {current_time_str}"
         )
-        send_tg(token, chat_id, msg)
-        state["shutdown_95"] = True
-        save_state(state)
-        os.system("shutdown -h now")
+        success = send_tg(token, chat_id, msg)
+        if success:
+            state["shutdown_95"] = True
+            save_state(state)
+            os.system("shutdown -h now")
+        else:
+            print("[Warning] 95% 关机通知发送失败，推迟关机以待重试。")
 
 if __name__ == "__main__":
     main()
 EOF_PY
 
     chmod +x "$SCRIPT_FILE"
-    echo "==> 监控核心脚本已生成并赋予权限。"
+    echo "==> 监控核心脚本已更新并赋予权限。"
 }
 
 setup_cron() {
@@ -354,7 +370,7 @@ menu() {
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
-        echo "3. 手动触发一次 Telegram 日报测试推送"
+        echo "3. 手动触发一次 Telegram 测试推送"
         echo "4. 卸载流量监控"
         echo "0. 退出脚本"
         echo "============================================="
@@ -373,7 +389,7 @@ menu() {
                 read -p "按回车键返回主菜单..."
                 ;;
             3)
-                echo "==> 正在向 Telegram 发送日报测试消息..."
+                echo "==> 正在向 Telegram 发送测试消息..."
                 python3 /usr/local/bin/traffic-monitor.py --test
                 read -p "按回车键返回主菜单..."
                 ;;
