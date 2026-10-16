@@ -12,8 +12,9 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 CONFIG_FILE="/etc/traffic-monitor.conf"
 CRON_FILE="/etc/cron.d/traffic-monitor"
 LOCK_FILE="/var/lock/traffic-monitor.lock"
+LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-SCRIPT_VERSION="1.5"
+SCRIPT_VERSION="1.7"
 BASE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
@@ -114,7 +115,7 @@ install_or_config() {
     read -p "请输入Telegram Chat ID [默认: ${DEFAULT_CHAT_ID}]: " input_chatid
     TG_CHAT_ID="${input_chatid:-$DEFAULT_CHAT_ID}"
 
-    # 保存配置文件并严格限制权限（保护 Token 安全）
+    # 保存配置文件并严格限制权限
     cat << EOF > "$CONFIG_FILE"
 SERVER_NAME="$SERVER_NAME"
 INTERFACES="$INTERFACES"
@@ -165,7 +166,7 @@ send_tg_msg() {
     fi
 }
 
-# ==================== 3. 流量计算核心逻辑 ====================
+# ==================== 3. 流量计算核心逻辑 (带容错校验) ====================
 get_current_traffic_bytes() {
     local c_year=$(date +%Y)
     local c_month=$(date +%m | sed 's/^0//')
@@ -178,8 +179,10 @@ get_current_traffic_bytes() {
         p_year=$((c_year - 1))
     fi
 
+    # 查询网卡状态，若查询失败或网卡不存在则记录日志并返回0
     json_data=$(vnstat -i "$INTERFACES" --json 2>/dev/null)
     if [ $? -ne 0 ] || [ -z "$json_data" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] vnstat query failed or interface '$INTERFACES' not found." >> "$LOG_FILE"
         echo "0"
         return
     fi
@@ -252,12 +255,14 @@ format_bytes() {
 
 # ==================== 4. 后台检查与定时推送逻辑 ====================
 run_checker() {
-    # 启用单实例锁，防止每分钟定时任务由于网络延迟产生并发堆积
     exec 200>/var/lock/traffic-monitor.lock
     flock -n 200 || exit 0
 
     [ ! -f "$CONFIG_FILE" ] && exit 0
     source "$CONFIG_FILE"
+
+    # 自动清理 /var/lib/traffic-monitor/ 下超过 60 天的旧状态标记文件，防止无限堆积
+    find /var/lib/traffic-monitor/ -type f -mtime +60 -delete 2>/dev/null
 
     current_bytes=$(get_current_traffic_bytes)
     total_bytes_limit=$(awk "BEGIN {print $TOTAL_LIMIT_GB * 1073741824}")
@@ -276,7 +281,7 @@ run_checker() {
     current_hm=$(date '+%H:%M')
     daily_flag="/var/lib/traffic-monitor/daily_${today_date}.flag"
 
-    # 1. 每日 08:10 定时报告（精简美观通知样式）
+    # 1. 每日 08:10 定时报告
     if [ "$current_hm" = "08:10" ] && [ ! -f "$daily_flag" ]; then
         msg="📊 *[${SERVER_NAME}] 每日流量日报*
 
@@ -301,7 +306,7 @@ run_checker() {
         fi
     fi
 
-    # 3. 95% 超阈值关机告警检查
+    # 3. 95% 超阈值延时关机告警检查（带双重校验与防误触缓冲）
     shutdown_flag="/var/lib/traffic-monitor/shutdown_sent_${RESET_DAY}_$(date '+%Y%m')"
     is_above_95=$(awk "BEGIN {print ($percent >= 95) ? 1 : 0}")
     if [ "$is_above_95" -eq 1 ] && [ ! -f "$shutdown_flag" ]; then
@@ -309,19 +314,30 @@ run_checker() {
 
 - 状态: 流量已超 95% (*${percent}%*)
 - 流量: ${used_str} / ${total_str}
-- 操作: 服务器正在执行安全关机
+- 操作: 服务器将在1分钟后执行安全关机 (可输入 shutdown -c 撤销)
 - 时间: ${current_time}"
-        if send_tg_msg "$msg"; then
-            touch "$shutdown_flag"
-            sync
-            sleep 2
-            shutdown now
+
+        # 关机前再次实时校验当前周期的真实流量
+        recheck_bytes=$(get_current_traffic_bytes)
+        recheck_percent=$(awk "BEGIN {printf \"%.2f\", ($recheck_bytes / $total_bytes_limit) * 100}")
+        is_still_above_95=$(awk "BEGIN {print ($recheck_percent >= 95) ? 1 : 0}")
+
+        if [ "$is_still_above_95" -eq 1 ]; then
+            if send_tg_msg "$msg"; then
+                touch "$shutdown_flag"
+                sync
+                sleep 2
+                # 延时1分钟关机，允许通过 shutdown -c 撤销
+                shutdown -h +1 "Traffic limit exceeded (95%), shutting down in 1 minute."
+            else
+                sleep 3
+                send_tg_msg "$msg"
+                touch "$shutdown_flag"
+                sync
+                shutdown -h +1 "Traffic limit exceeded (95%), shutting down in 1 minute."
+            fi
         else
-            sleep 3
-            send_tg_msg "$msg"
-            touch "$shutdown_flag"
-            sync
-            shutdown now
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Recheck passed: traffic dropped or new cycle started (${recheck_percent}%), shutdown canceled." >> "$LOG_FILE"
         fi
     fi
 }
