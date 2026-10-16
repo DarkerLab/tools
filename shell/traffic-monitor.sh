@@ -10,7 +10,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 CRON_FILE="/etc/cron.d/traffic-monitor"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-SCRIPT_VERSION="1.2"
+SCRIPT_VERSION="1.3"
 BASE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 
 # 颜色定义
@@ -47,27 +47,45 @@ install_or_config() {
     echo -e "\n${YELLOW}当前可用网卡列表：${NC}"
     ip -o link show | awk -F': ' '{print $2}' | grep -v "lo"
     
-    # 读取旧配置（如果存在）
+    # 默认变量初始化
+    DEFAULT_SERVER_NAME="$(hostname)"
+    DEFAULT_INTERFACES="$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)"
+    DEFAULT_RESET_DAY="1"
+    DEFAULT_TZ_MODE="1"
+    DEFAULT_TRAFFIC_TYPE="1"
+    DEFAULT_LIMIT_GB="1000"
+    DEFAULT_TOKEN=""
+    DEFAULT_CHAT_ID=""
+
+    # 读取旧配置（如果存在，则覆盖默认值以便回填）
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
-        echo -e "${GREEN}[√] 检测到已有配置文件，将加载默认值进行更新。${NC}"
+        DEFAULT_SERVER_NAME="${SERVER_NAME:-$DEFAULT_SERVER_NAME}"
+        DEFAULT_INTERFACES="${INTERFACES:-$DEFAULT_INTERFACES}"
+        DEFAULT_RESET_DAY="${RESET_DAY:-$DEFAULT_RESET_DAY}"
+        [ "$USE_UTC" == "yes" ] && DEFAULT_TZ_MODE="2" || DEFAULT_TZ_MODE="1"
+        DEFAULT_TRAFFIC_TYPE="${TRAFFIC_TYPE:-1}"
+        DEFAULT_LIMIT_GB="${TOTAL_LIMIT_GB:-1000}"
+        DEFAULT_TOKEN="${TG_BOT_TOKEN:-}"
+        DEFAULT_CHAT_ID="${TG_CHAT_ID:-}"
+        echo -e "${GREEN}[√] 检测到已有配置文件，已成功加载历史配置用于更新。${NC}"
     fi
 
-    # 交互式参数配置
-    read -p "请输入自定义监控服务器名称 [默认: $(hostname)]: " SERVER_NAME
-    SERVER_NAME="${SERVER_NAME:-$(hostname)}"
+    # 交互式参数配置（完美支持历史配置回填）
+    read -p "请输入自定义监控服务器名称 [默认: ${DEFAULT_SERVER_NAME}]: " input_name
+    SERVER_NAME="${input_name:-$DEFAULT_SERVER_NAME}"
 
-    read -p "请输入监控网口（单网口如 ens18，多网口可用空格或逗号分隔如 ens18,ens19）[默认: $(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)]: " INTERFACES
-    INTERFACES="${INTERFACES:-$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1)}"
+    read -p "请输入监控网口（单网口如 ens18，多网口请用 + 号连接如 ens18+ens19）[默认: ${DEFAULT_INTERFACES}]: " input_ifaces
+    INTERFACES="${input_ifaces:-$DEFAULT_INTERFACES}"
 
-    read -p "请输入每月流量重置日期 (1-31) [默认: 1]: " RESET_DAY
-    RESET_DAY="${RESET_DAY:-1}"
+    read -p "请输入每月流量重置日期 (1-31) [默认: ${DEFAULT_RESET_DAY}]: " input_rday
+    RESET_DAY="${input_rday:-$DEFAULT_RESET_DAY}"
 
     echo "请选择流量统计时区模式："
     echo "1. UTC+8 (北京时间)"
     echo "2. UTC+0 (零时区)"
-    read -p "请选择 [1-2, 默认: 1]: " TZ_MODE
-    TZ_MODE="${TZ_MODE:-1}"
+    read -p "请选择 [1-2, 默认: ${DEFAULT_TZ_MODE}]: " input_tz
+    TZ_MODE="${input_tz:-$DEFAULT_TZ_MODE}"
     if [ "$TZ_MODE" == "2" ]; then
         USE_UTC="yes"
         sed -i 's/^[#]*UseUTC .*/UseUTC 1/' /etc/vnstat.conf 2>/dev/null || true
@@ -81,14 +99,17 @@ install_or_config() {
     echo "1. 总流量 (上传 + 下载)"
     echo "2. 仅上传流量"
     echo "3. 仅下载流量"
-    read -p "请选择 [1-3, 默认: 1]: " TRAFFIC_TYPE
-    TRAFFIC_TYPE="${TRAFFIC_TYPE:-1}"
+    read -p "请选择 [1-3, 默认: ${DEFAULT_TRAFFIC_TYPE}]: " input_ttype
+    TRAFFIC_TYPE="${input_ttype:-$DEFAULT_TRAFFIC_TYPE}"
 
-    read -p "请输入每月总流量限制 (单位: GB) [默认: 1000]: " TOTAL_LIMIT_GB
-    TOTAL_LIMIT_GB="${TOTAL_LIMIT_GB:-1000}"
+    read -p "请输入每月总流量限制 (单位: GB) [默认: ${DEFAULT_LIMIT_GB}]: " input_limit
+    TOTAL_LIMIT_GB="${input_limit:-$DEFAULT_LIMIT_GB}"
 
-    read -p "请输入Telegram Bot Token: " TG_BOT_TOKEN
-    read -p "请输入Telegram Chat ID: " TG_CHAT_ID
+    read -p "请输入Telegram Bot Token [默认: ${DEFAULT_TOKEN}]: " input_token
+    TG_BOT_TOKEN="${input_token:-$DEFAULT_TOKEN}"
+
+    read -p "请输入Telegram Chat ID [默认: ${DEFAULT_CHAT_ID}]: " input_chatid
+    TG_CHAT_ID="${input_chatid:-$DEFAULT_CHAT_ID}"
 
     # 保存配置文件
     cat << EOF > "$CONFIG_FILE"
@@ -104,8 +125,10 @@ EOF
 
     echo -e "${GREEN}[√] 配置文件已成功保存至 $CONFIG_FILE${NC}"
 
-    # 配置定时任务 (每分钟执行一次检查)
-    cp "$0" "$SCRIPT_PATH"
+    # 配置定时任务与脚本自复制（避免同文件复制报错）
+    if [ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]; then
+        cp "$0" "$SCRIPT_PATH"
+    fi
     chmod +x "$SCRIPT_PATH"
 
     cat << EOF > "$CRON_FILE"
@@ -113,7 +136,6 @@ EOF
 EOF
     systemctl restart cron
 
-    # 初始化状态标记文件目录
     mkdir -p /var/lib/traffic-monitor
     
     echo -e "${GREEN}[√] 监控定时任务已部署（每1分钟检查一次）。${NC}"
@@ -139,11 +161,8 @@ send_tg_msg() {
     fi
 }
 
-# ==================== 3. 流量计算核心逻辑 (已修复) ====================
+# ==================== 3. 流量计算核心逻辑 (适配 vnstat 原生 + 语法) ====================
 get_current_traffic_bytes() {
-    local total_rx=0
-    local total_tx=0
-    
     local c_year=$(date +%Y)
     local c_month=$(date +%m | sed 's/^0//')
     local c_day=$(date +%d | sed 's/^0//')
@@ -154,69 +173,61 @@ get_current_traffic_bytes() {
         p_month=12
         p_year=$((c_year - 1))
     fi
-    
-    IFS=',+' read -r -a if_array <<< "$INTERFACES"
-    
-    for iface in "${if_array[@]}"; do
-        iface=$(echo "$iface" | xargs)
-        [ -z "$iface" ] && continue
-        
-        json_data=$(vnstat -i "$iface" --json 2>/dev/null)
-        if [ $? -ne 0 ] \vert{}\vert{} [ -z "$json_data" ]; then
-            continue
-        fi
-        
-        if [ "$RESET_DAY" -eq 1 ]; then
-            rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
-                .interfaces[0].traffic.month | 
-                map(select(.date.year == $yr and .date.month ==$mo)) | 
-                .[0].rx // 0
+
+    # vnstat 支持直接传入用 + 连接的多网口（如 ens18+ens19）
+    json_data=$(vnstat -i "$INTERFACES" --json 2>/dev/null)
+    if [ $? -ne 0 ] \vert{}\vert{} [ -z "$json_data" ]; then
+        echo "0"
+        return
+    fi
+
+    if [ "$RESET_DAY" -eq 1 ]; then
+        rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
+            .interfaces[0].traffic.month | 
+            map(select(.date.year == $yr and .date.month ==$mo)) | 
+            .[0].rx // 0
+        ')
+        tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
+            .interfaces[0].traffic.month | 
+            map(select(.date.year == $yr and .date.month ==$mo)) | 
+            .[0].tx // 0
+        ')
+    else
+        if [ "$c_day" -ge "$RESET_DAY" ]; then
+            rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
+                .interfaces[0].traffic.day | 
+                map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
+                map(.rx) | add // 0
             ')
-            tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" '
-                .interfaces[0].traffic.month | 
-                map(select(.date.year == $yr and .date.month ==$mo)) | 
-                .[0].tx // 0
+            tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
+                .interfaces[0].traffic.day | 
+                map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
+                map(.tx) | add // 0
             ')
         else
-            if [ "$c_day" -ge "$RESET_DAY" ]; then
-                rx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
-                    .interfaces[0].traffic.day | 
-                    map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
-                    map(.rx) | add // 0
-                ')
-                tx=$(echo "$json_data" | jq --argjson yr "$c_year" --argjson mo "$c_month" --argjson rday "$RESET_DAY" '
-                    .interfaces[0].traffic.day | 
-                    map(select(.date.year == $yr and .date.month == $mo and .date.day >=$rday)) | 
-                    map(.tx) | add // 0
-                ')
-            else
-                rx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
-                    .interfaces[0].traffic.day | 
-                    map(select(
-                        (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
-                        (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
-                    )) | 
-                    map(.rx) | add // 0
-                ')
-                tx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
-                    .interfaces[0].traffic.day | 
-                    map(select(
-                        (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
-                        (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
-                    )) | 
-                    map(.tx) | add // 0
-                ')
-            fi
+            rx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
+                .interfaces[0].traffic.day | 
+                map(select(
+                    (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
+                    (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
+                )) | 
+                map(.rx) | add // 0
+            ')
+            tx=$(echo "$json_data" | jq --argjson pyr "$p_year" --argjson pmo "$p_month" --argjson cyr "$c_year" --argjson cmo "$c_month" --argjson rday "$RESET_DAY" '
+                .interfaces[0].traffic.day | 
+                map(select(
+                    (.date.year == $pyr and .date.month == $pmo and .date.day >=$rday) or
+                    (.date.year == $cyr and .date.month == $cmo and .date.day <$rday)
+                )) | 
+                map(.tx) | add // 0
+            ')
         fi
-        
-        total_rx=$((total_rx +${rx:-0}))
-        total_tx=$((total_tx +${tx:-0}))
-    done
+    fi
 
     case "$TRAFFIC_TYPE" in
-        2) echo "$total_tx" ;;
-        3) echo "$total_rx" ;;
-        *) echo $((total_rx + total_tx)) ;;
+        2) echo "${tx:-0}" ;;
+        3) echo "${rx:-0}" ;;
+        *) echo $(( ${rx:-0} +${tx:-0} )) ;;
     esac
 }
 
@@ -353,7 +364,13 @@ view_traffic() {
     source "$CONFIG_FILE"
     current_bytes=$(get_current_traffic_bytes)
     total_bytes_limit=$(awk "BEGIN {print $TOTAL_LIMIT_GB * 1073741824}")
-    percent=$(awk "BEGIN {printf \"%.2f\", ($current_bytes / $total_bytes_limit) * 100}")
+    
+    if [ "$total_bytes_limit" -le 0 ]; then
+        percent=0
+    else
+        percent=$(awk "BEGIN {printf \"%.2f\", ($current_bytes / $total_bytes_limit) * 100}")
+    fi
+
     used_str=$(format_bytes "$current_bytes")
     total_str="${TOTAL_LIMIT_GB} GB"
 
@@ -367,7 +384,7 @@ view_traffic() {
     echo -e "当前使用率: ${GREEN}${percent}\%${NC}"
     echo "----------------------------------------"
     echo -e "${YELLOW}vnstat 详细接口状态：${NC}"
-    vnstat -i "$(echo "$INTERFACES" | awk -F'[,+]' '{print $1}' | xargs)"
+    vnstat -i "$INTERFACES"
     echo "----------------------------------------"
     read -p "按回车键返回主菜单..."
     show_menu
@@ -379,7 +396,9 @@ update_script() {
     
     if curl -sSL "$FORCE_URL" -o "$SCRIPT_PATH"; then
         chmod +x "$SCRIPT_PATH"
-        cp "$SCRIPT_PATH" "$0"
+        if [ "$(realpath "$0" 2>/dev/null)" != "$(realpath "$SCRIPT_PATH" 2>/dev/null)" ]; then
+            cp "$SCRIPT_PATH" "$0"
+        fi
         echo -e "${GREEN}[√] 脚本更新成功，正在重新启动...${NC}"
         sleep 1
         exec "$SCRIPT_PATH"
