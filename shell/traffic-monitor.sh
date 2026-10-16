@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 # 确保以root权限运行
@@ -105,7 +104,6 @@ EOF
     echo -e "${GREEN}[√] 配置文件已成功保存至 $CONFIG_FILE${NC}"
 
     # 配置定时任务 (每分钟执行一次检查)
-    # 将自身复制到 /usr/local/bin/traffic-monitor.sh
     cp "$0" "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
 
@@ -142,11 +140,9 @@ send_tg_msg() {
 
 # ==================== 3. 流量计算核心逻辑 ====================
 get_current_traffic_bytes() {
-    # 兼容多网口求和
     local total_rx=0
     local total_tx=0
     
-    # 将逗号或空格分隔的网口转换为数组
     IFS=', ' read -r -a if_array <<< "$INTERFACES"
     
     for iface in "${if_array[@]}"; do
@@ -158,8 +154,6 @@ get_current_traffic_bytes() {
             continue
         fi
         
-        # 使用 jq 获取当前月（或者从重置日起）的流量
-        # vnstat json 中 month 数组包含当前月的统计
         rx=$(echo "$json_data" | jq --argjson rday "$RESET_DAY" '
             .interfaces[0].traffic.month | 
             map(select(.date.day >= $rday)) | 
@@ -179,7 +173,7 @@ get_current_traffic_bytes() {
         2) echo "$total_tx" ;;
         3) echo "$total_rx" ;;
         *) echo $((total_rx + total_tx)) ;;
-    esas
+    esac
 }
 
 format_bytes() {
@@ -213,7 +207,6 @@ run_checker() {
     total_str="${TOTAL_LIMIT_GB} GB"
     current_time=$(date '+%Y-%m-%d %H:%M:%S')
 
-    # 1. 每日 08:10 定时报告检查
     today_date=$(date '+%Y%m%d')
     current_hm=$(date '+%H:%M')
     daily_flag="/var/lib/traffic-monitor/daily_${today_date}.flag"
@@ -228,11 +221,9 @@ run_checker() {
 ━━━━━━━━━━━━━━━━━━"
         send_tg_msg "$msg"
         touch "$daily_flag"
-        # 清理旧标记文件
         find /var/lib/traffic-monitor/ -name "daily_*.flag" ! -name "daily_${today_date}.flag" -delete
     fi
 
-    # 2. 90% 预警检查 (每个周期仅发一次)
     warning_flag="/var/lib/traffic-monitor/warning_sent_${RESET_DAY}_$(date '+%Y%m')"
     is_above_90=$(awk "BEGIN {print ($percent >= 90 &&$percent < 95) ? 1 : 0}")
     if [ "$is_above_90" -eq 1 ] && [ ! -f "$warning_flag" ]; then
@@ -248,7 +239,6 @@ run_checker() {
         fi
     fi
 
-    # 3. 95% 超阈值关机告警检查
     shutdown_flag="/var/lib/traffic-monitor/shutdown_sent_${RESET_DAY}_$(date '+%Y%m')"
     is_above_95=$(awk "BEGIN {print ($percent >= 95) ? 1 : 0}")
     if [ "$is_above_95" -eq 1 ] && [ ! -f "$shutdown_flag" ]; then
@@ -260,14 +250,12 @@ run_checker() {
 🔌 *操作:* 服务器正在执行安全关机
 ⏰ *时间:* \`${current_time}\`
 ━━━━━━━━━━━━━━━━━━"
-        # 强制检查关机通知是否发送成功再执行关机
         if send_tg_msg "$msg"; then
             touch "$shutdown_flag"
             sync
             sleep 2
             shutdown now
         else
-            # 若推送失败，重试一次后依然关机，确保保护机制生效
             sleep 3
             send_tg_msg "$msg"
             touch "$shutdown_flag"
