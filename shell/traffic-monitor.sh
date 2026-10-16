@@ -3,7 +3,7 @@
 # Script Name: traffic-monitor.sh
 # Description: Debian 13 Traffic Monitor & Telegram Alert System using vnstat
 # Author: DarkerLab
-# Version: 1.2.2
+# Version: 1.2.3
 # ==============================================================================
 
 # 颜色定义
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 STATE_DIR="/var/lib/traffic-monitor"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
 GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-VERSION="1.2.2"
+VERSION="1.2.3"
 
 # 检查Root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
@@ -35,13 +35,19 @@ check_timezone() {
     fi
 }
 
-# 安装依赖
+# 安装依赖并初始化网卡监控
 install_dependencies() {
     echo -e "${BLUE}正在检查并安装必要依赖 (vnstat, curl, jq, bc, cron)...${PLAIN}"
     apt-get update -y
     apt-get install -y vnstat curl jq bc cron systemd
     systemctl enable --now vnstat
     systemctl enable --now cron
+    
+    # 自动为所有可用网卡初始化 vnstat 监控
+    mapfile -t available_ifs < <(ip -o link show | awk -F': ' '{print $2}' | grep -v 'lo')
+    for iface in "${available_ifs[@]}"; do
+        vnstat -i "$iface" >/dev/null 2>&1
+    done
 }
 
 # 加载配置
@@ -116,6 +122,11 @@ configure_parameters() {
     fi
     [ -z "$INTERFACES" ] && INTERFACES="${available_ifs[0]}"
 
+    # 确保所选网卡已被 vnstat 初始化
+    for iface in $INTERFACES; do
+        vnstat -i "$iface" >/dev/null 2>&1
+    done
+
     # 3. 每月流量重置日
     local default_reset_day="${RESET_DAY:-1}"
     read -p "请输入每月流量重置日期 (1-31) [默认: $default_reset_day]: " input_day
@@ -172,10 +183,10 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | { cat; echo "$cron_cmd"; } | crontab -
 }
 
-# 计算当前周期内的已用流量
+# 计算当前周期内的已用流量（已增强容错与网卡自动初始化）
 calculate_traffic() {
     load_config
-    [ -z "$INTERFACES" ] && return
+    [ -z "$INTERFACES" ] && echo "0.00 0 N/A N/A" && return
 
     local cur_date cur_day cur_month cur_year
     if [ "$RESET_TZ" = "UTC0" ]; then
@@ -216,9 +227,14 @@ calculate_traffic() {
     local total_tx=0
 
     for iface in $INTERFACES; do
+        vnstat -i "$iface" >/dev/null 2>&1
         local if_json
         if_json=$(vnstat -i "$iface" --json 2>/dev/null)
-        [ -z "$if_json" ] && continue
+        
+        # 验证是否为合法 JSON
+        if ! echo "$if_json" | jq empty >/dev/null 2>&1; then
+            continue
+        fi
 
         local parsed
         parsed=$(echo "$if_json" | jq -r --arg start "$start_date_str" '
@@ -249,10 +265,13 @@ calculate_traffic() {
 
     local used_gb quota_bytes percentage
     used_gb=$(echo "scale=2; $used_bytes / (1024 * 1024 * 1024)" | bc)
+    [[ "$used_gb" == .* ]] && used_gb="0$used_gb"
+
     quota_bytes=$(echo "$TOTAL_QUOTA_GB * 1024 * 1024 * 1024" | bc | cut -d'.' -f1)
     
     if [ -n "$quota_bytes" ] && [ "$quota_bytes" -gt 0 ]; then
         percentage=$(echo "scale=1; ($used_bytes * 100) /$quota_bytes" | bc)
+        [[ "$percentage" == .* ]] && percentage="0$percentage"
     else
         percentage=0
     fi
