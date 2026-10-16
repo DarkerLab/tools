@@ -31,7 +31,7 @@ detect_interfaces() {
 
 configure_params() {
     echo "============================================="
-    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.9"
+    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.0"
     echo "============================================="
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -144,6 +144,28 @@ def send_tg(token, chat_id, message):
         print(f"[Error] Telegram 发送失败: {e}")
         return False
 
+def parse_size_to_bytes(s):
+    if not s or "--" in s:
+        return 0.0
+    parts = s.split()
+    if len(parts) < 2:
+        return 0.0
+    try:
+        val = float(parts[0])
+        unit = parts[1].lower()
+        mult = 1.0
+        if 'ki' in unit: mult = 1024.0
+        elif 'mi' in unit: mult = 1024.0**2
+        elif 'gi' in unit: mult = 1024.0**3
+        elif 'ti' in unit: mult = 1024.0**4
+        elif unit == 'kb': mult = 1000.0
+        elif unit == 'mb': mult = 1000.0**2
+        elif unit == 'gb': mult = 1000.0**3
+        elif unit == 'tb': mult = 1000.0**4
+        return val * mult
+    except:
+        return 0.0
+
 def calculate_traffic():
     config = load_config()
     ifaces = config.get("INTERFACES", "eth0").split()
@@ -170,32 +192,29 @@ def calculate_traffic():
         cycle_start_str = f"{prev_year}-{prev_month:02d}-{reset_day:02d}"
     
     used_bytes = 0.0
-    
-    # 核心重构：将多网卡用 + 号拼接（例如 ens18+ens19），直接调用 vnstat 原生组合查询
-    combined_iface = "+".join(ifaces)
+    combined_iface = "+".join(ifaces) # 例如 ens18+ens19
+    target_ym = now.strftime("%Y-%m") # 例如 2026-10
     
     try:
-        res = subprocess.run(["vnstat", "-i", combined_iface, "--json"], capture_output=True, text=True, check=True)
-        data = json.loads(res.stdout)
-        
-        for inf in data.get("interfaces", []):
-            traffic = inf.get("traffic", {})
-            months_list = traffic.get("months", [])
-            
-            for m in months_list:
-                m_date = m.get("date", {})
-                if m_date.get("year") == year and m_date.get("month") == month:
-                    rx = m.get("rx", 0)
-                    tx = m.get("tx", 0)
+        # 直接调用您验证完全正常的文本表格命令
+        res = subprocess.run(["vnstat", "-i", combined_iface, "-m"], capture_output=True, text=True, check=True)
+        for line in res.stdout.splitlines():
+            if target_ym in line and "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 4:
+                    rx_bytes = parse_size_to_bytes(parts[1])
+                    tx_bytes = parse_size_to_bytes(parts[2])
+                    total_bytes = parse_size_to_bytes(parts[3])
+                    
                     if traffic_type == 1:
-                        used_bytes = float(rx + tx)
+                        used_bytes = total_bytes
                     elif traffic_type == 2:
-                        used_bytes = float(tx)
+                        used_bytes = tx_bytes
                     elif traffic_type == 3:
-                        used_bytes = float(rx)
+                        used_bytes = rx_bytes
                     break
     except Exception as e:
-        print(f"[Warning] 获取 vnstat JSON 数据失败: {e}")
+        print(f"[Warning] 获取 vnstat 文本数据失败: {e}")
 
     used_gb = used_bytes / (1024.0 ** 3)
     return used_gb, cycle_start_str, now
@@ -340,7 +359,7 @@ menu() {
     while true; do
         clear
         echo "============================================="
-        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.9"
+        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v2.0"
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
