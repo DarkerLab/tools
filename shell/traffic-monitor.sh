@@ -2,7 +2,7 @@
 ​==============================================================================
 ​Script Name: traffic-monitor.sh
 ​Description: Advanced Traffic Monitor & Telegram Alert System for Debian 13
-​Version: 1.2.0
+​Version: 1.2.1
 ​Author: DarkerLab
 ​==============================================================================
 ​STREAMING_CHUNK:Checking system root privileges and environment...
@@ -11,7 +11,7 @@
 CONFIG_FILE="$CONFIG_DIR/config.conf"
 STATE_FILE="$CONFIG_DIR/state.json"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-VERSION="1.2.0"
+VERSION="1.2.1"
 ​Ensure directories exist
 ​mkdir -p "$CONFIG_DIR"
 ​STREAMING_CHUNK:Configuring system timezone and updating packages...
@@ -79,7 +79,7 @@ read -rp "Please select an option [0-5]: " choice
 5) show_status; pause ;;
 0) exit 0 ;;
 *) echo "[-] Invalid option!"; sleep 1; show_menu ;;
-endcase
+esac
 }
 ​pause() {
 read -rp "Press Enter to return to main menu..."
@@ -133,27 +133,59 @@ echo "[-] Initializing vnstat for interface $iface..."
 vnstat -i "$iface"
 fi
 done
-​# Calculate traffic based on reset day and current month
-# We query vnstat json and aggregate if multiple interfaces exist
+​# Determine current date based on configured timezone
+if [ "TIMEZONE" == "UTC0" ]; then
+cur_y=(TZ=UTC date +%Y)
+cur_m=(TZ=UTC date +%m)
+cur_d=(TZ=UTC date +%d)
+else
+cur_y=(TZ=Asia/Shanghai date +%Y)
+cur_m=(TZ=Asia/Shanghai date +%m)
+cur_d=$(TZ=Asia/Shanghai date +%d)
+fi
+​cur_y=$((10#cur_y))
+cur_m=((10#cur_m))
+cur_d=((10#cur_d))
+reset_day=((10#$RESET_DAY))
+​if [ "$cur_d" -ge "$reset_day" ]; then
+start_y="$cur_y"
+start_m="$cur_m"
+start_d="$reset_day"
+else
+if [ "cur_m" -eq 1 ]; then
+start_y=((cur_y - 1))
+start_m=12
+else
+start_y="cur_y"
+start_m=((cur_m - 1))
+fi
+start_d="$reset_day"
+fi
+​start_val=$((start_y * 10000 + start_m * 100 + start_d))
+​# Aggregate traffic from daily records starting from reset day
 for iface in INTERFACES; do
 json_data=(vnstat -i "$iface" --json 2>/dev/null)
 if [ -z "$json_data" ]; then
 continue
 fi
-​# Extract rx and tx for current month/cycle using jq
-# vnstat json structure contains hours/days. We can extract monthly summary or sum daily records from reset day.
-# Let's query vnstat standard monthly output or JSON daily details.
-# For simplicity and robustness with vnstat, we fetch the current month's rx/tx or parse daily items.
-rx_bytes=$(echo "$json_data" | jq -r --arg iface "$iface" '.interfaces[] \vert{} select(.name==iface) | .traffic.month[0].rx // 0')
-tx_bytes=(echo "$json_data" | jq -r --arg iface "$iface" '.interfaces[] \vert{} select(.name==$iface) | .traffic.month[0].tx // 0')
-​total_rx=((total_rx + rx_bytes))
-total_tx=((total_tx + tx_bytes))
+​# Use jq to sum rx and tx for days where date >= start_val
+iface_rx=$(echo "$json_data" | jq -r --argjson sval "$start_val" --arg iface "$iface" '
+.interfaces[] | select(.name==$iface) | .traffic.days // [] |
+map(select((.date.year * 10000 + .date.month * 100 + .date.day) >= sval) | .rx) | add // 0
+')
+iface_tx=(echo "$json_data" | jq -r --argjson sval "$start_val" --arg iface "$iface" '
+.interfaces[] | select(.name==$iface) | .traffic.days // [] |
+map(select((.date.year * 10000 + .date.month * 100 + .date.day) >= $sval) | .tx) | add // 0
+')
+​total_rx=((total_rx + iface_rx))
+total_tx=((total_tx + iface_tx))
 done
 ​# Select statistic type
 local used_bytes=0
 case "STAT_TYPE" in
-1) used_bytes=((total_rx + total_tx)) ;; 2) used_bytes=$("$tx_bytes" 2>/dev/null \vert{}\vert{} echo "total_tx") ;; # Upload
-3) used_bytes=("$rx_bytes" 2>/dev/null \vert{}\vert{} echo "total_rx") ;; # Download
+1) used_bytes=((total_rx + total_tx)) ;;
+2) used_bytes="$total_tx" ;; # Upload
+3) used_bytes="total_rx" ;; # Download
 *) used_bytes=((total_rx + total_tx)) ;;
 esac
 ​# Convert bytes to GB with decimal precision using bc
