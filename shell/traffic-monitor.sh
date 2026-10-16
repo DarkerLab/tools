@@ -3,7 +3,7 @@
 # Script Name: traffic-monitor.sh
 # Description: Debian 13 Traffic Monitor & Telegram Alert System using vnstat
 # Author: DarkerLab
-# Version: 1.2.9
+# Version: 1.3.0
 # ==============================================================================
 
 # 颜色定义
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor.conf"
 STATE_DIR="/var/lib/traffic-monitor"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
 GITHUB_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-VERSION="1.2.9"
+VERSION="1.3.0"
 
 # 检查Root权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
@@ -174,7 +174,7 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "traffic-monitor.sh" | { cat; echo "$cron_cmd"; } | crontab -
 }
 
-# 计算当前周期内的已用流量（v1.2.9 完美重构版：纯 jq 计算 + TSV 稳定传输）
+# 计算当前周期内的已用流量（v1.3.0 时间戳数值精准比对版）
 calculate_traffic() {
     load_config
     [ -z "$INTERFACES" ] && echo -e "0.00\t0\tN/A\tN/A" && return
@@ -214,6 +214,15 @@ calculate_traffic() {
     local start_date_str
     start_date_str=$(printf "\%04d-\%02d-\%02d" "$start_year" "$start_month" "$start_day")
 
+    # 计算结算起始时间戳（用于纯数字比对，杜绝字符串匹配错误）
+    local start_ts
+    if [ "$RESET_TZ" = "UTC0" ]; then
+        start_ts=$(TZ='UTC' date -d "$start_date_str 00:00:00" +%s 2>/dev/null)
+    else
+        start_ts=$(TZ='Asia/Shanghai' date -d "$start_date_str 00:00:00" +%s 2>/dev/null)
+    fi
+    [ -z "$start_ts" ] && start_ts=0
+
     # 多网口使用 '+' 拼接查询（如 ens18+ens19）
     local vnstat_target
     vnstat_target=$(echo "$INTERFACES" | tr ' ' '+')
@@ -226,17 +235,14 @@ calculate_traffic() {
         return
     fi
 
-    # 核心：利用 jq 直接在底层完成日期过滤、求和及百分比计算，输出纯净的 TSV 格式
-    jq -r --arg start "$start_date_str" \
+    # 核心：通过时间戳数值过滤，稳妥聚合流量
+    jq -r --arg start_ts "$start_ts" \
+          --arg start_str "$start_date_str" \
           --arg cur "$cur_date" \
           --arg type "${TRAFFIC_TYPE:-1}" \
           --arg quota "${TOTAL_QUOTA_GB:-1000}" '
         ([ .interfaces[0].traffic.day?[]? | 
-           select(
-               ((.date.year | tostring) + "-" + 
-               ((.date.month | tostring) | if length == 1 then "0" + . else . end) + "-" + 
-               ((.date.day | tostring) | if length == 1 then "0" + . else . end)) >= $start
-           )
+           select(.timestamp >= ($start_ts | tonumber))
         ] // []) as $days |
         
         ($days \vert{} map(.rx) \vert{} add // 0) as$total_rx |
@@ -254,7 +260,7 @@ calculate_traffic() {
         [
             ($used_gb | . * 100 | round / 100 | tostring),
             ($percent | . * 10 | round / 10 | tostring),
-            $start,$cur
+            $start_str,$cur
         ] | @tsv
     ' <<< "$if_json" 2>/dev/null
 }
@@ -405,7 +411,6 @@ view_status() {
     echo -e "总流量额度: ${GREEN}$TOTAL_QUOTA_GB GB${PLAIN}"
     echo "--------------------------------------------------"
     if [ -n "$INTERFACES" ]; then
-        # 核心：使用 IFS=$'\t' 精准接收 TSV 格式数据，杜绝字段错位与乱码
         IFS=$'\t' read -r used_gb percentage start_date cur_date <<< "$(calculate_traffic)"
         echo -e "统计周期起止: ${GREEN}${start_date:-N/A}${PLAIN} 至 ${GREEN}${cur_date:-N/A}${PLAIN}"
         echo -e "已使用流量:   ${YELLOW}${used_gb:-0} GB${PLAIN}"
