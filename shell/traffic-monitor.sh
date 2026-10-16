@@ -2,7 +2,7 @@
 # ==============================================================================
 # 脚本名称: traffic-monitor.sh
 # 适用系统: Debian 13 / Linux
-# 脚本版本: v1.2.0
+# 脚本版本: v1.3.0
 # 脚本作者: DarkerLab
 # GitHub Raw 链接: https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 # ==============================================================================
@@ -17,7 +17,7 @@ CONFIG_FILE="/etc/traffic-monitor/config.json"
 STATE_FILE="/etc/traffic-monitor/state.json"
 LOG_FILE="/var/log/traffic-monitor.log"
 SCRIPT_PATH="/usr/local/bin/traffic-monitor.sh"
-VERSION="v1.2.0"
+VERSION="v1.3.0"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -385,15 +385,15 @@ run_monitor() {
 }
 
 # ------------------------------------------------------------------------------
-# 8. GitHub 一键更新脚本
+# 8. GitHub 一键更新脚本（检查本地是否存在文件，存在则删除后从GitHub拉取）
 # ------------------------------------------------------------------------------
 update_script() {
-    echo -e "${BLUE}[+] 正在从 GitHub 检查并拉取最新脚本...${NC}"
+    echo -e "${BLUE}[+] 正在检查并从 GitHub 更新脚本...${NC}"
     TEMP_SCRIPT="/tmp/traffic-monitor.sh"
     
-    # 检查本地是否存在 traffic-monitor.sh 脚本，若存在则先执行删除
+    # 检查本地是否存在 traffic-monitor.sh 文件，存在则执行删除命令
     if [ -f "$SCRIPT_PATH" ]; then
-        echo -e "${YELLOW}[*] 检测到本地已存在脚本文件，正在执行删除并拉取更新...${NC}"
+        echo -e "${YELLOW}[*] 检测到本地已存在脚本文件 ($SCRIPT_PATH)，正在执行删除命令...${NC}"
         rm -f "$SCRIPT_PATH"
     fi
 
@@ -403,9 +403,9 @@ update_script() {
             chmod +x "$SCRIPT_PATH"
             rm -f "$TEMP_SCRIPT"
             ln -sf "$SCRIPT_PATH" /usr/local/bin/traffic-monitor
-            echo -e "${GREEN}[+] 脚本已成功更新至最新版本！${NC}"
+            echo -e "${GREEN}[+] 脚本已成功从 GitHub 拉取并更新至最新版本！${NC}"
         else
-            echo -e "${RED}[-] 下载的文件格式异常，更新失败。${NC}"
+            echo -e "${RED}[-] 下载的文件格式异常，更新取消。${NC}"
         fi
     else
         echo -e "${RED}[-] 从 GitHub 下载脚本失败，请检查网络连接。${NC}"
@@ -441,7 +441,7 @@ show_menu() {
         echo -e " ${GREEN}2.${NC} 查看当前详细流量统计"
         echo -e " ${GREEN}3.${NC} 测试 Telegram 机器人通知"
         echo -e " ${GREEN}4.${NC} 手动触发一次流量检查"
-        echo -e " ${GREEN}5.${NC} 一键更新脚本 (GitHub 最新版)"
+        echo -e " ${GREEN}5.${NC} 一键更新脚本 (删除旧文件并从 GitHub 拉取)"
         echo -e " ${RED}0.${NC} 退出脚本"
         echo -e "${CYAN}======================================================${NC}"
         read -p "请输入对应的操作编号 [0-5]: " choice
@@ -494,7 +494,7 @@ show_menu() {
 }
 
 # ------------------------------------------------------------------------------
-# 10. 脚本入口点处理
+# 10. 脚本入口点逻辑优化
 # ------------------------------------------------------------------------------
 case "$1" in
     --monitor)
@@ -502,14 +502,13 @@ case "$1" in
         ;;
     --install)
         init_system
-        configure_wizard
+        show_menu
         ;;
     *)
+        # 无论配置文件是否存在，直接进入菜单或执行环境初始化
         if [ ! -f "$CONFIG_FILE" ]; then
             init_system
-            configure_wizard
-        else
-            show_menu
         fi
+        show_menu
         ;;
 esac
