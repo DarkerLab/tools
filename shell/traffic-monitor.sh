@@ -31,7 +31,7 @@ detect_interfaces() {
 
 configure_params() {
     echo "============================================="
-    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.5"
+    echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.6"
     echo "============================================="
 
     if [ -f "$CONFIG_FILE" ]; then
@@ -171,58 +171,64 @@ def calculate_traffic():
     
     used_bytes = 0.0
     
-    # 核心优化：逐个网卡通过标准 vnstat JSON 接口查询并聚合
-    for iface in ifaces:
-        iface_bytes = 0.0
-        try:
-            res = subprocess.run(["vnstat", "-i", iface, "--json"], capture_output=True, text=True, check=True)
-            data = json.loads(res.stdout)
-            
-            for inf in data.get("interfaces", []):
-                if inf.get("name") == iface:
-                    traffic = inf.get("traffic", {})
-                    
-                    # 1. 尝试通过每日明细精确统计（适配任意重置日）
-                    days_list = traffic.get("days", [])
-                    for d in days_list:
-                        d_date = d.get("date", {})
-                        dy = d_date.get("year")
-                        dm = d_date.get("month")
-                        dd = d_date.get("day")
-                        if dy and dm and dd:
-                            try:
-                                record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
-                                if record_date >= cycle_start:
-                                    rx = d.get("rx", 0)
-                                    tx = d.get("tx", 0)
-                                    if traffic_type == 1:
-                                        iface_bytes += (rx + tx)
-                                    elif traffic_type == 2:
-                                        iface_bytes += tx
-                                    elif traffic_type == 3:
-                                        iface_bytes += rx
-                            except Exception:
-                                continue
-                                
-                    # 2. 如果每日明细未匹配到且重置日为1号，直接取当月月份 JSON 兜底
-                    if iface_bytes == 0.0 and reset_day == 1:
-                        months_list = traffic.get("months", [])
-                        for m in months_list:
-                            m_date = m.get("date", {})
-                            if m_date.get("year") == year and m_date.get("month") == month:
-                                rx = m.get("rx", 0)
-                                tx = m.get("tx", 0)
+    try:
+        # 全局获取所有网卡的 vnstat JSON 数据，确保 100% 兼容多网卡
+        res = subprocess.run(["vnstat", "--json"], capture_output=True, text=True, check=True)
+        data = json.loads(res.stdout)
+        
+        for inf in data.get("interfaces", []):
+            if_name = inf.get("name")
+            if if_name in ifaces:
+                traffic = inf.get("traffic", {})
+                
+                # 1. 尝试通过每日明细精确统计周期流量
+                days_list = traffic.get("days", [])
+                if_bytes_days = 0.0
+                for d in days_list:
+                    d_date = d.get("date", {})
+                    dy = d_date.get("year")
+                    dm = d_date.get("month")
+                    dd = d_date.get("day")
+                    if dy and dm and dd:
+                        try:
+                            record_date = datetime(dy, dm, dd, 0, 0, 0, tzinfo=target_tz)
+                            if record_date >= cycle_start:
+                                rx = d.get("rx", 0)
+                                tx = d.get("tx", 0)
                                 if traffic_type == 1:
-                                    iface_bytes += (rx + tx)
+                                    if_bytes_days += (rx + tx)
                                 elif traffic_type == 2:
-                                    iface_bytes += tx
+                                    if_bytes_days += tx
                                 elif traffic_type == 3:
-                                    iface_bytes += rx
-                                break
-        except Exception as e:
-            print(f"[Warning] 查询网卡 {iface} 失败: {e}")
-            
-        used_bytes += iface_bytes
+                                    if_bytes_days += rx
+                        except Exception:
+                            continue
+                            
+                # 2. 如果重置日为1号或天数明细为空，直接采用当前月份统计兜底
+                if if_bytes_days == 0.0 or reset_day == 1:
+                    months_list = traffic.get("months", [])
+                    if_bytes_months = 0.0
+                    for m in months_list:
+                        m_date = m.get("date", {})
+                        if m_date.get("year") == year and m_date.get("month") == month:
+                            rx = m.get("rx", 0)
+                            tx = m.get("tx", 0)
+                            if traffic_type == 1:
+                                if_bytes_months += (rx + tx)
+                            elif traffic_type == 2:
+                                if_bytes_months += tx
+                            elif traffic_type == 3:
+                                if_bytes_months += rx
+                            break
+                    if if_bytes_days == 0.0 or reset_day == 1:
+                        used_bytes += max(if_bytes_days, if_bytes_months)
+                    else:
+                        used_bytes += if_bytes_days
+                else:
+                    used_bytes += if_bytes_days
+                    
+    except Exception as e:
+        print(f"[Warning] 获取 vnstat JSON 数据失败: {e}")
 
     used_gb = used_bytes / (1024.0 ** 3)
     return used_gb, cycle_start_str, now
@@ -367,7 +373,7 @@ menu() {
     while true; do
         clear
         echo "============================================="
-        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.5"
+        echo "    Debian 13 vnstat 流量监控与报警一键脚本 v1.6"
         echo "============================================="
         echo "1. 安装 / 初始化配置 / 修改配置"
         echo "2. 查看当前监控状态与流量使用情况"
@@ -387,7 +393,7 @@ menu() {
                 ;;
             2)
                 show_status
-                read -p "按回车键返回主菜单..."
+                read -p "按回space键返回主菜单..."
                 ;;
             3)
                 echo "==> 正在向 Telegram 发送测试消息..."
