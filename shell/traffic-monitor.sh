@@ -1,20 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v3.0
-#
-# 功能：
-#   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
-#   2. 自定义服务器名称、监控网卡（单/多网口）、账单重置日（UTC0 严格口径）
-#   3. 流量统计类型：总流量 / 仅上传 / 仅下载
-#   4. Telegram 每日流量报告（北京时间 08:00 推送）
-#   5. 流量 90% 预警（每账单周期仅一次）
-#   6. 流量 95% 关机报警（通知重试2次，无论送达与否均关机；关机前二次复核）
-#   7. 每分钟定时检查、日志记录、强制在线更新、完整卸载
+# vnstat 流量监控助手 v3.1
 #===============================================================================
 set -u
 
-VERSION="3.0"
-# ⚠️ 请确保这里是你自己的 GitHub 仓库地址！
+VERSION="3.1"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
 VNSTAT_FALLBACK_VER="2.12"
@@ -144,10 +134,9 @@ tg_send_retry() {
 }
 
 #===============================================================================
-# 流量数据获取（基于原生 --oneline 文本处理，绝对稳定）
+# 流量数据获取（基于 vnstat --json，100% 精确无小数）
 #===============================================================================
 get_used_bytes() {
-    # 获取起始日期字符串 (YYYY-MM-DD)
     local cur_y cur_m cur_d
     read -r cur_y cur_m cur_d <<< "$(TZ=UTC date +'%Y %m %d')"
     cur_m=$((10#$cur_m)); cur_d=$((10#$cur_d))
@@ -167,18 +156,35 @@ get_used_bytes() {
     local start_date_str
     start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    # 直接获取日数据单行文本，例如：
-    # ens18+ens19;2026-10-17;4220000000;2180000000;6400000000;...
-    local raw_data
-    raw_data="$(vnstat -d --oneline -i "$INTERFACES" 2>/dev/null)" || return 1
-    [ -z "$raw_data" ] && return 1
+    local json rx tx
+    # 使用原生的 json d 模式，不带 -i 参数以免被合并网卡名坑害，直接拉全量在本地过滤
+    json="$(vnstat --json d 2>/dev/null)" || return 1
+    [ -z "$json" ] && return 1
     
-    # 使用 awk 过滤并累加
-    local rx tx
-    read -r rx tx <<< "$(echo "$raw_data" | awk -F';' -v start="$start_date_str" '
-        $2 >= start { r += $3; t += $4 }
-        END { print r+0, t+0 }
-    ')"
+    # 极度兼容的 jq 处理：处理有 id 和没有 id 的情况，并做字符串安全补齐
+    rx="$(echo "$json" | jq --arg s "$start_date_str" '
+        [ .interfaces[]?.traffic.days[]? 
+          | select(
+              (if .id then .id 
+               else (.date.year|tostring) + "-" + 
+                    (if (.date.month|tostring|length) == 1 then "0" else "" end) + (.date.month|tostring) + "-" + 
+                    (if (.date.day|tostring|length) == 1 then "0" else "" end) + (.date.day|tostring)
+               end) >= $s
+            ) 
+          | .rx ] | add // 0
+    ' 2>/dev/null)"
+    
+    tx="$(echo "$json" | jq --arg s "$start_date_str" '
+        [ .interfaces[]?.traffic.days[]? 
+          | select(
+              (if .id then .id 
+               else (.date.year|tostring) + "-" + 
+                    (if (.date.month|tostring|length) == 1 then "0" else "" end) + (.date.month|tostring) + "-" + 
+                    (if (.date.day|tostring|length) == 1 then "0" else "" end) + (.date.day|tostring)
+               end) >= $s
+            ) 
+          | .tx ] | add // 0
+    ' 2>/dev/null)"
     
     rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
@@ -575,7 +581,6 @@ setup_vnstat() {
         log_info "已写入 systemd drop-in：/etc/systemd/system/vnstat.service.d/utc.conf (TZ=UTC)"
     fi
     
-    # 关键修改：删除 MonthRotate，让 vnstat 的 -m 和 -d 恢复真实自然日期，脚本自己来截取账单周期
     sed -i -E '/^[[:space:]]*MonthRotate[[:space:]]/d' "$VNSTAT_CONF"
     set_vnstat_conf "KeepDays" "62"
     
@@ -629,9 +634,7 @@ setup_cron() {
 # vnstat 流量监控助手定时任务（自动生成，请勿手工修改）
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# 每分钟阈值检查（90% 预警 / 95% 关机）
 */${CHECK_INTERVAL} * * * * root ${INSTALL_PATH} check >/dev/null 2>&1
-# 每日流量报告（系统时区 Asia/Shanghai，即北京时间 ${DEF_REPORT_HOUR}:$(printf '%02d' $DEF_REPORT_MIN)）
 ${DEF_REPORT_MIN} ${DEF_REPORT_HOUR} * * * root ${INSTALL_PATH} report >/dev/null 2>&1
 EOF
     chmod 0644 "$CRON_FILE"
@@ -834,7 +837,6 @@ do_update() {
     info "从仓库强制拉取最新脚本（附加随机参数破 CDN 缓存）..."
     log_info "开始在线更新脚本，源：${REPO_URL}"
     local tmp; tmp="$(mktemp /tmp/traffic-monitor.XXXXXX)"
-    # 加参数击穿缓存
     local url="${REPO_URL}?t=$(date +%s)"
     
     if ! curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmp"; then
