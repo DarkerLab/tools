@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.4
+# vnstat 流量监控助手 v2.5
 #===============================================================================
 set -u
 
-VERSION="2.4"
+VERSION="2.5"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
 VNSTAT_FALLBACK_VER="2.12"
@@ -152,19 +152,31 @@ get_used_bytes() {
         fi
     fi
     local start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
+    local start_ts
+    start_ts=$(TZ=UTC date -d "${start_date_str} 00:00:00" +%s 2>/dev/null)
+    [ -z "$start_ts" ] && return 1
     
-    local rx tx
-    read -r rx tx <<< "$(vnstat --json d -i "$INTERFACES" 2>/dev/null | awk -v ts="$start_date_str" '
-        match($0, /"id":"([0-9]{4}-[0-9]{2}-[0-9]{2})"/, m) {
-            if (m[1] >= ts) {
-                match($0, /"rx":([0-9]+)/, r); match($0, /"tx":([0-9]+)/, t);
-                R += r[1]; T += t[1];
-            }
-        }
-        END { print R+0, T+0 }
-    ')"
+    local rx=0 tx=0
+    local iface r t
+    local IFS_SAVE="$IFS"
+    IFS='+'
+    for iface in $INTERFACES; do
+        local db
+        db="$(vnstat --dumpdb -i "$iface" 2>/dev/null)"
+        if [ -n "$db" ]; then
+            # 纯 POSIX 语法，完全兼容 mawk / gawk / busybox awk
+            local res
+            res="$(echo "$db" | awk -F';' -v ts="$start_ts" '
+                $1 == "d" && $3 >= ts { r += $4; t += $5 }
+                END { print r+0, t+0 }
+            ')"
+            read -r r t <<< "$res"
+            rx=$((rx + r))
+            tx=$((tx + t))
+        fi
+    done
+    IFS="$IFS_SAVE"
     
-    rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
     case "$TRAFFIC_TYPE" in
         1) echo $((rx + tx)) ;;
@@ -800,39 +812,13 @@ do_status() {
 
 do_update() {
     check_root
-    info "从仓库强制拉取最新脚本（附加时间戳参数破 CDN 缓存）..."
-    log_info "开始在线更新脚本，源：${REPO_URL}"
-    local tmp; tmp="$(mktemp /tmp/traffic-monitor.XXXXXX)"
-    local url="${REPO_URL}?nocache=$(date +%s%N)$RANDOM"
-    if ! curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmp"; then
-        rm -f "$tmp"
-        log_error "更新失败：下载脚本出错（网络或仓库地址问题）"
-        die "下载失败，请检查网络或仓库地址是否可访问"
-    fi
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"; die "下载内容为空，更新中止"
-    fi
-    if ! head -n1 "$tmp" | grep -qE '^#!.*bash'; then
-        rm -f "$tmp"; die "下载内容不是有效的 bash 脚本（可能被 CDN/代理污染），更新中止"
-    fi
-    if ! bash -n "$tmp" 2>/dev/null; then
-        rm -f "$tmp"; die "新脚本语法校验未通过，更新中止（保留当前版本）"
-    fi
-    local new_ver
-    new_ver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
-    cp -f "$tmp" "$INSTALL_PATH"
-    chmod +x "$INSTALL_PATH"
-    if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ] && [ -w "$SCRIPT_PATH" ] && [[ "$SCRIPT_PATH" != /tmp/* ]]; then
-        cp -f "$tmp" "$SCRIPT_PATH" 2>/dev/null || true
-    fi
-    rm -f "$tmp"
-    
-    echo
-    ok "脚本已更新：v${VERSION} → v${new_ver:-未知}（${INSTALL_PATH}）"
-    log_info "脚本更新成功：v${VERSION} → v${new_ver:-未知}"
-    info "正在自动重新加载最新版本..."
+    info "正在强制刷新重载本地脚本..."
     sleep 1
-    exec bash "$INSTALL_PATH"
+    if [ -f "$INSTALL_PATH" ]; then
+        exec bash "$INSTALL_PATH"
+    else
+        die "未找到安装文件 ${INSTALL_PATH}，请重新运行安装"
+    fi
 }
 
 do_uninstall() {
@@ -892,7 +878,7 @@ show_menu() {
    1. 安装部署/修改配置
    2. 测试发送每日流量推送
    3. 查看当前流量数据
-   4. 强制刷新更新脚本
+   4. 强制刷新重载脚本
    5. 卸载监控程序
    0. 退出
 
