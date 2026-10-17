@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.5
+# vnstat 流量监控助手 v2.6
 #===============================================================================
 set -u
 
-VERSION="2.5"
+VERSION="2.6"
+# ⚠️ 请确保这里是你自己的 GitHub 仓库地址！
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
 VNSTAT_FALLBACK_VER="2.12"
@@ -164,7 +165,6 @@ get_used_bytes() {
         local db
         db="$(vnstat --dumpdb -i "$iface" 2>/dev/null)"
         if [ -n "$db" ]; then
-            # 纯 POSIX 语法，完全兼容 mawk / gawk / busybox awk
             local res
             res="$(echo "$db" | awk -F';' -v ts="$start_ts" '
                 $1 == "d" && $3 >= ts { r += $4; t += $5 }
@@ -812,13 +812,44 @@ do_status() {
 
 do_update() {
     check_root
-    info "正在强制刷新重载本地脚本..."
-    sleep 1
-    if [ -f "$INSTALL_PATH" ]; then
-        exec bash "$INSTALL_PATH"
-    else
-        die "未找到安装文件 ${INSTALL_PATH}，请重新运行安装"
+    info "尝试从 GitHub 获取最新代码..."
+    info "注意：GitHub Raw 存在 5 分钟 CDN 缓存，如果你刚推送代码，拉取到的可能还是旧版。"
+    
+    local tmp; tmp="$(mktemp /tmp/traffic-monitor.XXXXXX)"
+    if ! curl -fsSL --connect-timeout 15 --max-time 120 "$REPO_URL" -o "$tmp"; then
+        rm -f "$tmp"
+        log_error "更新失败：下载脚本出错（网络或仓库地址问题）"
+        die "下载失败，请检查网络或仓库地址是否可访问"
     fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; die "下载内容为空，更新中止"
+    fi
+    if ! head -n1 "$tmp" | grep -qE '^#!.*bash'; then
+        rm -f "$tmp"; die "下载内容不是有效的 bash 脚本（可能被 CDN/代理污染），更新中止"
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; die "新脚本语法校验未通过，更新中止（保留当前版本）"
+    fi
+    
+    local new_ver
+    new_ver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
+    cp -f "$tmp" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+    if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ] && [ -w "$SCRIPT_PATH" ] && [[ "$SCRIPT_PATH" != /tmp/* ]]; then
+        cp -f "$tmp" "$SCRIPT_PATH" 2>/dev/null || true
+    fi
+    rm -f "$tmp"
+    
+    echo
+    if [ "$new_ver" = "$VERSION" ]; then
+        warn "拉取的版本与当前版本相同（v${VERSION}），GitHub 可能有 5 分钟缓存，请稍后再试。"
+    else
+        ok "脚本已更新：v${VERSION} → v${new_ver:-未知}（${INSTALL_PATH}）"
+        log_info "脚本更新成功：v${VERSION} → v${new_ver:-未知}"
+    fi
+    info "正在自动重新加载最新版本..."
+    sleep 2
+    exec bash "$INSTALL_PATH"
 }
 
 do_uninstall() {
@@ -878,7 +909,7 @@ show_menu() {
    1. 安装部署/修改配置
    2. 测试发送每日流量推送
    3. 查看当前流量数据
-   4. 强制刷新重载脚本
+   4. 从 GitHub 更新脚本
    5. 卸载监控程序
    0. 退出
 
