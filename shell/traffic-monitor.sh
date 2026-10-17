@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v1.7
+# vnstat 流量监控助手 v1.8
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -13,7 +13,7 @@
 #===============================================================================
 set -u
 
-VERSION="1.7"
+VERSION="1.8"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
 VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
@@ -157,7 +157,7 @@ tg_send_retry() {
 }
 
 #===============================================================================
-# 流量数据获取（脚本层按天累加，彻底解决 vnstat MonthRotate 导致的错月问题）
+# 流量数据获取（严格 UTC0 口径，按天累加当前账单周期）
 #===============================================================================
 # 输出当前账单周期已用字节数（按 TRAFFIC_TYPE），失败返回非 0
 get_used_bytes() {
@@ -183,18 +183,28 @@ get_used_bytes() {
         fi
     fi
     
-    # 起始日期的数字形式 (YYYYMMDD) 用于比较
-    local start_num=$((start_y * 10000 + start_m * 100 + BILLING_DAY))
+    # 起始日期的字符串形式 (YYYY-MM-DD) 用于比对
+    local start_date_str
+    start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    # 筛选大于等于起始日期的流量并累加
-    rx="$(printf '%s' "$json" | jq --argjson s "$start_num" '
+    # 筛选大于等于起始日期的流量并累加，使用 id 进行字符串比较以防某些版本的数值类型问题
+    rx="$(printf '%s' "$json" | jq --arg s "$start_date_str" '
         [.interfaces[]?.traffic.days[]? 
-         | select((.date.year * 10000 + .date.month * 100 + .date.day) >= $s) 
-         | .rx] | add // 0' 2>/dev/null)" || return 1
-    tx="$(printf '%s' "$json" | jq --argjson s "$start_num" '
+         | select(
+             (if has("id") and .id != null then .id 
+              else ((.date.year|tostring) + "-" + (if (.date.month|tostring|length)==1 then "0" else "" end) + (.date.month|tostring) + "-" + (if (.date.day|tostring|length)==1 then "0" else "" end) + (.date.day|tostring))
+              end) >= $s
+           ) 
+         | .rx // 0] | add // 0' 2>/dev/null)" || return 1
+         
+    tx="$(printf '%s' "$json" | jq --arg s "$start_date_str" '
         [.interfaces[]?.traffic.days[]? 
-         | select((.date.year * 10000 + .date.month * 100 + .date.day) >= $s) 
-         | .tx] | add // 0' 2>/dev/null)" || return 1
+         | select(
+             (if has("id") and .id != null then .id 
+              else ((.date.year|tostring) + "-" + (if (.date.month|tostring|length)==1 then "0" else "" end) + (.date.month|tostring) + "-" + (if (.date.day|tostring|length)==1 then "0" else "" end) + (.date.day|tostring))
+              end) >= $s
+           ) 
+         | .tx // 0] | add // 0' 2>/dev/null)" || return 1
     
     rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
@@ -599,10 +609,10 @@ setup_vnstat() {
         log_info "已写入 systemd drop-in：/etc/systemd/system/vnstat.service.d/utc.conf (TZ=UTC)"
     fi
     
-    # 关键修改：删除 MonthRotate，让 vnstat 的 -m 统计恢复正常自然月，不再产生错月标签
+    # 删除 MonthRotate，让 vnstat 的 -m 统计恢复正常自然月
     sed -i -E '/^[[:space:]]*MonthRotate[[:space:]]/d' "$VNSTAT_CONF"
     
-    # 确保 vnstat 保留足够的天数数据（至少保留两个月的每日数据）
+    # 确保 vnstat 保留足够的天数数据
     set_vnstat_conf "KeepDays" "62"
     
     local conf_interfaces="${INTERFACES//+/ }"
@@ -859,8 +869,8 @@ do_status() {
     echo "  预警阈值   ：${WARN_PCT}%    关机阈值：${SHUTDOWN_PCT}%"
     echo "═════════════════════════════════════"
     echo
-    info "vnstat 自然月原始数据（脚本已自动按账单周期截取累加，以下仅供核对）："
-    vnstat -m -i "$INTERFACES" 2>/dev/null || warn "vnstat 查询失败"
+    info "vnstat 原始日数据（脚本已按账单周期截取累加，以下天级数据供核对）："
+    vnstat -d -i "$INTERFACES" 2>/dev/null || warn "vnstat 查询失败"
 }
 
 #===============================================================================
