@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.4
+# 版    本 : v1.5
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
+#   v1.5 流量统计口径改为 1000 进制(SI)，与主流云服务商账单一致:
+#        human_bytes 按 1000 分割(B/KB/MB/GB/TB/PB)；
+#        calc_percent 的 LIMIT_GB 按 1000^3 换算字节(原 1024^3)。
+#        （仅计算逻辑调整，不对用户额外展示口径提示）
+#        同时修复 v1.4 遗留的"新库误报历史缺失"问题:
+#        check_day_coverage 新增 newdb 状态(日明细最早=今天/昨天时判定为
+#        新建或刚重置的库，属正常)，build_report/cmd_show 分支提示区分
 #   v1.4 按代码审查意见全面修复:
 #        [必修] cycle_start_date 短月末日判断错误(重置日>当月天数时)导致
 #               周期起点算错、阈值误触发；配置文件写入未转义(含 " $ ` 会
@@ -32,13 +39,14 @@
 #      阈值仍达标后执行关机，防止账单重置后误关机；解析失败绝不关机
 #   5. 每分钟定时检查（cron），安装/修改配置后自动创建、更新并重载定时任务
 #   6. 完整日志记录、权限检查、依赖检查、配置校验、中文交互提示
+#   7. 流量单位按 1000 进制(SI)换算，与主流云服务商账单口径一致
 # 更新地址 : https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 #===============================================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.4"
+VERSION="v1.5"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -48,7 +56,7 @@ LOCK_SHUTDOWN="${BASE_DIR}/shutdown.lock"
 UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 VNSTAT_CONF="/etc/vnstat.conf"
 VNSTAT_DB_DIR="/var/lib/vnstat"
-MAX_LOG_SIZE=$((5*1024*1024))   # 日志超过 5MB 自动截断
+MAX_LOG_SIZE=$((5*1024*1024))   # 日志超过 5MB 自动截断（文件大小仍用 1024 进制）
 
 #===============================================================================
 # 基础工具
@@ -79,10 +87,11 @@ check_root() {
 }
 
 human_bytes() {
+    # 1000 进制（SI）：B/KB/MB/GB/TB/PB，与主流云服务商账单口径一致
     awk -v b="${1:-0}" 'BEGIN{
         split("B KB MB GB TB PB", u, " ");
         i = 1;
-        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        while (b >= 1000 && i < 6) { b /= 1000; i++ }
         printf "%.2f %s", b, u[i];
     }'
 }
@@ -240,24 +249,36 @@ day_coverage_earliest() {
     esac
 }
 
-# 周期起点与日明细最早日比较：输出 ok / nodata / unknown / missing:<yyyymmdd>
+# 周期起点与日明细最早日比较
+# 输出: ok / newdb / unknown / missing:<yyyymmdd>
+#   ok      : 日明细覆盖到周期起点或更早，统计完整
+#   newdb   : 日明细从今天/昨天才开始 → 新建库或刚重置，属正常，不报缺失
+#   missing : 日明细早于今天/昨天，但晚于周期起点 → 真正存在历史缺口
 check_day_coverage() {
     # $1=周期起始日期 YYYY-MM-DD
-    local startnum earliest
+    local startnum earliest todaynum yestnum
     startnum=${1//-/}
     earliest=$(day_coverage_earliest)
     [ "$earliest" = "unknown" ] && { echo "unknown"; return; }
-    # 全部明细为空数组时 day_coverage_earliest 已返回 unknown（无 day 条目）
     if [ "$earliest" -gt "$startnum" ]; then
-        echo "missing:${earliest}"
+        todaynum=$(date -u +%Y%m%d)
+        # 用 date -u -d yesterday 而非 todaynum-1：避免跨月(20261001-1=20261000)
+        yestnum=$(date -u -d "yesterday" +%Y%m%d 2>/dev/null || echo "")
+        if [ "$earliest" = "$todaynum" ] \
+                || { [ -n "$yestnum" ] && [ "$earliest" = "$yestnum" ]; }; then
+            echo "newdb"
+        else
+            echo "missing:${earliest}"
+        fi
     else
         echo "ok"
     fi
 }
 
 calc_percent() {
+    # 1000 进制：LIMIT_GB × 1000^3 字节，与云服务商账单口径一致
     local used_bytes=$1 limit_bytes
-    limit_bytes=$(awk -v l="$LIMIT_GB" 'BEGIN{printf "%.0f", l*1024*1024*1024}')
+    limit_bytes=$(awk -v l="$LIMIT_GB" 'BEGIN{printf "%.0f", l*1000*1000*1000}')
     awk -v u="$used_bytes" -v l="$limit_bytes" \
         'BEGIN{ if (l<=0) print 0; else printf "%.1f", u/l*100 }'
 }
@@ -310,11 +331,17 @@ build_report() {
     now_utc=$(date -u '+%Y-%m-%d %H:%M')
     if [ "$PARSE_ERROR" -eq 0 ]; then
         cover=$(check_day_coverage "$start")
-        if [ "${cover#missing:}" != "$cover" ]; then
-            cov_earliest=${cover#missing:}
-            warn="${warn}
+        case "$cover" in
+            missing:*)
+                cov_earliest=${cover#missing:}
+                warn="${warn}
 ℹ️ vnStat 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}，早于此的周期流量无法统计（历史明细缺失），可用【重置 vnStat 数据库】获得干净口径"
-        fi
+                ;;
+            newdb)
+                warn="${warn}
+ℹ️ vnStat 数据库为新建/刚重置，日明细从今日起记录，周期统计从今天开始累积（属正常）"
+                ;;
+        esac
     fi
     cat <<EOF
 📊 <b>Traffic Daily Report</b>
@@ -730,11 +757,16 @@ cmd_show() {
         fi
     else
         cover=$(check_day_coverage "$start")
-        if [ "${cover#missing:}" != "$cover" ]; then
-            cov_earliest=${cover#missing:}
-            c_yellow "  ⚠ 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}（晚于周期起点），此前的周期流量无法统计"
-            c_yellow "    历史数据口径错乱可用【7. 重置 vnStat 数据库】解决"
-        fi
+        case "$cover" in
+            missing:*)
+                cov_earliest=${cover#missing:}
+                c_yellow "  ⚠ 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}（晚于周期起点），此前的周期流量无法统计"
+                c_yellow "    历史数据口径错乱可用【7. 重置 vnStat 数据库】解决"
+                ;;
+            newdb)
+                c_green "  ℹ 日明细从今日开始记录（新建库/刚重置），周期统计从今天起累积"
+                ;;
+        esac
     fi
     echo "-----------------------------------------------"
     echo "  vnStat 实时概况:"
