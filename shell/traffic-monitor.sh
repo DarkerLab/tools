@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v3.1
+# vnstat 流量监控助手 v3.2
 #===============================================================================
 set -u
 
-VERSION="3.1"
+VERSION="3.2"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
 VNSTAT_FALLBACK_VER="2.12"
@@ -134,7 +134,7 @@ tg_send_retry() {
 }
 
 #===============================================================================
-# 流量数据获取（基于 vnstat --json，100% 精确无小数）
+# 流量数据获取（基于纯文本解析，无视任何 JSON / 小数报错）
 #===============================================================================
 get_used_bytes() {
     local cur_y cur_m cur_d
@@ -156,35 +156,32 @@ get_used_bytes() {
     local start_date_str
     start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    local json rx tx
-    # 使用原生的 json d 模式，不带 -i 参数以免被合并网卡名坑害，直接拉全量在本地过滤
-    json="$(vnstat --json d 2>/dev/null)" || return 1
-    [ -z "$json" ] && return 1
+    # 获取 oneline 格式
+    local raw_data
+    raw_data="$(vnstat -d --oneline -i "$INTERFACES" 2>/dev/null)" || return 1
+    [ -z "$raw_data" ] && return 1
     
-    # 极度兼容的 jq 处理：处理有 id 和没有 id 的情况，并做字符串安全补齐
-    rx="$(echo "$json" | jq --arg s "$start_date_str" '
-        [ .interfaces[]?.traffic.days[]? 
-          | select(
-              (if .id then .id 
-               else (.date.year|tostring) + "-" + 
-                    (if (.date.month|tostring|length) == 1 then "0" else "" end) + (.date.month|tostring) + "-" + 
-                    (if (.date.day|tostring|length) == 1 then "0" else "" end) + (.date.day|tostring)
-               end) >= $s
-            ) 
-          | .rx ] | add // 0
-    ' 2>/dev/null)"
-    
-    tx="$(echo "$json" | jq --arg s "$start_date_str" '
-        [ .interfaces[]?.traffic.days[]? 
-          | select(
-              (if .id then .id 
-               else (.date.year|tostring) + "-" + 
-                    (if (.date.month|tostring|length) == 1 then "0" else "" end) + (.date.month|tostring) + "-" + 
-                    (if (.date.day|tostring|length) == 1 then "0" else "" end) + (.date.day|tostring)
-               end) >= $s
-            ) 
-          | .tx ] | add // 0
-    ' 2>/dev/null)"
+    # 使用 awk 智能过滤累加：判定日期，解析单位，消除小数点导致的 Bash 崩溃
+    local rx tx
+    read -r rx tx <<< "$(echo "$raw_data" | awk -F';' -v start="$start_date_str" '
+        $2 >= start {
+            rx_val = $3 + 0;
+            if ($3 ~ /TiB/) rx_val *= 1099511627776;
+            else if ($3 ~ /GiB/) rx_val *= 1073741824;
+            else if ($3 ~ /MiB/) rx_val *= 1048576;
+            else if ($3 ~ /KiB/) rx_val *= 1024;
+
+            tx_val = $4 + 0;
+            if ($4 ~ /TiB/) tx_val *= 1099511627776;
+            else if ($4 ~ /GiB/) tx_val *= 1073741824;
+            else if ($4 ~ /MiB/) tx_val *= 1048576;
+            else if ($4 ~ /KiB/) tx_val *= 1024;
+
+            r += rx_val;
+            t += tx_val;
+        }
+        END { print int(r), int(t) }
+    ')"
     
     rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
