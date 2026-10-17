@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.9
+# vnstat 流量监控助手 v3.0
+#
+# 功能：
+#   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
+#   2. 自定义服务器名称、监控网卡（单/多网口）、账单重置日（UTC0 严格口径）
+#   3. 流量统计类型：总流量 / 仅上传 / 仅下载
+#   4. Telegram 每日流量报告（北京时间 08:00 推送）
+#   5. 流量 90% 预警（每账单周期仅一次）
+#   6. 流量 95% 关机报警（通知重试2次，无论送达与否均关机；关机前二次复核）
+#   7. 每分钟定时检查、日志记录、强制在线更新、完整卸载
 #===============================================================================
 set -u
 
-VERSION="2.9"
+VERSION="3.0"
+# ⚠️ 请确保这里是你自己的 GitHub 仓库地址！
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
 VNSTAT_FALLBACK_VER="2.12"
@@ -28,6 +38,9 @@ DEF_CHECK_INTERVAL=1
 DEF_REPORT_HOUR=8
 DEF_REPORT_MIN=0
 
+#===============================================================================
+# 基础函数
+#===============================================================================
 _log() {
     local level="$1"; shift
     local ts; ts="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
@@ -38,12 +51,7 @@ log_info()  { _log "INFO " "$*"; }
 log_warn()  { _log "WARN " "$*"; }
 log_error() { _log "ERROR" "$*"; }
 
-die() {
-    echo -e "\033[31m[错误] $*\033[0m" >&2
-    log_error "$*"
-    exit 1
-}
-
+die() { echo -e "\033[31m[错误] $*\033[0m" >&2; log_error "$*"; exit 1; }
 ok()   { echo -e "\033[32m[成功] $*\033[0m"; }
 info() { echo -e "\033[36m[信息] $*\033[0m"; }
 warn() { echo -e "\033[33m[警告] $*\033[0m"; }
@@ -73,9 +81,7 @@ load_config() {
 
 load_state() {
     WARN_PERIOD=""
-    if [ -f "$STATE_FILE" ]; then
-        . "$STATE_FILE"
-    fi
+    if [ -f "$STATE_FILE" ]; then . "$STATE_FILE"; fi
 }
 
 save_state() {
@@ -107,6 +113,9 @@ validate_config() {
     fi
 }
 
+#===============================================================================
+# Telegram 推送
+#===============================================================================
 tg_send() {
     local text="$1" resp
     resp="$(curl -s -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
@@ -134,13 +143,11 @@ tg_send_retry() {
     return 1
 }
 
+#===============================================================================
+# 流量数据获取（基于原生 --oneline 文本处理，绝对稳定）
+#===============================================================================
 get_used_bytes() {
-    local json rx tx
-    # 直接使用组合接口名称查询，不再拆分
-    json="$(vnstat --json d -i "$INTERFACES" 2>/dev/null)" || return 1
-    [ -z "$json" ] && return 1
-    
-    # 获取当前 UTC 年月日
+    # 获取起始日期字符串 (YYYY-MM-DD)
     local cur_y cur_m cur_d
     read -r cur_y cur_m cur_d <<< "$(TZ=UTC date +'%Y %m %d')"
     cur_m=$((10#$cur_m)); cur_d=$((10#$cur_d))
@@ -157,35 +164,25 @@ get_used_bytes() {
             start_y=$((start_y - 1))
         fi
     fi
-    
     local start_date_str
     start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    # 通过 jq 极强的兼容性处理：不管返回一个还是多个接口，自动扁平化；不管有没有 id，自动按日期拼接比对
-    rx="$(echo "$json" | jq --arg s "$start_date_str" '
-        [ .interfaces[]?.traffic.days[]? 
-          | . as $d
-          | (if $d.id then $d.id 
-             else "\($d.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end)-\($d.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end)-\($d.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)" 
-             end) as $dayid
-          | select($dayid >= $s)
-          | $d.rx // 0 
-        ] | add // 0
-    ' 2>/dev/null)"
+    # 直接获取日数据单行文本，例如：
+    # ens18+ens19;2026-10-17;4220000000;2180000000;6400000000;...
+    local raw_data
+    raw_data="$(vnstat -d --oneline -i "$INTERFACES" 2>/dev/null)" || return 1
+    [ -z "$raw_data" ] && return 1
     
-    tx="$(echo "$json" | jq --arg s "$start_date_str" '
-        [ .interfaces[]?.traffic.days[]? 
-          | . as $d
-          | (if $d.id then $d.id 
-             else "\($d.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end)-\($d.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end)-\($d.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)" 
-             end) as $dayid
-          | select($dayid >= $s)
-          | $d.tx // 0 
-        ] | add // 0
-    ' 2>/dev/null)"
+    # 使用 awk 过滤并累加
+    local rx tx
+    read -r rx tx <<< "$(echo "$raw_data" | awk -F';' -v start="$start_date_str" '
+        $2 >= start { r += $3; t += $4 }
+        END { print r+0, t+0 }
+    ')"
     
     rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
+    
     case "$TRAFFIC_TYPE" in
         1) echo $((rx + tx)) ;;
         2) echo "$tx" ;;
@@ -212,6 +209,7 @@ get_period_info() {
     fi
     PERIOD_ID="$(printf "%04d-%02d" "$start_y" "$start_m")"
     PERIOD_START="$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")"
+    return 0
 }
 
 fmt_traffic() {
@@ -245,6 +243,9 @@ traffic_type_name() {
 
 now_beijing() { TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S'; }
 
+#===============================================================================
+# 消息模板
+#===============================================================================
 build_report_msg() {
     local used="$1" pct="$2"
     cat <<EOF
@@ -287,6 +288,9 @@ build_shutdown_msg() {
 EOF
 }
 
+#===============================================================================
+# 安装部署
+#===============================================================================
 install_deps() {
     info "检查并安装软件依赖（vnstat curl jq cron tzdata）..."
     log_info "开始安装依赖"
@@ -300,8 +304,8 @@ install_deps() {
     pkgs="$pkgs tzdata"
     apt-get install -y $pkgs >>"$LOG_FILE" 2>&1 || die "依赖安装失败，请检查网络或 apt 源，详见 $LOG_FILE"
     have_cmd vnstat || die "vnstat 安装失败"
+    have_cmd jq     || die "jq 安装失败"
     have_cmd curl   || die "curl 安装失败"
-    have_cmd jq     || die "jq 安装失败，请检查网络"
     local ver
     ver="$(vnstat --version 2>/dev/null | head -n1)"
     info "依赖就绪：${ver}"
@@ -550,7 +554,7 @@ ensure_vnstat_version() {
 }
 
 setup_vnstat() {
-    info "配置 vnstat（UTC0 时间基准，禁用 MonthRotate）..."
+    info "配置 vnstat（UTC0 时间基准，恢复自然月）..."
     [ -f "$VNSTAT_CONF" ] || die "未找到 ${VNSTAT_CONF}，vnstat 可能未正确安装"
 
     local vnum="" use_utc=1
@@ -571,6 +575,7 @@ setup_vnstat() {
         log_info "已写入 systemd drop-in：/etc/systemd/system/vnstat.service.d/utc.conf (TZ=UTC)"
     fi
     
+    # 关键修改：删除 MonthRotate，让 vnstat 的 -m 和 -d 恢复真实自然日期，脚本自己来截取账单周期
     sed -i -E '/^[[:space:]]*MonthRotate[[:space:]]/d' "$VNSTAT_CONF"
     set_vnstat_conf "KeepDays" "62"
     
@@ -588,17 +593,11 @@ setup_vnstat() {
     systemctl enable vnstat >>"$LOG_FILE" 2>&1 || true
     if ! systemctl restart vnstat >>"$LOG_FILE" 2>&1; then
         journalctl -u vnstat --no-pager -n 20 >>"$LOG_FILE" 2>&1 || true
-        echo "----- vnstat 最近日志（排查用） -----"
-        journalctl -u vnstat --no-pager -n 20 2>/dev/null || true
-        echo "------------------------------------"
         die "vnstat 服务启动失败，完整日志见 ${LOG_FILE}"
     fi
     sleep 3
     if ! systemctl is-active --quiet vnstat; then
         journalctl -u vnstat --no-pager -n 20 >>"$LOG_FILE" 2>&1 || true
-        echo "----- vnstat 最近日志（排查用） -----"
-        journalctl -u vnstat --no-pager -n 20 2>/dev/null || true
-        echo "------------------------------------"
         die "vnstat 服务未处于运行状态，完整日志见 ${LOG_FILE}"
     fi
 
@@ -612,9 +611,6 @@ setup_vnstat() {
 
     ok "vnstat 已配置并运行（UseUTC=${use_utc}, 脚本按天智能截取账期）"
     log_info "vnstat 配置完成并重启：UseUTC=${use_utc} 网口=${INTERFACES}"
-    if [ "$use_utc" = "1" ]; then
-        warn "注意：启用 UseUTC 后，vnstat 历史数据的日/月边界将按 UTC 解释；切换当日数据可能有最多 8 小时的归属偏移，属正常现象"
-    fi
 }
 
 install_script() {
@@ -633,7 +629,9 @@ setup_cron() {
 # vnstat 流量监控助手定时任务（自动生成，请勿手工修改）
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# 每分钟阈值检查（90% 预警 / 95% 关机）
 */${CHECK_INTERVAL} * * * * root ${INSTALL_PATH} check >/dev/null 2>&1
+# 每日流量报告（系统时区 Asia/Shanghai，即北京时间 ${DEF_REPORT_HOUR}:$(printf '%02d' $DEF_REPORT_MIN)）
 ${DEF_REPORT_MIN} ${DEF_REPORT_HOUR} * * * root ${INSTALL_PATH} report >/dev/null 2>&1
 EOF
     chmod 0644 "$CRON_FILE"
@@ -683,11 +681,13 @@ do_install() {
     log_info "===== ${mode}完成 ====="
 }
 
+#===============================================================================
+# 每日报告 / 测试推送
+#===============================================================================
 do_report() {
     load_config || die "未找到配置文件，请先执行安装部署"
     validate_config
     have_cmd vnstat || die "vnstat 未安装"
-    have_cmd jq || die "jq 未安装"
 
     get_period_info || true
     local used pct msg
@@ -705,6 +705,9 @@ do_report() {
     fi
 }
 
+#===============================================================================
+# 阈值检查（每分钟）：90% 预警（周期内一次）/ 95% 复核后关机
+#===============================================================================
 do_check() {
     exec 9>"$LOCK_FILE" 2>/dev/null || true
     if have_cmd flock; then
@@ -714,13 +717,13 @@ do_check() {
     load_config || { log_error "check：配置文件缺失，跳过"; exit 1; }
     validate_config
     have_cmd vnstat || { log_error "check：vnstat 未安装"; exit 1; }
-    have_cmd jq || { log_error "check：jq 未安装"; exit 1; }
 
     get_period_info || true
     local used pct
     used="$(get_used_bytes)" || { log_error "check：读取流量数据失败，本轮跳过"; exit 1; }
     pct="$(calc_pct "$used" "$MONTHLY_LIMIT_GB")"
 
+    # ---- 95% 关机流程 ----
     if pct_ge "$pct" "$SHUTDOWN_PCT"; then
         log_warn "触发关机阈值：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%) >= ${SHUTDOWN_PCT}%"
         local msg; msg="$(build_shutdown_msg "$used" "$pct")"
@@ -742,7 +745,7 @@ do_check() {
             log_warn "关机前复核：当前 ${pct2}% 未达 ${SHUTDOWN_PCT}%（账单周期可能已重置），中止关机"
             if tg_send "ℹ️ 关机已中止
 服务器：${SERVER_NAME}
-复核流量：$(fmt_traffic "$used2") / ${MONTHLY_LIMIT_GB}GB（${pct2}%），未达关机阈值 ${SHUTDOWN_PCT}%（账单周期可能已重置）。
+复核流量：$(fmt_traffic "$used2") / ${MONTHLY_LIMIT_GB}GB（${pct2}%），未达关机阈值 ${SHUTDOWN_PCT}%。
 时间：$(now_beijing)（北京时间）"; then
                 log_info "关机中止通知发送成功"
             fi
@@ -767,6 +770,7 @@ do_check() {
         exit 0
     fi
 
+    # ---- 90% 预警 ----
     if pct_ge "$pct" "$WARN_PCT"; then
         load_state
         if [ "${WARN_PERIOD:-}" = "${PERIOD_ID}" ]; then
@@ -778,7 +782,7 @@ do_check() {
         if tg_send_retry "$msg" 2; then
             WARN_PERIOD="$PERIOD_ID"
             save_state
-            log_info "预警通知发送成功，已记录周期 ${PERIOD_ID}，本周期不再重复推送"
+            log_info "预警通知发送成功，已记录周期 ${PERIOD_ID}"
         else
             log_error "预警通知发送失败（已重试），下轮检查将再次尝试"
         fi
@@ -788,6 +792,9 @@ do_check() {
     log_info "阈值检查正常：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%)"
 }
 
+#===============================================================================
+# 查看当前流量数据
+#===============================================================================
 do_status() {
     load_config || die "未找到配置文件，请先执行安装部署"
     validate_config
@@ -819,11 +826,15 @@ do_status() {
     vnstat -d -i "$INTERFACES" 2>/dev/null || warn "vnstat 查询失败"
 }
 
+#===============================================================================
+# 强制刷新更新脚本（防 CDN 缓存）
+#===============================================================================
 do_update() {
     check_root
-    info "从仓库强制拉取最新脚本（附加时间戳破缓存）..."
+    info "从仓库强制拉取最新脚本（附加随机参数破 CDN 缓存）..."
     log_info "开始在线更新脚本，源：${REPO_URL}"
     local tmp; tmp="$(mktemp /tmp/traffic-monitor.XXXXXX)"
+    # 加参数击穿缓存
     local url="${REPO_URL}?t=$(date +%s)"
     
     if ! curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmp"; then
@@ -835,11 +846,12 @@ do_update() {
         rm -f "$tmp"; die "下载内容为空，更新中止"
     fi
     if ! head -n1 "$tmp" | grep -qE '^#!.*bash'; then
-        rm -f "$tmp"; die "下载内容不是有效的 bash 脚本（可能被 CDN/代理污染），更新中止"
+        rm -f "$tmp"; die "下载内容不是有效的 bash 脚本，更新中止"
     fi
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"; die "新脚本语法校验未通过，更新中止（保留当前版本）"
     fi
+    
     local new_ver
     new_ver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
     cp -f "$tmp" "$INSTALL_PATH"
@@ -851,16 +863,20 @@ do_update() {
     
     echo
     if [ "$new_ver" = "$VERSION" ]; then
-        warn "拉取的版本与当前版本相同（v${VERSION}），GitHub CDN 可能还没刷新，请稍后再试。"
+        warn "拉取的版本与当前版本相同（v${VERSION}），GitHub CDN 可能还没刷新，请等待 5 分钟后再试。"
+        info "本次仅重新加载当前脚本..."
     else
         ok "脚本已更新：v${VERSION} → v${new_ver:-未知}（${INSTALL_PATH}）"
         log_info "脚本更新成功：v${VERSION} → v${new_ver:-未知}"
     fi
-    info "正在自动重新加载最新版本..."
+    info "正在自动重新加载..."
     sleep 2
     exec bash "$INSTALL_PATH"
 }
 
+#===============================================================================
+# 卸载
+#===============================================================================
 do_uninstall() {
     check_root
     echo
@@ -899,9 +915,11 @@ do_uninstall() {
     fi
     echo
     ok "===== 卸载完成 ====="
-    echo "（日志目录已一并删除；如脚本从其他路径运行，请手动删除该副本：${SCRIPT_PATH}）"
 }
 
+#===============================================================================
+# 交互菜单
+#===============================================================================
 show_menu() {
     clear 2>/dev/null || true
     local cfg_tip="未配置"
@@ -951,22 +969,10 @@ main() {
         status|show)     shift || true; do_status ;;
         test)            shift || true; do_report ;;
         update|upgrade)  shift || true; do_update ;;
-        vnstat-upgrade)
-            shift || true
-            check_root
-            ensure_vnstat_version
-            if load_config; then
-                setup_vnstat
-                ok "vnstat 配置已按当前版本重新应用（UseUTC）"
-            fi
-            ;;
         uninstall|remove) shift || true; do_uninstall ;;
         version|-v|--version) echo "traffic-monitor v${VERSION}" ;;
-        help|-h|--help)
-            sed -n '2,30p' "$SCRIPT_PATH" | grep -E '^#' | sed 's/^# \{0,1\}//'
-            ;;
         menu|"")  main_menu ;;
-        *)        die "未知参数：$1（可用：install/check/report/status/test/update/uninstall/version/help）" ;;
+        *)        die "未知参数：$1" ;;
     esac
 }
 
