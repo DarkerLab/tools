@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.2
+# vnstat 流量监控助手 v2.3
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -13,7 +13,7 @@
 #===============================================================================
 set -u
 
-VERSION="2.2"
+VERSION="2.3"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
 VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
@@ -157,15 +157,9 @@ tg_send_retry() {
 }
 
 #===============================================================================
-# 流量数据获取（使用 vnstat --oneline 及 awk，100% 稳定，规避 JSON 兼容性问题）
+# 流量数据获取（核心重构：时间戳比较 + awk 直接加总，抛弃 JSON）
 #===============================================================================
 get_used_bytes() {
-    local raw_data
-    # 直接获取所有接口的每日数据单行输出（不使用 -i，避免多网卡拼接报错）
-    raw_data="$(vnstat -d --oneline 2>/dev/null)" || return 1
-    [ -z "$raw_data" ] && return 1
-    
-    # 获取当前 UTC 年月日
     local cur_y cur_m cur_d
     read -r cur_y cur_m cur_d <<< "$(TZ=UTC date +'%Y %m %d')"
     cur_m=$((10#$cur_m)); cur_d=$((10#$cur_d))
@@ -183,15 +177,23 @@ get_used_bytes() {
         fi
     fi
     
-    # 起始日期的纯字符串形式 (YYYY-MM-DD)
-    local start_date_str
+    # 获取起始日期的 UTC 时间戳 (秒级)
+    local start_date_str start_ts
     start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
+    start_ts=$(TZ=UTC date -d "${start_date_str} 00:00:00" +%s 2>/dev/null)
+    if [ -z "$start_ts" ]; then
+        log_error "无法获取起始日期的时间戳：${start_date_str}"
+        return 1
+    fi
     
-    # vnstat oneline 格式：网卡;日期(YYYY-MM-DD);rx;tx;total;...
-    # 直接利用 awk 筛选大于等于起始日期的行，将 rx(第3列) 和 tx(第4列) 累加
-    local rx tx
-    read -r rx tx <<< "$(echo "$raw_data" | awk -F';' -v start="$start_date_str" '
-        $2 >= start { r += $3; t += $4 }
+    # 使用 --dumpdb 导出纯文本表格（无单位换算，纯字节），用 awk 按照时间戳过滤并累加
+    # dumpdb 的格式为：d;日期ID;时间戳;rx字节数;tx字节数;...
+    local raw_data rx tx
+    raw_data="$(vnstat -d -i "$INTERFACES" --dumpdb 2>/dev/null)" || return 1
+    [ -z "$raw_data" ] && return 1
+    
+    read -r rx tx <<< "$(echo "$raw_data" | awk -F';' -v ts="$start_ts" '
+        $1 == "d" && $3 >= ts { r += $4; t += $5 }
         END { print r+0, t+0 }
     ')"
     
