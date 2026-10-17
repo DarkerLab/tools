@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.0
+# vnstat 流量监控助手 v2.1
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -13,7 +13,7 @@
 #===============================================================================
 set -u
 
-VERSION="2.0"
+VERSION="2.1"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
 VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
@@ -162,7 +162,8 @@ tg_send_retry() {
 # 输出当前账单周期已用字节数（按 TRAFFIC_TYPE），失败返回非 0
 get_used_bytes() {
     local json rx tx
-    json="$(vnstat --json d 2>/dev/null)" || return 1
+    # 限制接口，防止获取到非监控网卡
+    json="$(vnstat --json d -i "$INTERFACES" 2>/dev/null)" || return 1
     [ -z "$json" ] && return 1
     
     # 获取当前 UTC 年月日
@@ -183,25 +184,31 @@ get_used_bytes() {
         fi
     fi
     
-    # 起始日期的纯字符串 (YYYY-MM-DD)，可直接字典序比较
-    local start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
+    # 起始日期的纯字符串形式 (YYYY-MM-DD)
+    local start_date_str
+    start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    # 利用 id 字段进行字符串比较，完美避开 jq 的八进制数字报错，并去重多网卡干扰
-    rx="$(printf '%s' "$json" | jq --arg s "$start_date_str" --arg i "$INTERFACES" '
-        [ .interfaces[]? | select(.name == $i) ] as $matched
-        | (if ($matched | length) > 0 then $matched else [ .interfaces[]? ] end)
-        | .[] | .traffic.days[]?
-        | select( (.id // "") >= $s )
-        | (.rx // 0)
-    ' 2>/dev/null | awk '{s+=$1} END {print s+0}')" || return 1
-
-    tx="$(printf '%s' "$json" | jq --arg s "$start_date_str" --arg i "$INTERFACES" '
-        [ .interfaces[]? | select(.name == $i) ] as $matched
-        | (if ($matched | length) > 0 then $matched else [ .interfaces[]? ] end)
-        | .[] | .traffic.days[]?
-        | select( (.id // "") >= $s )
-        | (.tx // 0)
-    ' 2>/dev/null | awk '{s+=$1} END {print s+0}')" || return 1
+    # 核心修复：1. 不依赖接口名称匹配，直接遍历所有数据累加（vnstat -i 已经过滤过了）
+    # 2. 使用 tostring 和补零，杜绝一切数字格式报错和 "09" 的问题
+    rx="$(echo "$json" | jq --arg s "$start_date_str" '
+        [ .interfaces[]?.traffic.days[]? 
+          | select(
+              ((.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end) + "-" +
+               (.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end) + "-" +
+               (.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)) >= $s
+            )
+          | (.rx // 0)
+        ] | add // 0' 2>/dev/null)" || return 1
+         
+    tx="$(echo "$json" | jq --arg s "$start_date_str" '
+        [ .interfaces[]?.traffic.days[]? 
+          | select(
+              ((.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end) + "-" +
+               (.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end) + "-" +
+               (.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)) >= $s
+            )
+          | (.tx // 0)
+        ] | add // 0' 2>/dev/null)" || return 1
     
     rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
