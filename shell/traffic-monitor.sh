@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v1.8
+# vnstat 流量监控助手 v1.9
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -13,7 +13,7 @@
 #===============================================================================
 set -u
 
-VERSION="1.8"
+VERSION="1.9"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
 VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
@@ -170,7 +170,7 @@ get_used_bytes() {
     read -r cur_y cur_m cur_d <<< "$(TZ=UTC date +'%Y %m %d')"
     cur_m=$((10#$cur_m)); cur_d=$((10#$cur_d))
     
-    local start_y start_m
+    local start_y start_m start_d
     if [ "$cur_d" -ge "$BILLING_DAY" ]; then
         start_y=$cur_y
         start_m=$cur_m
@@ -182,27 +182,23 @@ get_used_bytes() {
             start_y=$((start_y - 1))
         fi
     fi
+    start_d=$BILLING_DAY
     
-    # 起始日期的字符串形式 (YYYY-MM-DD) 用于比对
-    local start_date_str
-    start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
+    # 起始日期的纯数字表示，如 20260918 (万无一失的比对方式)
+    local start_num=$((start_y * 10000 + start_m * 100 + start_d))
     
-    # 筛选大于等于起始日期的流量并累加，使用 id 进行字符串比较以防某些版本的数值类型问题
-    rx="$(printf '%s' "$json" | jq --arg s "$start_date_str" '
+    # 使用 tonumber 确保提取出纯数字进行运算比对，彻底规避字符串格式错乱问题
+    rx="$(printf '%s' "$json" | jq --argjson s "$start_num" '
         [.interfaces[]?.traffic.days[]? 
          | select(
-             (if has("id") and .id != null then .id 
-              else ((.date.year|tostring) + "-" + (if (.date.month|tostring|length)==1 then "0" else "" end) + (.date.month|tostring) + "-" + (if (.date.day|tostring|length)==1 then "0" else "" end) + (.date.day|tostring))
-              end) >= $s
+             (((.date.year | tonumber) * 10000) + ((.date.month | tonumber) * 100) + (.date.day | tonumber)) >= $s
            ) 
          | .rx // 0] | add // 0' 2>/dev/null)" || return 1
          
-    tx="$(printf '%s' "$json" | jq --arg s "$start_date_str" '
+    tx="$(printf '%s' "$json" | jq --argjson s "$start_num" '
         [.interfaces[]?.traffic.days[]? 
          | select(
-             (if has("id") and .id != null then .id 
-              else ((.date.year|tostring) + "-" + (if (.date.month|tostring|length)==1 then "0" else "" end) + (.date.month|tostring) + "-" + (if (.date.day|tostring|length)==1 then "0" else "" end) + (.date.day|tostring))
-              end) >= $s
+             (((.date.year | tonumber) * 10000) + ((.date.month | tonumber) * 100) + (.date.day | tonumber)) >= $s
            ) 
          | .tx // 0] | add // 0' 2>/dev/null)" || return 1
     
@@ -904,9 +900,13 @@ do_update() {
         cp -f "$tmp" "$SCRIPT_PATH" 2>/dev/null || true
     fi
     rm -f "$tmp"
+    
+    echo
     ok "脚本已更新：v${VERSION} → v${new_ver:-未知}（${INSTALL_PATH}）"
     log_info "脚本更新成功：v${VERSION} → v${new_ver:-未知}"
-    info "定时任务指向 ${INSTALL_PATH}，无需重建；如需变更配置请执行菜单 1"
+    info "正在自动重新加载最新版本..."
+    sleep 1
+    exec bash "$INSTALL_PATH"
 }
 
 #===============================================================================
