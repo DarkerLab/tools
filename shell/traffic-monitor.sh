@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.7
+# vnstat 流量监控助手 v2.8
 #===============================================================================
 set -u
 
-VERSION="2.7"
-# ⚠️ 请确保这里是你自己的 GitHub 仓库地址！
+VERSION="2.8"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
 VNSTAT_FALLBACK_VER="2.12"
@@ -153,25 +152,23 @@ get_used_bytes() {
         fi
     fi
     local start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
-    local start_ts
-    start_ts=$(TZ=UTC date -d "${start_date_str} 00:00:00" +%s 2>/dev/null)
-    [ -z "$start_ts" ] && return 1
     
     local rx=0 tx=0
     local iface r t
-    # 修复 IFS 污染，改用 tr 转换空格拆分
+    
     for iface in $(echo "$INTERFACES" | tr '+' ' '); do
-        local db
-        db="$(vnstat --dumpdb -i "$iface" 2>/dev/null)"
-        if [ -n "$db" ]; then
+        local json
+        json="$(vnstat --json d -i "$iface" 2>/dev/null)"
+        if [ -n "$json" ]; then
+            # 使用 jq 提取，利用 id (如 "2026-10-17") 直接做字符串对比
             local res
-            res="$(echo "$db" | awk -F';' -v ts="$start_ts" '
-                $1 == "d" && $3 >= ts { r += $4; t += $5 }
-                END { print r+0, t+0 }
-            ')"
+            res="$(echo "$json" | jq -r --arg s "$start_date_str" '
+                [ .interfaces[].traffic.days[]? | select(.id >= $s) ] 
+                | "\(map(.rx // 0) | add // 0) \(map(.tx // 0) | add // 0)"
+            ' 2>/dev/null)"
             read -r r t <<< "$res"
-            rx=$((rx + r))
-            tx=$((tx + t))
+            rx=$((rx + ${r:-0}))
+            tx=$((tx + ${t:-0}))
         fi
     done
     
@@ -291,6 +288,7 @@ install_deps() {
     apt-get install -y $pkgs >>"$LOG_FILE" 2>&1 || die "依赖安装失败，请检查网络或 apt 源，详见 $LOG_FILE"
     have_cmd vnstat || die "vnstat 安装失败"
     have_cmd curl   || die "curl 安装失败"
+    have_cmd jq     || die "jq 安装失败，请检查网络"
     local ver
     ver="$(vnstat --version 2>/dev/null | head -n1)"
     info "依赖就绪：${ver}"
@@ -810,11 +808,12 @@ do_status() {
 
 do_update() {
     check_root
-    info "尝试从 GitHub 获取最新代码..."
-    info "注意：GitHub Raw 存在 5 分钟 CDN 缓存，如果你刚推送代码，拉取到的可能还是旧版。"
-    
+    info "从仓库强制拉取最新脚本（附加时间戳破缓存）..."
+    log_info "开始在线更新脚本，源：${REPO_URL}"
     local tmp; tmp="$(mktemp /tmp/traffic-monitor.XXXXXX)"
-    if ! curl -fsSL --connect-timeout 15 --max-time 120 "$REPO_URL" -o "$tmp"; then
+    local url="${REPO_URL}?t=$(date +%s)"
+    
+    if ! curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmp"; then
         rm -f "$tmp"
         log_error "更新失败：下载脚本出错（网络或仓库地址问题）"
         die "下载失败，请检查网络或仓库地址是否可访问"
@@ -828,7 +827,6 @@ do_update() {
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"; die "新脚本语法校验未通过，更新中止（保留当前版本）"
     fi
-    
     local new_ver
     new_ver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
     cp -f "$tmp" "$INSTALL_PATH"
@@ -840,7 +838,7 @@ do_update() {
     
     echo
     if [ "$new_ver" = "$VERSION" ]; then
-        warn "拉取的版本与当前版本相同（v${VERSION}），GitHub 可能有 5 分钟缓存，请稍后再试。"
+        warn "拉取的版本与当前版本相同（v${VERSION}），GitHub CDN 可能还没刷新，请稍后再试。"
     else
         ok "脚本已更新：v${VERSION} → v${new_ver:-未知}（${INSTALL_PATH}）"
         log_info "脚本更新成功：v${VERSION} → v${new_ver:-未知}"
