@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.3
-#
-# 功能：
-#   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
-#   2. 自定义服务器名称、监控网卡（单/多网口）、账单重置日（UTC0 严格口径）
-#   3. 流量统计类型：总流量 / 仅上传 / 仅下载
-#   4. Telegram 每日流量报告（北京时间 08:00 推送）
-#   5. 流量 90% 预警（每账单周期仅一次）
-#   6. 流量 95% 关机报警（通知重试2次，无论送达与否均关机；关机前二次复核）
-#   7. 每分钟定时检查、日志记录、强制在线更新、完整卸载
+# vnstat 流量监控助手 v2.4
 #===============================================================================
 set -u
 
-VERSION="2.3"
+VERSION="2.4"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
-MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
-VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
+MIN_VNSTAT_VER="2.7"
+VNSTAT_FALLBACK_VER="2.12"
 VNSTAT_SRC_BASE="https://humdi.net/vnstat"
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -31,16 +22,12 @@ CRON_FILE="/etc/cron.d/traffic-monitor"
 LOCK_FILE="/run/traffic-monitor.lock"
 VNSTAT_CONF="/etc/vnstat.conf"
 
-# 阈值（按需求固定，可在配置文件中调整）
 DEF_WARN_PCT=90
 DEF_SHUTDOWN_PCT=95
-DEF_CHECK_INTERVAL=1          # 分钟
-DEF_REPORT_HOUR=8             # 北京时间 08:00
+DEF_CHECK_INTERVAL=1
+DEF_REPORT_HOUR=8
 DEF_REPORT_MIN=0
 
-#===============================================================================
-# 基础函数
-#===============================================================================
 _log() {
     local level="$1"; shift
     local ts; ts="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')"
@@ -69,7 +56,6 @@ check_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# 版本号比较：ver_lt A B 为真当且仅当 A < B
 ver_lt() {
     awk -v a="$1" -v b="$2" 'BEGIN{
         split(a, x, "."); split(b, y, ".");
@@ -77,10 +63,8 @@ ver_lt() {
     }'
 }
 
-# 读取已保存配置（存在时）
 load_config() {
     if [ -f "$CONF_FILE" ]; then
-        # shellcheck disable=SC1090
         . "$CONF_FILE"
         return 0
     fi
@@ -90,7 +74,6 @@ load_config() {
 load_state() {
     WARN_PERIOD=""
     if [ -f "$STATE_FILE" ]; then
-        # shellcheck disable=SC1090
         . "$STATE_FILE"
     fi
 }
@@ -103,7 +86,6 @@ EOF
     chmod 600 "$STATE_FILE"
 }
 
-# 配置文件完整性校验（check/report 前置）
 validate_config() {
     local missing=""
     [ -z "${SERVER_NAME:-}"     ] && missing="$missing SERVER_NAME"
@@ -125,9 +107,6 @@ validate_config() {
     fi
 }
 
-#===============================================================================
-# Telegram 推送
-#===============================================================================
 tg_send() {
     local text="$1" resp
     resp="$(curl -s -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
@@ -141,7 +120,6 @@ tg_send() {
     return 1
 }
 
-# 带重试发送：共尝试 $1+1 次（默认重试 2 次）
 tg_send_retry() {
     local text="$1" retries="${2:-2}" i=1
     while [ "$i" -le $((retries + 1)) ]; do
@@ -156,9 +134,6 @@ tg_send_retry() {
     return 1
 }
 
-#===============================================================================
-# 流量数据获取（核心重构：时间戳比较 + awk 直接加总，抛弃 JSON）
-#===============================================================================
 get_used_bytes() {
     local cur_y cur_m cur_d
     read -r cur_y cur_m cur_d <<< "$(TZ=UTC date +'%Y %m %d')"
@@ -176,25 +151,17 @@ get_used_bytes() {
             start_y=$((start_y - 1))
         fi
     fi
+    local start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    # 获取起始日期的 UTC 时间戳 (秒级)
-    local start_date_str start_ts
-    start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
-    start_ts=$(TZ=UTC date -d "${start_date_str} 00:00:00" +%s 2>/dev/null)
-    if [ -z "$start_ts" ]; then
-        log_error "无法获取起始日期的时间戳：${start_date_str}"
-        return 1
-    fi
-    
-    # 使用 --dumpdb 导出纯文本表格（无单位换算，纯字节），用 awk 按照时间戳过滤并累加
-    # dumpdb 的格式为：d;日期ID;时间戳;rx字节数;tx字节数;...
-    local raw_data rx tx
-    raw_data="$(vnstat -d -i "$INTERFACES" --dumpdb 2>/dev/null)" || return 1
-    [ -z "$raw_data" ] && return 1
-    
-    read -r rx tx <<< "$(echo "$raw_data" | awk -F';' -v ts="$start_ts" '
-        $1 == "d" && $3 >= ts { r += $4; t += $5 }
-        END { print r+0, t+0 }
+    local rx tx
+    read -r rx tx <<< "$(vnstat --json d -i "$INTERFACES" 2>/dev/null | awk -v ts="$start_date_str" '
+        match($0, /"id":"([0-9]{4}-[0-9]{2}-[0-9]{2})"/, m) {
+            if (m[1] >= ts) {
+                match($0, /"rx":([0-9]+)/, r); match($0, /"tx":([0-9]+)/, t);
+                R += r[1]; T += t[1];
+            }
+        }
+        END { print R+0, T+0 }
     ')"
     
     rx="${rx:-0}"; tx="${tx:-0}"
@@ -206,7 +173,6 @@ get_used_bytes() {
     esac
 }
 
-# 当前账单周期标识与起始日期（脚本计算，精确无误）
 get_period_info() {
     local cur_y cur_m cur_d
     read -r cur_y cur_m cur_d <<< "$(TZ=UTC date +'%Y %m %d')"
@@ -224,13 +190,10 @@ get_period_info() {
             start_y=$((start_y - 1))
         fi
     fi
-    
     PERIOD_ID="$(printf "%04d-%02d" "$start_y" "$start_m")"
     PERIOD_START="$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")"
-    return 0
 }
 
-# 字节数转动态单位（B, KB, MB, GB） - 固定 1000^3 口径
 fmt_traffic() {
     local b="$1"
     awk -v b="$b" 'BEGIN{
@@ -241,7 +204,6 @@ fmt_traffic() {
     }'
 }
 
-# 计算百分比（固定 1000^3 口径）
 calc_pct() {
     awk -v u="$1" -v l="$2" 'BEGIN{
         limit = l * 1000000000;
@@ -250,9 +212,7 @@ calc_pct() {
     }'
 }
 
-pct_ge() {  # pct_ge 当前值 阈值
-    awk -v p="$1" -v t="$2" 'BEGIN{exit !(p >= t)}'
-}
+pct_ge() { awk -v p="$1" -v t="$2" 'BEGIN{exit !(p >= t)}'; }
 
 traffic_type_name() {
     case "$1" in
@@ -263,9 +223,6 @@ traffic_type_name() {
     esac
 }
 
-#===============================================================================
-# 消息模板
-#===============================================================================
 now_beijing() { TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S'; }
 
 build_report_msg() {
@@ -310,9 +267,6 @@ build_shutdown_msg() {
 EOF
 }
 
-#===============================================================================
-# 安装部署
-#===============================================================================
 install_deps() {
     info "检查并安装软件依赖（vnstat curl jq cron tzdata）..."
     log_info "开始安装依赖"
@@ -324,10 +278,8 @@ install_deps() {
     have_cmd jq     || pkgs="$pkgs jq"
     have_cmd cron 2>/dev/null || [ -d /etc/cron.d ] || pkgs="$pkgs cron"
     pkgs="$pkgs tzdata"
-    # shellcheck disable=SC2086
     apt-get install -y $pkgs >>"$LOG_FILE" 2>&1 || die "依赖安装失败，请检查网络或 apt 源，详见 $LOG_FILE"
     have_cmd vnstat || die "vnstat 安装失败"
-    have_cmd jq     || die "jq 安装失败"
     have_cmd curl   || die "curl 安装失败"
     local ver
     ver="$(vnstat --version 2>/dev/null | head -n1)"
@@ -337,9 +289,7 @@ install_deps() {
 
 set_timezone() {
     local cur=""
-    if have_cmd timedatectl; then
-        cur="$(timedatectl show -p Timezone --value 2>/dev/null)"
-    fi
+    if have_cmd timedatectl; then cur="$(timedatectl show -p Timezone --value 2>/dev/null)"; fi
     [ -z "$cur" ] && [ -f /etc/timezone ] && cur="$(tr -d '[:space:]' < /etc/timezone)"
     if [ "$cur" = "Asia/Shanghai" ]; then
         info "系统时区已是 Asia/Shanghai，跳过设置"
@@ -600,10 +550,7 @@ setup_vnstat() {
         log_info "已写入 systemd drop-in：/etc/systemd/system/vnstat.service.d/utc.conf (TZ=UTC)"
     fi
     
-    # 删除 MonthRotate，让 vnstat 的 -m 统计恢复正常自然月
     sed -i -E '/^[[:space:]]*MonthRotate[[:space:]]/d' "$VNSTAT_CONF"
-    
-    # 确保 vnstat 保留足够的天数数据
     set_vnstat_conf "KeepDays" "62"
     
     local conf_interfaces="${INTERFACES//+/ }"
@@ -665,9 +612,7 @@ setup_cron() {
 # vnstat 流量监控助手定时任务（自动生成，请勿手工修改）
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# 每分钟阈值检查（90% 预警 / 95% 关机）
 */${CHECK_INTERVAL} * * * * root ${INSTALL_PATH} check >/dev/null 2>&1
-# 每日流量报告（系统时区 Asia/Shanghai，即北京时间 ${DEF_REPORT_HOUR}:$(printf '%02d' $DEF_REPORT_MIN)）
 ${DEF_REPORT_MIN} ${DEF_REPORT_HOUR} * * * root ${INSTALL_PATH} report >/dev/null 2>&1
 EOF
     chmod 0644 "$CRON_FILE"
@@ -717,9 +662,6 @@ do_install() {
     log_info "===== ${mode}完成 ====="
 }
 
-#===============================================================================
-# 每日报告 / 测试推送
-#===============================================================================
 do_report() {
     load_config || die "未找到配置文件，请先执行安装部署"
     validate_config
@@ -742,9 +684,6 @@ do_report() {
     fi
 }
 
-#===============================================================================
-# 阈值检查（每分钟）：90% 预警（周期内一次）/ 95% 复核后关机
-#===============================================================================
 do_check() {
     exec 9>"$LOCK_FILE" 2>/dev/null || true
     if have_cmd flock; then
@@ -761,7 +700,6 @@ do_check() {
     used="$(get_used_bytes)" || { log_error "check：读取流量数据失败，本轮跳过"; exit 1; }
     pct="$(calc_pct "$used" "$MONTHLY_LIMIT_GB")"
 
-    # ---- 95% 关机流程 ----
     if pct_ge "$pct" "$SHUTDOWN_PCT"; then
         log_warn "触发关机阈值：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%) >= ${SHUTDOWN_PCT}%"
         local msg; msg="$(build_shutdown_msg "$used" "$pct")"
@@ -808,7 +746,6 @@ do_check() {
         exit 0
     fi
 
-    # ---- 90% 预警（每账单周期仅推送一次）----
     if pct_ge "$pct" "$WARN_PCT"; then
         load_state
         if [ "${WARN_PERIOD:-}" = "${PERIOD_ID}" ]; then
@@ -830,9 +767,6 @@ do_check() {
     log_info "阈值检查正常：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%)"
 }
 
-#===============================================================================
-# 查看当前流量数据
-#===============================================================================
 do_status() {
     load_config || die "未找到配置文件，请先执行安装部署"
     validate_config
@@ -864,9 +798,6 @@ do_status() {
     vnstat -d -i "$INTERFACES" 2>/dev/null || warn "vnstat 查询失败"
 }
 
-#===============================================================================
-# 强制刷新更新脚本（防 CDN 缓存）
-#===============================================================================
 do_update() {
     check_root
     info "从仓库强制拉取最新脚本（附加时间戳参数破 CDN 缓存）..."
@@ -904,9 +835,6 @@ do_update() {
     exec bash "$INSTALL_PATH"
 }
 
-#===============================================================================
-# 卸载
-#===============================================================================
 do_uninstall() {
     check_root
     echo
@@ -948,14 +876,10 @@ do_uninstall() {
     echo "（日志目录已一并删除；如脚本从其他路径运行，请手动删除该副本：${SCRIPT_PATH}）"
 }
 
-#===============================================================================
-# 交互菜单
-#===============================================================================
 show_menu() {
     clear 2>/dev/null || true
     local cfg_tip="未配置"
     if [ -f "$CONF_FILE" ]; then
-        # shellcheck disable=SC1090
         cfg_tip="$(. "$CONF_FILE"; echo "${SERVER_NAME:-?} | ${INTERFACES:-?} | 限额${MONTHLY_LIMIT_GB:-?}GB")"
     fi
     cat <<EOF
@@ -993,9 +917,6 @@ main_menu() {
     done
 }
 
-#===============================================================================
-# 入口
-#===============================================================================
 main() {
     case "${1:-menu}" in
         install|config)  shift || true; do_install ;;
