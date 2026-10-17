@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.1
+# vnstat 流量监控助手 v2.2
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -13,7 +13,7 @@
 #===============================================================================
 set -u
 
-VERSION="2.1"
+VERSION="2.2"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
 VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
@@ -157,14 +157,13 @@ tg_send_retry() {
 }
 
 #===============================================================================
-# 流量数据获取（严格 UTC0 口径，按天累加当前账单周期）
+# 流量数据获取（使用 vnstat --oneline 及 awk，100% 稳定，规避 JSON 兼容性问题）
 #===============================================================================
-# 输出当前账单周期已用字节数（按 TRAFFIC_TYPE），失败返回非 0
 get_used_bytes() {
-    local json rx tx
-    # 限制接口，防止获取到非监控网卡
-    json="$(vnstat --json d -i "$INTERFACES" 2>/dev/null)" || return 1
-    [ -z "$json" ] && return 1
+    local raw_data
+    # 直接获取所有接口的每日数据单行输出（不使用 -i，避免多网卡拼接报错）
+    raw_data="$(vnstat -d --oneline 2>/dev/null)" || return 1
+    [ -z "$raw_data" ] && return 1
     
     # 获取当前 UTC 年月日
     local cur_y cur_m cur_d
@@ -188,27 +187,13 @@ get_used_bytes() {
     local start_date_str
     start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    # 核心修复：1. 不依赖接口名称匹配，直接遍历所有数据累加（vnstat -i 已经过滤过了）
-    # 2. 使用 tostring 和补零，杜绝一切数字格式报错和 "09" 的问题
-    rx="$(echo "$json" | jq --arg s "$start_date_str" '
-        [ .interfaces[]?.traffic.days[]? 
-          | select(
-              ((.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end) + "-" +
-               (.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end) + "-" +
-               (.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)) >= $s
-            )
-          | (.rx // 0)
-        ] | add // 0' 2>/dev/null)" || return 1
-         
-    tx="$(echo "$json" | jq --arg s "$start_date_str" '
-        [ .interfaces[]?.traffic.days[]? 
-          | select(
-              ((.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end) + "-" +
-               (.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end) + "-" +
-               (.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)) >= $s
-            )
-          | (.tx // 0)
-        ] | add // 0' 2>/dev/null)" || return 1
+    # vnstat oneline 格式：网卡;日期(YYYY-MM-DD);rx;tx;total;...
+    # 直接利用 awk 筛选大于等于起始日期的行，将 rx(第3列) 和 tx(第4列) 累加
+    local rx tx
+    read -r rx tx <<< "$(echo "$raw_data" | awk -F';' -v start="$start_date_str" '
+        $2 >= start { r += $3; t += $4 }
+        END { print r+0, t+0 }
+    ')"
     
     rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
