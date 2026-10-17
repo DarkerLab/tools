@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v1.1
+# vnstat 流量监控助手 v1.4
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -19,15 +19,19 @@
 #   traffic-monitor.sh status        # 查看当前流量数据
 #   traffic-monitor.sh test          # 测试发送每日流量推送
 #   traffic-monitor.sh update        # 强制刷新更新脚本
+#   traffic-monitor.sh vnstat-upgrade # 检测并升级 vnstat（低于 2.7 时源码编译升级）
 #   traffic-monitor.sh uninstall     # 卸载监控程序
 #
 # 仓库地址（更新源）：
-#   https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
+#   [https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh](https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh)
 #===============================================================================
 set -u
 
-VERSION="1.1"
-REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
+VERSION="1.4"
+REPO_URL="[https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh](https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh)"
+MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
+VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
+VNSTAT_SRC_BASE="[https://humdi.net/vnstat](https://humdi.net/vnstat)"
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 INSTALL_PATH="/usr/local/bin/traffic-monitor.sh"
@@ -78,6 +82,14 @@ check_root() {
 }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 版本号比较：ver_lt A B 为真当且仅当 A < B（按主.次版本分段数值比较，避免 2.10<2.7 的浮点误判）
+ver_lt() {
+    awk -v a="$1" -v b="$2" 'BEGIN{
+        split(a, x, "."); split(b, y, ".");
+        exit !((x[1]+0 < y[1]+0) || (x[1]+0 == y[1]+0 && x[2]+0 < y[2]+0))
+    }'
+}
 
 # 读取已保存配置（存在时）
 load_config() {
@@ -132,7 +144,7 @@ validate_config() {
 #===============================================================================
 tg_send() {
     local text="$1" resp
-    resp="$(curl -s -m 20 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+    resp="$(curl -s -m 20 -X POST "[https://api.telegram.org/bot$](https://api.telegram.org/bot$){TG_BOT_TOKEN}/sendMessage" \
         --data-urlencode "chat_id=${TG_CHAT_ID}" \
         --data-urlencode "text=${text}" \
         --data-urlencode "disable_web_page_preview=true" 2>/dev/null)"
@@ -187,19 +199,15 @@ get_period_info() {
     return 0
 }
 
-# 字节数转 GB/GiB（UNIT_MODE: si=1000^3, iec=1024^3）
+# 字节数转 GB（统一按 1GB = 1000^3 计算，与多数商家计费口径一致）
 fmt_gb() {
-    awk -v b="$1" -v m="${UNIT_MODE:-si}" 'BEGIN{
-        div = (m == "iec") ? 1024*1024*1024 : 1000*1000*1000;
-        printf "%.2f", b/div
-    }'
+    awk -v b="$1" 'BEGIN{ printf "%.2f", b/1000000000 }'
 }
 
-# 计算百分比（保留两位小数）
+# 计算百分比（保留两位小数，GB=1000^3）
 calc_pct() {
-    awk -v u="$1" -v l="$2" -v m="${UNIT_MODE:-si}" 'BEGIN{
-        div = (m == "iec") ? 1024*1024*1024 : 1000*1000*1000;
-        limit = l * div;
+    awk -v u="$1" -v l="$2" 'BEGIN{
+        limit = l * 1000000000;
         if (limit <= 0) { print "0.00"; exit }
         printf "%.2f", u/limit*100
     }'
@@ -404,19 +412,13 @@ prompt_config() {
         warn "限额必须为大于 0 的数值，请重新输入"
     done
 
-    def="${UNIT_MODE:-si}"
-    echo "流量单位口径：si=GB(1000^3，与多数商家计费一致)  iec=GiB(1024^3)"
-    read -r -p "请选择 [${def}]: " val
-    UNIT_MODE="${val:-$def}"
-    case "$UNIT_MODE" in si|iec) ;; *) UNIT_MODE="si" ;; esac
-
     WARN_PCT="${WARN_PCT:-$DEF_WARN_PCT}"
     SHUTDOWN_PCT="${SHUTDOWN_PCT:-$DEF_SHUTDOWN_PCT}"
     CHECK_INTERVAL="${CHECK_INTERVAL:-$DEF_CHECK_INTERVAL}"
 
     echo "────────────────────────────────────────────────────────────────"
     info "配置预览：服务器=${SERVER_NAME} 网口=${INTERFACES} 重置日=${BILLING_DAY}(UTC0) 类型=$(traffic_type_name "$TRAFFIC_TYPE")"
-    info "          限额=${MONTHLY_LIMIT_GB}GB(${UNIT_MODE}) 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}% 检查间隔=${CHECK_INTERVAL}分钟"
+    info "          限额=${MONTHLY_LIMIT_GB}GB（按 1GB=1000^3 计算） 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}% 检查间隔=${CHECK_INTERVAL}分钟"
 }
 
 save_config() {
@@ -431,7 +433,6 @@ TRAFFIC_TYPE="${TRAFFIC_TYPE}"
 TG_BOT_TOKEN="${TG_BOT_TOKEN}"
 TG_CHAT_ID="${TG_CHAT_ID}"
 MONTHLY_LIMIT_GB="${MONTHLY_LIMIT_GB}"
-UNIT_MODE="${UNIT_MODE}"
 WARN_PCT="${WARN_PCT}"
 SHUTDOWN_PCT="${SHUTDOWN_PCT}"
 CHECK_INTERVAL="${CHECK_INTERVAL}"
@@ -441,12 +442,166 @@ EOF
     log_info "配置已保存：网口=${INTERFACES} 重置日=${BILLING_DAY} 类型=${TRAFFIC_TYPE} 限额=${MONTHLY_LIMIT_GB}GB 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}%"
 }
 
+# 获取 vnstat 版本号（如 2.10），未安装返回空
+vnstat_get_ver() {
+    have_cmd vnstat || { echo ""; return 1; }
+    vnstat --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1
+}
+
+# 源码编译安装 vnstat 最新版（apt 源版本过老、不支持 UseUTC 时使用）
+# 说明：apt remove 会保留 /etc/vnstat.conf 与 /var/lib/vnstat 流量数据库，新版启动时自动迁移旧数据
+upgrade_vnstat() {
+    info "准备源码编译安装 vnstat 新版本（需 build-essential，约 1-3 分钟）..."
+    log_info "开始源码编译升级 vnstat"
+    export DEBIAN_FRONTEND=noninteractive
+    if ! apt-get install -y build-essential >>"$LOG_FILE" 2>&1; then
+        log_error "编译依赖 build-essential 安装失败"
+        return 1
+    fi
+
+    # 优先从 GitHub 获取最新 release 版本号，失败则用兜底版本
+    local ver=""
+    if have_cmd jq; then
+        ver="$(curl -fsSL -m 20 [https://api.github.com/repos/vergoh/vnstat/releases/latest](https://api.github.com/repos/vergoh/vnstat/releases/latest) 2>/dev/null \
+            | jq -r '.tag_name // empty' | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)"
+    fi
+    [ -z "$ver" ] && ver="$VNSTAT_FALLBACK_VER"
+    info "目标版本：vnstat ${ver}"
+    log_info "升级目标版本：${ver}"
+
+    local workdir tarball srcdir
+    workdir="$(mktemp -d /tmp/vnstat-build.XXXXXX)"
+    tarball="${workdir}/vnstat-${ver}.tar.gz"
+    if ! curl -fsSL --connect-timeout 15 --max-time 300 "${VNSTAT_SRC_BASE}/vnstat-${ver}.tar.gz" -o "$tarball"; then
+        rm -rf "$workdir"; log_error "vnstat ${ver} 源码包下载失败（${VNSTAT_SRC_BASE}）"; return 1
+    fi
+    if ! tar -xzf "$tarball" -C "$workdir"; then
+        rm -rf "$workdir"; log_error "vnstat 源码包解压失败"; return 1
+    fi
+    srcdir="$(find "$workdir" -maxdepth 1 -type d -name 'vnstat-*' | head -n1)"
+    if [ -z "$srcdir" ] || [ ! -f "${srcdir}/configure" ]; then
+        rm -rf "$workdir"; log_error "源码目录结构异常，未找到 configure"; return 1
+    fi
+
+    local rc=0
+    (
+        cd "$srcdir" || exit 1
+        ./configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var || exit 1
+        make -j"$(nproc 2>/dev/null || echo 2)" || exit 1
+        systemctl stop vnstat >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get remove -y vnstat >/dev/null 2>&1 || true
+        make install || exit 1
+    ) >>"$LOG_FILE" 2>&1 || rc=1
+
+    if [ "$rc" -eq 0 ] && [ -f "${srcdir}/examples/systemd/vnstat.service" ]; then
+        # 使用源码自带的 systemd 服务单元（apt 版单元已随卸载移除）
+        cp -f "${srcdir}/examples/systemd/vnstat.service" /etc/systemd/system/vnstat.service
+    fi
+    rm -rf "$workdir"
+    systemctl daemon-reload 2>/dev/null || true
+
+    if [ "$rc" -ne 0 ]; then
+        log_error "vnstat 编译/安装失败，详见 ${LOG_FILE}"
+        warn "编译安装失败（详见 ${LOG_FILE}），若系统vnstat已被卸载请重新执行安装流程"
+        # 编译失败后若二进制缺失，尝试恢复 apt 版本，避免系统无 vnstat 可用
+        if ! have_cmd vnstat; then
+            warn "检测到 vnstat 已缺失，尝试恢复 apt 源版本..."
+            apt-get install -y vnstat >>"$LOG_FILE" 2>&1 || true
+        fi
+        return 1
+    fi
+
+    local newver; newver="$(vnstat_get_ver)"
+    if [ -n "$newver" ] && ! ver_lt "$newver" "$MIN_VNSTAT_VER"; then
+        ok "vnstat 已升级至 ${newver}（支持 UseUTC），流量数据库与配置已保留"
+        log_info "vnstat 源码编译升级成功：${newver}"
+        return 0
+    fi
+    log_error "升级后 vnstat 版本为 ${newver:-未知}，仍低于 ${MIN_VNSTAT_VER}"
+    return 1
+}
+
+# 版本检测入口：过低时询问是否升级；拒绝或失败则由 setup_vnstat 自动降级为 TZ=UTC 方案
+ensure_vnstat_version() {
+    local vnum; vnum="$(vnstat_get_ver)"
+    if [ -z "$vnum" ]; then
+        warn "无法检测 vnstat 版本号，跳过版本检测"
+        return 0
+    fi
+    if ! ver_lt "$vnum" "$MIN_VNSTAT_VER"; then
+        info "vnstat 版本 ${vnum} ≥ ${MIN_VNSTAT_VER}，支持 UseUTC，无需升级"
+        log_info "vnstat 版本检测通过：${vnum}（≥${MIN_VNSTAT_VER}）"
+        return 0
+    fi
+    warn "vnstat 版本 ${vnum} 过低（< ${MIN_VNSTAT_VER}），不支持 UseUTC 参数"
+    echo "    升级：源码编译安装新版（保留流量数据库与配置），UTC0 账单口径更规范"
+    echo "    不升级：自动改用 systemd 注入 TZ=UTC 方案（同样满足 UTC0 口径）"
+    local ans=""
+    read -r -p "  是否现在升级 vnstat？[Y/n]: " ans
+    if [ "$ans" != "n" ] && [ "$ans" != "N" ]; then
+        if upgrade_vnstat; then
+            return 0
+        fi
+        warn "升级失败，将自动改用 TZ=UTC 降级方案，监控功能不受影响"
+        log_warn "vnstat 升级失败，回退 TZ=UTC 方案"
+    else
+        info "已跳过升级，将使用 TZ=UTC 降级方案"
+        log_info "用户跳过 vnstat 升级，使用 TZ=UTC 降级方案"
+    fi
+    return 0
+}
+
+# 清理 vnstat.conf 中本脚本管理键的重复未注释行（保留最后一次出现，删除更早的重复项）
+dedupe_vnstat_conf() {
+    local key tmpf
+    tmpf="$(mktemp /tmp/vnstat-conf-dedupe.XXXXXX)"
+    cp -f "$VNSTAT_CONF" "$tmpf" || { rm -f "$tmpf"; return 1; }
+    for key in Interface UseUTC MonthRotate TrafficlessDays; do
+        # 统计未注释的重复行数，>1 才需要处理
+        local cnt
+        cnt="$(awk -v k="$key" '$0 ~ "^[ \t]*" k "[ \t]" {n++} END{print n+0}' "$tmpf")"
+        if [ "$cnt" -gt 1 ]; then
+            awk -v k="$key" '
+                { lines[NR] = $0 }
+                $0 ~ "^[ \t]*" k "[ \t]" { lastn = NR }
+                END {
+                    for (i = 1; i <= NR; i++) {
+                        if (lines[i] ~ "^[ \t]*" k "[ \t]" && i != lastn) continue
+                        print lines[i]
+                    }
+                }' "$tmpf" > "${tmpf}.new" && mv -f "${tmpf}.new" "$tmpf"
+            log_info "dedupe：清理 ${key} 重复配置行（原 ${cnt} 行，保留最后一次）"
+        fi
+    done
+    cp -f "$tmpf" "$VNSTAT_CONF"
+    rm -f "$tmpf"
+}
+
 setup_vnstat() {
     info "配置 vnstat（UTC0 时间基准 + 账单日轮转）..."
     [ -f "$VNSTAT_CONF" ] || die "未找到 ${VNSTAT_CONF}，vnstat 可能未正确安装"
 
-    # 严格 UTC0 口径：UseUTC 1 使数据库全部按 UTC 记录；MonthRotate 使月边界=账单日 UTC 零点
-    set_vnstat_conf "UseUTC" "1"
+    # 版本检测：UseUTC 需要 vnstat >= ${MIN_VNSTAT_VER}，老版本自动降级为 systemd 注入 TZ=UTC（等效 UTC0 口径）
+    local vnum="" use_utc=1
+    vnum="$(vnstat_get_ver)"
+    if [ -n "$vnum" ] && ver_lt "$vnum" "$MIN_VNSTAT_VER"; then
+        use_utc=0
+        warn "vnstat 版本 ${vnum} 不支持 UseUTC 参数（需 ≥${MIN_VNSTAT_VER}），改用 systemd 注入 TZ=UTC 实现 UTC0 口径"
+        log_warn "vnstat ${vnum} < ${MIN_VNSTAT_VER}，UseUTC 不可用，降级为 systemd TZ=UTC 方案"
+    fi
+
+    if [ "$use_utc" = "1" ]; then
+        # 严格 UTC0 口径：UseUTC 1 使数据库全部按 UTC 记录
+        set_vnstat_conf "UseUTC" "1"
+        rm -f /etc/systemd/system/vnstat.service.d/utc.conf
+    else
+        # 老版本：必须移除可能残留的 UseUTC 行（未知参数会导致 2.6 等旧版守护进程启动失败）
+        sed -i -E '/^[[:space:]]*UseUTC[[:space:]]/d' "$VNSTAT_CONF"
+        mkdir -p /etc/systemd/system/vnstat.service.d
+        printf '[Service]\nEnvironment="TZ=UTC"\n' > /etc/systemd/system/vnstat.service.d/utc.conf
+        log_info "已写入 systemd drop-in：/etc/systemd/system/vnstat.service.d/utc.conf (TZ=UTC)"
+    fi
+    # MonthRotate 使月边界=账单日 UTC 零点
     set_vnstat_conf "MonthRotate" "$BILLING_DAY"
     set_vnstat_conf "TrafficlessDays" "1"
     local first_if="${INTERFACES%%+*}"
@@ -461,18 +616,49 @@ setup_vnstat() {
     done
     IFS="$IFS_SAVE"
 
-    # 配置自检
-    if ! vnstat --configtest >>"$LOG_FILE" 2>&1; then
-        warn "vnstat 配置自检未通过，请检查 ${VNSTAT_CONF}（详见日志）"
-        log_warn "vnstat --configtest 未通过"
+    # 配置自检（--configtest 仅 vnstat ≥2.12 支持，老版本跳过）
+    # 失败时：打印详细原因 → 自动清理本脚本管理键的重复行 → 复检
+    if vnstat --help 2>&1 | grep -q -- '--configtest'; then
+        local ct_out="" ct_rc=0
+        ct_out="$(vnstat --configtest 2>&1)" || ct_rc=$?
+        if [ "$ct_rc" -ne 0 ]; then
+            warn "vnstat 配置自检未通过，详细输出如下（已写入日志）："
+            printf '%s\n' "$ct_out" | sed 's/^/    │ /'
+            { echo "--- configtest 输出（$(now_beijing)） ---"; printf '%s\n' "$ct_out"; } >>"$LOG_FILE"
+            info "尝试自动修复：清理 ${VNSTAT_CONF} 中重复的配置项..."
+            dedupe_vnstat_conf
+            ct_rc=0
+            ct_out="$(vnstat --configtest 2>&1)" || ct_rc=$?
+            if [ "$ct_rc" -eq 0 ]; then
+                ok "自动修复成功，配置自检已通过"
+                log_info "configtest 自动修复成功（清理重复配置项后复检通过）"
+            else
+                warn "自检仍未通过，vnstat 将忽略无效项继续加载（服务仍可运行），请根据上方输出手工检查 ${VNSTAT_CONF}"
+                printf '%s\n' "$ct_out" | sed 's/^/    │ /'
+                { echo "--- configtest 复检输出 ---"; printf '%s\n' "$ct_out"; } >>"$LOG_FILE"
+                log_warn "configtest 自动修复后仍未通过，详情见日志"
+            fi
+        else
+            log_info "vnstat --configtest 配置自检通过"
+        fi
     fi
 
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable vnstat >>"$LOG_FILE" 2>&1 || true
-    systemctl restart vnstat >>"$LOG_FILE" 2>&1 || die "vnstat 服务启动失败"
+    if ! systemctl restart vnstat >>"$LOG_FILE" 2>&1; then
+        journalctl -u vnstat --no-pager -n 20 >>"$LOG_FILE" 2>&1 || true
+        echo "----- vnstat 最近日志（排查用） -----"
+        journalctl -u vnstat --no-pager -n 20 2>/dev/null || true
+        echo "------------------------------------"
+        die "vnstat 服务启动失败，完整日志见 ${LOG_FILE}"
+    fi
     sleep 3
     if ! systemctl is-active --quiet vnstat; then
-        die "vnstat 服务未处于运行状态，请执行 systemctl status vnstat 排查"
+        journalctl -u vnstat --no-pager -n 20 >>"$LOG_FILE" 2>&1 || true
+        echo "----- vnstat 最近日志（排查用） -----"
+        journalctl -u vnstat --no-pager -n 20 2>/dev/null || true
+        echo "------------------------------------"
+        die "vnstat 服务未处于运行状态，完整日志见 ${LOG_FILE}"
     fi
     ok "vnstat 已配置并运行（UseUTC=1, MonthRotate=${BILLING_DAY}）"
     log_info "vnstat 配置完成并重启：UseUTC=1 MonthRotate=${BILLING_DAY} 网口=${INTERFACES}"
@@ -481,12 +667,34 @@ setup_vnstat() {
 
 install_script() {
     mkdir -p "$(dirname "$INSTALL_PATH")"
-    if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ]; then
-        cp -f "$SCRIPT_PATH" "$INSTALL_PATH"
+    local src="$SCRIPT_PATH" tmp_downloaded=""
+
+    # 管道执行场景（如 curl | bash）：$0 指向 /proc/*/fd/pipe:*，无实体文件可复制
+    if [ ! -f "$src" ]; then
+        warn "检测到脚本经管道方式运行（无本地实体文件），尝试从仓库拉取脚本本体..."
+        log_warn "install_script：SCRIPT_PATH 非实体文件（${src}），尝试从仓库下载"
+        tmp_downloaded="$(mktemp /tmp/traffic-monitor-install.XXXXXX)"
+        if curl -fsSL --connect-timeout 15 --max-time 120 "${REPO_URL}?nocache=$(date +%s)$RANDOM" -o "$tmp_downloaded" \
+            && [ -s "$tmp_downloaded" ] && head -n1 "$tmp_downloaded" | grep -qE '^#!.*bash' \
+            && bash -n "$tmp_downloaded" 2>/dev/null; then
+            src="$tmp_downloaded"
+        else
+            rm -f "$tmp_downloaded"
+            die "无法安装脚本本体：管道运行时仓库拉取失败。请先将脚本保存为本地文件再执行（如：curl -o traffic-monitor.sh ${REPO_URL} && bash traffic-monitor.sh），否则定时任务将因 ${INSTALL_PATH} 缺失而失效"
+        fi
     fi
-    chmod +x "$INSTALL_PATH"
-    ok "脚本已安装至 ${INSTALL_PATH}"
-    log_info "脚本已安装至 ${INSTALL_PATH}（版本 ${VERSION}）"
+
+    if [ "$src" != "$INSTALL_PATH" ]; then
+        cp -f "$src" "$INSTALL_PATH" || die "复制脚本到 ${INSTALL_PATH} 失败"
+    fi
+    [ -n "$tmp_downloaded" ] && rm -f "$tmp_downloaded"
+    chmod +x "$INSTALL_PATH" 2>/dev/null || die "chmod ${INSTALL_PATH} 失败"
+    # 安装结果强校验：确保 cron 指向的脚本真实存在且语法有效
+    if [ ! -f "$INSTALL_PATH" ] || ! bash -n "$INSTALL_PATH" 2>/dev/null; then
+        die "脚本安装校验失败：${INSTALL_PATH} 不存在或语法无效"
+    fi
+    ok "脚本已安装至 ${INSTALL_PATH}（已校验存在且语法有效）"
+    log_info "脚本已安装至 ${INSTALL_PATH}（版本 ${VERSION}，校验通过）"
 }
 
 setup_cron() {
@@ -532,6 +740,7 @@ do_install() {
     log_info "===== 开始${mode} ====="
 
     install_deps
+    ensure_vnstat_version
     set_timezone
     prompt_config
     setup_vnstat
@@ -673,8 +882,8 @@ do_status() {
     local used pct remain
     used="$(get_used_bytes)" || die "读取 vnstat 流量数据失败（vnstatd 可能刚启动，请稍后再试）"
     pct="$(calc_pct "$used" "$MONTHLY_LIMIT_GB")"
-    remain="$(awk -v u="$used" -v l="$MONTHLY_LIMIT_GB" -v m="${UNIT_MODE}" 'BEGIN{
-        div=(m=="iec")?1024*1024*1024:1000*1000*1000; r=l*div-u; if(r<0)r=0; printf "%.2f", r/div }')"
+    remain="$(awk -v u="$used" -v l="$MONTHLY_LIMIT_GB" 'BEGIN{
+        r = l*1000000000 - u; if (r < 0) r = 0; printf "%.2f", r/1000000000 }')"
 
     echo
     echo "════════════ 当前流量数据 ════════════"
@@ -746,8 +955,14 @@ do_uninstall() {
         systemctl reload cron >>"$LOG_FILE" 2>&1 || systemctl restart cron >>"$LOG_FILE" 2>&1 || service cron restart >>"$LOG_FILE" 2>&1 || true
         ok "定时任务已清理（${CRON_FILE}）"
     fi
-    # 2. 清理配置/状态/锁
+    # 2. 清理配置/状态/锁/systemd drop-in
     rm -rf "$CONF_DIR" "$STATE_DIR" "$LOCK_FILE"
+    if [ -f /etc/systemd/system/vnstat.service.d/utc.conf ]; then
+        rm -f /etc/systemd/system/vnstat.service.d/utc.conf
+        rmdir /etc/systemd/system/vnstat.service.d 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        ok "vnstat 的 systemd TZ=UTC drop-in 已清理"
+    fi
     ok "配置文件与状态文件已清理"
     # 3. 是否连同 vnstat 一并卸载（可选）
     read -r -p "是否同时卸载 vnstat 本体及其流量数据库？[y/N]: " ans2
@@ -827,6 +1042,15 @@ main() {
         status|show)     shift || true; do_status ;;
         test)            shift || true; do_report ;;
         update|upgrade)  shift || true; do_update ;;
+        vnstat-upgrade)
+            shift || true
+            check_root
+            ensure_vnstat_version
+            if load_config; then
+                setup_vnstat
+                ok "vnstat 配置已按当前版本重新应用（UseUTC/MonthRotate）"
+            fi
+            ;;
         uninstall|remove) shift || true; do_uninstall ;;
         version|-v|--version) echo "traffic-monitor v${VERSION}" ;;
         help|-h|--help)
