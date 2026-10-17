@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.8
+# vnstat 流量监控助手 v2.9
 #===============================================================================
 set -u
 
-VERSION="2.8"
+VERSION="2.9"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
 VNSTAT_FALLBACK_VER="2.12"
@@ -135,6 +135,12 @@ tg_send_retry() {
 }
 
 get_used_bytes() {
+    local json rx tx
+    # 直接使用组合接口名称查询，不再拆分
+    json="$(vnstat --json d -i "$INTERFACES" 2>/dev/null)" || return 1
+    [ -z "$json" ] && return 1
+    
+    # 获取当前 UTC 年月日
     local cur_y cur_m cur_d
     read -r cur_y cur_m cur_d <<< "$(TZ=UTC date +'%Y %m %d')"
     cur_m=$((10#$cur_m)); cur_d=$((10#$cur_d))
@@ -151,27 +157,34 @@ get_used_bytes() {
             start_y=$((start_y - 1))
         fi
     fi
-    local start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    local rx=0 tx=0
-    local iface r t
+    local start_date_str
+    start_date_str=$(printf "%04d-%02d-%02d" "$start_y" "$start_m" "$BILLING_DAY")
     
-    for iface in $(echo "$INTERFACES" | tr '+' ' '); do
-        local json
-        json="$(vnstat --json d -i "$iface" 2>/dev/null)"
-        if [ -n "$json" ]; then
-            # 使用 jq 提取，利用 id (如 "2026-10-17") 直接做字符串对比
-            local res
-            res="$(echo "$json" | jq -r --arg s "$start_date_str" '
-                [ .interfaces[].traffic.days[]? | select(.id >= $s) ] 
-                | "\(map(.rx // 0) | add // 0) \(map(.tx // 0) | add // 0)"
-            ' 2>/dev/null)"
-            read -r r t <<< "$res"
-            rx=$((rx + ${r:-0}))
-            tx=$((tx + ${t:-0}))
-        fi
-    done
+    # 通过 jq 极强的兼容性处理：不管返回一个还是多个接口，自动扁平化；不管有没有 id，自动按日期拼接比对
+    rx="$(echo "$json" | jq --arg s "$start_date_str" '
+        [ .interfaces[]?.traffic.days[]? 
+          | . as $d
+          | (if $d.id then $d.id 
+             else "\($d.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end)-\($d.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end)-\($d.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)" 
+             end) as $dayid
+          | select($dayid >= $s)
+          | $d.rx // 0 
+        ] | add // 0
+    ' 2>/dev/null)"
     
+    tx="$(echo "$json" | jq --arg s "$start_date_str" '
+        [ .interfaces[]?.traffic.days[]? 
+          | . as $d
+          | (if $d.id then $d.id 
+             else "\($d.date.year | tostring | if length < 4 then ("0000" + .)[-4:] else . end)-\($d.date.month | tostring | if length < 2 then ("0" + .)[-2:] else . end)-\($d.date.day | tostring | if length < 2 then ("0" + .)[-2:] else . end)" 
+             end) as $dayid
+          | select($dayid >= $s)
+          | $d.tx // 0 
+        ] | add // 0
+    ' 2>/dev/null)"
+    
+    rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
     case "$TRAFFIC_TYPE" in
         1) echo $((rx + tx)) ;;
