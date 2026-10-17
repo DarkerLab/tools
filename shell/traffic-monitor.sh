@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v1.6
+# vnstat 流量监控助手 v1.7
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -13,7 +13,7 @@
 #===============================================================================
 set -u
 
-VERSION="1.6"
+VERSION="1.7"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
 VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
@@ -117,7 +117,6 @@ validate_config() {
         die "配置缺失或不完整:${missing}，请先执行「安装部署/修改配置」"
     fi
     case "$TRAFFIC_TYPE" in 1|2|3) ;; *) die "TRAFFIC_TYPE 非法（应为 1/2/3）";; esac
-    case "${UNIT_MODE:-si}" in si|iec) ;; *) die "UNIT_MODE 非法（应为 si/iec）";; esac
     if ! awk -v v="$MONTHLY_LIMIT_GB" 'BEGIN{exit !(v>0)}'; then
         die "MONTHLY_LIMIT_GB 非法（应为大于 0 的数值）"
     fi
@@ -230,24 +229,21 @@ get_period_info() {
     return 0
 }
 
-# 字节数转动态单位（B, KB, MB, GB）
+# 字节数转动态单位（B, KB, MB, GB） - 固定 1000^3 口径
 fmt_traffic() {
     local b="$1"
-    local m="${UNIT_MODE:-si}"
-    awk -v b="$b" -v m="$m" 'BEGIN{
-        div = (m=="iec") ? 1024 : 1000;
-        if (b < div) printf "%.2f B", b;
-        else if (b < div*div) printf "%.2f KB", b/div;
-        else if (b < div*div*div) printf "%.2f MB", b/(div*div);
-        else printf "%.2f GB", b/(div*div*div);
+    awk -v b="$b" 'BEGIN{
+        if (b < 1000) printf "%.2f B", b;
+        else if (b < 1000000) printf "%.2f KB", b/1000;
+        else if (b < 1000000000) printf "%.2f MB", b/1000000;
+        else printf "%.2f GB", b/1000000000;
     }'
 }
 
-# 计算百分比（根据配置的 UNIT_MODE）
+# 计算百分比（固定 1000^3 口径）
 calc_pct() {
-    awk -v u="$1" -v l="$2" -v m="${UNIT_MODE:-si}" 'BEGIN{
-        div = (m=="iec") ? 1073741824 : 1000000000;
-        limit = l * div;
+    awk -v u="$1" -v l="$2" 'BEGIN{
+        limit = l * 1000000000;
         if (limit <= 0) { print "0.00"; exit }
         printf "%.2f", u/limit*100
     }'
@@ -273,13 +269,11 @@ now_beijing() { TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S'; }
 
 build_report_msg() {
     local used="$1" pct="$2"
-    local unit_str="GB"
-    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
     cat <<EOF
 📊 每日流量报告
 ━━━━━━━━━━━━━━━
 🖥 服务器：${SERVER_NAME}
-📶 计费流量：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）
+📶 计费流量：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} GB（${pct}%）
 🔼 上传：$(fmt_traffic "${TX_BYTES:-0}")   🔽 下载：$(fmt_traffic "${RX_BYTES:-0}")
 📋 统计类型：$(traffic_type_name "$TRAFFIC_TYPE")
 🗓 账单周期：${PERIOD_START}（UTC0）起 至当前
@@ -290,13 +284,11 @@ EOF
 
 build_warn_msg() {
     local used="$1" pct="$2"
-    local unit_str="GB"
-    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
     cat <<EOF
 ⚠️ 流量预警通知（已达 ${pct}%）
 ━━━━━━━━━━━━━━━
 🖥 服务器：${SERVER_NAME}
-📶 计费流量：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）
+📶 计费流量：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} GB（${pct}%）
 🚨 预警阈值：${WARN_PCT}%（已触发）  关机阈值：${SHUTDOWN_PCT}%
 🗓 账单周期：${PERIOD_START}（UTC0）起 至当前
 请尽快处理，达到 ${SHUTDOWN_PCT}% 将自动关机！
@@ -306,13 +298,11 @@ EOF
 
 build_shutdown_msg() {
     local used="$1" pct="$2"
-    local unit_str="GB"
-    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
     cat <<EOF
 🛑 流量超限关机通知（已达 ${pct}%）
 ━━━━━━━━━━━━━━━
 🖥 服务器：${SERVER_NAME}
-📶 计费流量：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）
+📶 计费流量：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} GB（${pct}%）
 🚨 已触达关机阈值 ${SHUTDOWN_PCT}%，服务器将在 30 秒后执行自动关机！
 🗓 账单周期：${PERIOD_START}（UTC0）起 至当前
 🕗 时间：$(now_beijing)（北京时间）
@@ -447,7 +437,7 @@ prompt_config() {
 
     def="${MONTHLY_LIMIT_GB:-}"
     while true; do
-        read -r -p "每月总流量限额（GB/GiB）[${def:-必填}]: " val
+        read -r -p "每月总流量限额（GB）[${def:-必填}]: " val
         MONTHLY_LIMIT_GB="${val:-$def}"
         if [ -n "$MONTHLY_LIMIT_GB" ] && awk -v v="$MONTHLY_LIMIT_GB" 'BEGIN{exit !(v>0)}'; then
             break
@@ -455,19 +445,13 @@ prompt_config() {
         warn "限额必须为大于 0 的数值，请重新输入"
     done
 
-    def="${UNIT_MODE:-si}"
-    echo "流量单位口径：si=GB(1000^3，与多数商家计费一致)  iec=GiB(1024^3)"
-    read -r -p "请选择 [${def}]: " val
-    UNIT_MODE="${val:-$def}"
-    case "$UNIT_MODE" in si|iec) ;; *) UNIT_MODE="si" ;; esac
-
     WARN_PCT="${WARN_PCT:-$DEF_WARN_PCT}"
     SHUTDOWN_PCT="${SHUTDOWN_PCT:-$DEF_SHUTDOWN_PCT}"
     CHECK_INTERVAL="${CHECK_INTERVAL:-$DEF_CHECK_INTERVAL}"
 
     echo "────────────────────────────────────────────────────────────────"
     info "配置预览：服务器=${SERVER_NAME} 网口=${INTERFACES} 重置日=${BILLING_DAY}(UTC0) 类型=$(traffic_type_name "$TRAFFIC_TYPE")"
-    info "          限额=${MONTHLY_LIMIT_GB}(${UNIT_MODE}) 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}% 检查间隔=${CHECK_INTERVAL}分钟"
+    info "          限额=${MONTHLY_LIMIT_GB}GB 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}% 检查间隔=${CHECK_INTERVAL}分钟"
 }
 
 save_config() {
@@ -482,14 +466,13 @@ TRAFFIC_TYPE="${TRAFFIC_TYPE}"
 TG_BOT_TOKEN="${TG_BOT_TOKEN}"
 TG_CHAT_ID="${TG_CHAT_ID}"
 MONTHLY_LIMIT_GB="${MONTHLY_LIMIT_GB}"
-UNIT_MODE="${UNIT_MODE}"
 WARN_PCT="${WARN_PCT}"
 SHUTDOWN_PCT="${SHUTDOWN_PCT}"
 CHECK_INTERVAL="${CHECK_INTERVAL}"
 EOF
     chmod 600 "$CONF_FILE"
     ok "配置已保存至 ${CONF_FILE}"
-    log_info "配置已保存：网口=${INTERFACES} 重置日=${BILLING_DAY} 类型=${TRAFFIC_TYPE} 限额=${MONTHLY_LIMIT_GB} 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}%"
+    log_info "配置已保存：网口=${INTERFACES} 重置日=${BILLING_DAY} 类型=${TRAFFIC_TYPE} 限额=${MONTHLY_LIMIT_GB}GB 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}%"
 }
 
 vnstat_get_ver() {
@@ -748,7 +731,7 @@ do_report() {
     pct="$(calc_pct "$used" "$MONTHLY_LIMIT_GB")"
     msg="$(build_report_msg "$used" "$pct")"
 
-    log_info "每日报告：服务器=${SERVER_NAME} 周期=${PERIOD_ID}(${PERIOD_START} UTC) 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB} (${pct}%)"
+    log_info "每日报告：服务器=${SERVER_NAME} 周期=${PERIOD_ID}(${PERIOD_START} UTC) 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%)"
     if tg_send_retry "$msg"; then
         ok "每日流量报告已推送"
     else
@@ -779,7 +762,7 @@ do_check() {
 
     # ---- 95% 关机流程 ----
     if pct_ge "$pct" "$SHUTDOWN_PCT"; then
-        log_warn "触发关机阈值：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB} (${pct}%) >= ${SHUTDOWN_PCT}%"
+        log_warn "触发关机阈值：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%) >= ${SHUTDOWN_PCT}%"
         local msg; msg="$(build_shutdown_msg "$used" "$pct")"
         if tg_send_retry "$msg" 2; then
             log_info "关机通知发送成功"
@@ -799,7 +782,7 @@ do_check() {
             log_warn "关机前复核：当前 ${pct2}% 未达 ${SHUTDOWN_PCT}%（账单周期可能已重置），中止关机"
             if tg_send "ℹ️ 关机已中止
 服务器：${SERVER_NAME}
-复核流量：$(fmt_traffic "$used2") / ${MONTHLY_LIMIT_GB}（${pct2}%），未达关机阈值 ${SHUTDOWN_PCT}%（账单周期可能已重置）。
+复核流量：$(fmt_traffic "$used2") / ${MONTHLY_LIMIT_GB}GB（${pct2}%），未达关机阈值 ${SHUTDOWN_PCT}%（账单周期可能已重置）。
 时间：$(now_beijing)（北京时间）"; then
                 log_info "关机中止通知发送成功"
             fi
@@ -831,7 +814,7 @@ do_check() {
             log_info "已达预警阈值 ${pct}%（周期 ${PERIOD_ID} 已推送过预警，跳过）"
             exit 0
         fi
-        log_warn "触发预警阈值：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB} (${pct}%) >= ${WARN_PCT}%"
+        log_warn "触发预警阈值：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%) >= ${WARN_PCT}%"
         local msg; msg="$(build_warn_msg "$used" "$pct")"
         if tg_send_retry "$msg" 2; then
             WARN_PERIOD="$PERIOD_ID"
@@ -843,7 +826,7 @@ do_check() {
         exit 0
     fi
 
-    log_info "阈值检查正常：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB} (${pct}%)"
+    log_info "阈值检查正常：周期=${PERIOD_ID} 已用=$(fmt_traffic "$used")/${MONTHLY_LIMIT_GB}GB (${pct}%)"
 }
 
 #===============================================================================
@@ -853,16 +836,15 @@ do_status() {
     load_config || die "未找到配置文件，请先执行安装部署"
     validate_config
     get_period_info || true
-    local used pct remain unit_str="GB"
-    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
+    local used pct remain
     
     used="$(get_used_bytes)" || die "读取 vnstat 流量数据失败（vnstatd 可能刚启动，请稍后再试）"
     pct="$(calc_pct "$used" "$MONTHLY_LIMIT_GB")"
     
-    remain="$(awk -v u="$used" -v l="$MONTHLY_LIMIT_GB" -v m="${UNIT_MODE:-si}" 'BEGIN{
-        div=(m=="iec")?1024*1024*1024:1000*1000*1000; r=l*div-u; if(r<0)r=0; 
-        if (r < div && r > 0) printf "%.2f MB", r/(div/1000); 
-        else printf "%.2f %s", r/div, (m=="iec"?"GiB":"GB") 
+    remain="$(awk -v u="$used" -v l="$MONTHLY_LIMIT_GB" 'BEGIN{
+        r=l*1000000000-u; if(r<0)r=0; 
+        if (r < 1000000000 && r > 0) printf "%.2f MB", r/1000000; 
+        else printf "%.2f GB", r/1000000000 
     }')"
 
     echo
@@ -871,7 +853,7 @@ do_status() {
     echo "  监控网口   ：${INTERFACES}"
     echo "  账单周期   ：${PERIOD_ID}（自 ${PERIOD_START} UTC0 起，重置日：每月 ${BILLING_DAY} 日）"
     echo "  统计类型   ：$(traffic_type_name "$TRAFFIC_TYPE")"
-    echo "  已用流量   ：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）"
+    echo "  已用流量   ：$(fmt_traffic "$used") / ${MONTHLY_LIMIT_GB} GB（${pct}%）"
     echo "  剩余流量   ：${remain}"
     echo "  上传/下载  ：$(fmt_traffic "${TX_BYTES:-0}") / $(fmt_traffic "${RX_BYTES:-0}")"
     echo "  预警阈值   ：${WARN_PCT}%    关机阈值：${SHUTDOWN_PCT}%"
@@ -969,7 +951,7 @@ show_menu() {
     local cfg_tip="未配置"
     if [ -f "$CONF_FILE" ]; then
         # shellcheck disable=SC1090
-        cfg_tip="$(. "$CONF_FILE"; echo "${SERVER_NAME:-?} | ${INTERFACES:-?} | 限额${MONTHLY_LIMIT_GB:-?}${UNIT_MODE:-si}")"
+        cfg_tip="$(. "$CONF_FILE"; echo "${SERVER_NAME:-?} | ${INTERFACES:-?} | 限额${MONTHLY_LIMIT_GB:-?}GB")"
     fi
     cat <<EOF
 
