@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v2.6
+# vnstat 流量监控助手 v2.7
 #===============================================================================
 set -u
 
-VERSION="2.6"
+VERSION="2.7"
 # ⚠️ 请确保这里是你自己的 GitHub 仓库地址！
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"
@@ -159,9 +159,8 @@ get_used_bytes() {
     
     local rx=0 tx=0
     local iface r t
-    local IFS_SAVE="$IFS"
-    IFS='+'
-    for iface in $INTERFACES; do
+    # 修复 IFS 污染，改用 tr 转换空格拆分
+    for iface in $(echo "$INTERFACES" | tr '+' ' '); do
         local db
         db="$(vnstat --dumpdb -i "$iface" 2>/dev/null)"
         if [ -n "$db" ]; then
@@ -175,7 +174,6 @@ get_used_bytes() {
             tx=$((tx + t))
         fi
     done
-    IFS="$IFS_SAVE"
     
     RX_BYTES="$rx"; TX_BYTES="$tx"
     case "$TRAFFIC_TYPE" in
