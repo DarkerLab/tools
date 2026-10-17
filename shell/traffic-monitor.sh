@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.5
+# 版    本 : v1.5 (Final)
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
-#   v1.5 流量统计口径改为 1000 进制(SI)；
-#        修复 v1.4 遗留的"新库误报历史缺失"问题；
-#        新增在线管道执行拦截（自动保存并提权重新执行），防止 crontab 写入
-#        临时路径 /proc/fd/... 导致任务失效；cmd_update 禁止覆盖管道。
+#   v1.5 Final
+#        [修复] 管道执行拦截增加 root 权限检查，避免非 root 写入失败误导。
+#        [修复] 关机命令增加降级机制 (shutdown -> poweroff -> systemctl)。
+#        [修复] 自动更新改用 .new + mv 原子替换，避免 Text file busy。
+#   v1.5 流量统计口径改为 1000 进制(SI)；修复新库误报；新增在线管道执行
+#        拦截；日报/预警/关机警报格式大幅精简。
 #   v1.4 按代码审查意见全面修复（同前）
 #   v1.3 全面代码审查重写（同前）
 #   v1.2 修复 vnStat 2.x JSON 结构解析（同前）
@@ -42,6 +44,13 @@ MAX_LOG_SIZE=$((5*1024*1024))   # 日志超过 5MB 自动截断
 # 拦截在线管道执行（自动保存并重启）
 #===============================================================================
 if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] || [ "$0" = "bash" ] || [ "$0" = "sh" ]; then
+    # 修复1: 强制要求 root 权限，否则无法自动写入本地文件
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "\033[31m[错误] 检测到在线临时运行。由于需要将脚本固化到本地，请使用 root 权限重新执行：\033[0m"
+        echo -e "\033[31m       sudo bash <(curl -sL $UPDATE_URL)\033[0m"
+        exit 1
+    fi
+
     _real_target="/usr/local/bin/traffic-monitor.sh"
     if [ -f "$_real_target" ] && [ "$_real_target" != "$SCRIPT_PATH" ]; then
         _real_target="/root/traffic-monitor.sh"
@@ -171,7 +180,6 @@ validate_config() {
 #===============================================================================
 PARSE_ERROR=0
 
-# 计算当前账单周期起始日期（UTC）
 cycle_start_date() {
     local rd=$((10#$RESET_DAY)) y m d dim eff pfirst pdim peff
     y=$(date -u +%Y); m=$(date -u +%m); d=$((10#$(date -u +%d)))
@@ -304,42 +312,32 @@ tg_send() {
 }
 
 #===============================================================================
-# 日报 / 测试推送
+# 正式日报推送（极简格式）
 #===============================================================================
 build_report() {
-    local used_bytes percent start now_bj now_utc warn="" cover cov_earliest
+    local used_bytes percent now_utc warn="" cover
     PARSE_ERROR=0
     used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
     if [ "$PARSE_ERROR" -eq 1 ]; then
         warn="
-⚠️ <b>数据解析异常</b>：未能从 vnStat 读取账单周期流量，数值不可信，请登录服务器使用【环境自检】检查"
-    fi
-    percent=$(calc_percent "${used_bytes:-0}")
-    start=$(cycle_start_date)
-    now_bj=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')
-    now_utc=$(date -u '+%Y-%m-%d %H:%M')
-    if [ "$PARSE_ERROR" -eq 0 ]; then
-        cover=$(check_day_coverage "$start")
+⚠️ 数据解析异常，请登录检查"
+    else
+        cover=$(check_day_coverage "$(cycle_start_date)")
         case "$cover" in
-            missing:*)
-                cov_earliest=${cover#missing:}
-                warn="${warn}
-ℹ️ vnStat 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}，早于此的周期流量无法统计（历史明细缺失），可用【重置 vnStat 数据库】获得干净口径"
-                ;;
-            newdb)
-                warn="${warn}
-ℹ️ vnStat 数据库为新建/刚重置，日明细从今日起记录，周期统计从今天开始累积（属正常）"
-                ;;
+            missing:*) warn="
+ℹ️ 历史明细缺失，统计可能偏低" ;;
+            newdb)     warn="
+ℹ️ 新建库，从今日起统计" ;;
         esac
     fi
+    percent=$(calc_percent "${used_bytes:-0}")
+    now_utc=$(date -u '+%Y-%m-%d %H:%M')
+
     cat <<EOF
-📊 <b>Traffic Daily Report</b>
-━━━━━━━━━━━━━━━
-🖥 服务器: <b>$(html_escape "$SERVER_NAME")</b>
-📡 网口: $(html_escape "$IFACE") | 类型: $(stat_type_name)
-📈 已用: <b>$(human_bytes "${used_bytes:-0}")</b> / $(html_escape "$LIMIT_GB") GB (<b>${percent}%</b>)
-🔄 账单周期: ${start} 起 (UTC)
-⏰ 时间: ${now_bj} (北京时间) / ${now_utc} (UTC)${warn}
+📊 [$(html_escape "$SERVER_NAME")]每日流量日报
+
+- 周期用量: $(human_bytes "${used_bytes:-0}") / $(html_escape "$LIMIT_GB") GB (${percent}%)
+- 统计时间: ${now_utc} (UTC)${warn}
 EOF
 }
 
@@ -356,14 +354,42 @@ cmd_daily() {
     fi
 }
 
+#===============================================================================
+# 测试推送（保留全量信息，用于排障）
+#===============================================================================
 cmd_test_push() {
     check_root
     load_config || die "尚未安装配置，请先执行【1. 安装部署/修改配置】"
     validate_config
     echo "正在发送测试日报..."
-    local msg
-    msg="$(build_report)
-✅ <i>这是一条测试消息</i>"
+    local used_bytes percent start now_bj now_utc status_msg cover
+    PARSE_ERROR=0
+    used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
+    percent=$(calc_percent "${used_bytes:-0}")
+    start=$(cycle_start_date)
+    now_bj=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M')
+    now_utc=$(date -u '+%Y-%m-%d %H:%M')
+
+    if [ "$PARSE_ERROR" -eq 1 ]; then
+        status_msg="异常(无法解析)"
+    else
+        cover=$(check_day_coverage "$start")
+        case "$cover" in
+            missing:*) status_msg="历史明细缺失(可能偏低)" ;;
+            newdb)     status_msg="新建库(从今日起统计)" ;;
+            *)         status_msg="正常" ;;
+        esac
+    fi
+
+    local msg="📊 [$(html_escape "$SERVER_NAME")]每日流量日报 (测试)
+
+- 周期用量: $(human_bytes "${used_bytes:-0}") / $(html_escape "$LIMIT_GB") GB (${percent}%)
+- 账单周期: ${start} 起 (UTC)
+- 监控网口: $(html_escape "$IFACE") ($(stat_type_name))
+- 统计时间: ${now_utc} (UTC) / ${now_bj} (北京)
+- 数据库状态: ${status_msg}
+✅ 这是一条测试消息"
+
     if tg_send "$msg"; then
         c_green "✔ 测试推送成功，请到 Telegram 查收"
         log "OK" "测试日报推送成功"
@@ -406,12 +432,12 @@ cmd_check() {
         log "WARN" "流量达到关机阈值: ${percent}% ($(human_bytes "$used_bytes")/${LIMIT_GB}GB)"
         echo "$start" > "$LOCK_SHUTDOWN"
 
-        local msg="🚨 <b>关机警报</b>
-━━━━━━━━━━━━━━━
-🖥 服务器: <b>$(html_escape "$SERVER_NAME")</b>
-📈 已用: <b>$(human_bytes "$used_bytes")</b> / $(html_escape "$LIMIT_GB") GB (<b>${percent}%</b>)
-⚠️ 已达 95% 关机阈值，服务器将在 <b>1 分钟</b> 后自动关机！
-⏰ $(date -u '+%Y-%m-%d %H:%M') UTC"
+        local msg="🚨 [$(html_escape "$SERVER_NAME")]关机警报 (95%)
+
+- 周期用量: $(human_bytes "$used_bytes") / $(html_escape "$LIMIT_GB") GB (${percent}%)
+- 统计时间: $(date -u '+%Y-%m-%d %H:%M') (UTC)
+⚠️ 服务器将在 1 分钟后自动关机"
+        
         if tg_send "$msg"; then
             log "OK" "关机报警推送成功"
         else
@@ -437,9 +463,20 @@ cmd_check() {
 
         if awk -v p="$percent" 'BEGIN{exit !(p >= 95)}'; then
             log "WARN" "二次确认通过（${percent}% ≥95%，周期 ${new_start}），执行关机命令"
-            tg_send "⛔ 服务器 <b>$(html_escape "$SERVER_NAME")</b> 二次确认 ${percent}% ≥95%，正在执行关机... $(date -u '+%Y-%m-%d %H:%M') UTC" >/dev/null 2>&1
+            tg_send "⛔ [$(html_escape "$SERVER_NAME")] 确认 ${percent}% ≥95%，正在执行关机... ($(date -u '+%Y-%m-%d %H:%M') UTC)" >/dev/null 2>&1
             sync
-            if shutdown -h now "traffic-monitor: 流量达到 95% 阈值，自动关机"; then
+            
+            # 修复2: 三级降级关机机制
+            local shutdown_success=0
+            if command -v shutdown >/dev/null 2>&1; then
+                shutdown -h now "traffic-monitor: 流量达到 95% 阈值，自动关机" && shutdown_success=1
+            elif command -v poweroff >/dev/null 2>&1; then
+                poweroff && shutdown_success=1
+            else
+                systemctl poweroff && shutdown_success=1
+            fi
+
+            if [ "$shutdown_success" -eq 1 ]; then
                 log "OK" "关机命令已下发"
                 exit 0
             else
@@ -454,17 +491,15 @@ cmd_check() {
         exit 0
     fi
 
-    # ---- 90% 预警（每周期仅首次触发） ----
+    # ---- 90% 预警（每周期仅首次触发，极简） ----
     if awk -v p="$percent" 'BEGIN{exit !(p >= 90)}'; then
         load_state
         if [ "$WARNED_CYCLE" != "$start" ]; then
             log "WARN" "流量达到预警阈值: ${percent}%，周期 ${start}，首次触发推送"
-            local msg="⚠️ <b>流量预警</b>
-━━━━━━━━━━━━━━━
-🖥 服务器: <b>$(html_escape "$SERVER_NAME")</b>
-📈 已用: <b>$(human_bytes "$used_bytes")</b> / $(html_escape "$LIMIT_GB") GB (<b>${percent}%</b>)
-🔔 已达 90% 预警阈值，请注意流量使用（95% 将自动关机）
-⏰ $(date -u '+%Y-%m-%d %H:%M') UTC"
+            local msg="⚠️ [$(html_escape "$SERVER_NAME")]流量预警 (90%)
+
+- 周期用量: $(human_bytes "$used_bytes") / $(html_escape "$LIMIT_GB") GB (${percent}%)
+- 统计时间: $(date -u '+%Y-%m-%d %H:%M') (UTC)"
             if tg_send "$msg"; then
                 save_state_var "WARNED_CYCLE" "$start"
                 log "OK" "90% 预警推送成功（本周期不再重复推送）"
@@ -666,7 +701,6 @@ interactive_config() {
 install_cron() {
     echo "→ 创建/更新定时任务 ..."
 
-    # 防止意外把 /proc/xxx 写进去
     if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]]; then
         die "脚本路径异常 ($SCRIPT_PATH)，无法配置定时任务！请将脚本保存为本地文件后再试。"
     fi
@@ -838,7 +872,7 @@ cmd_update() {
     fi
 
     echo "→ 正在从 GitHub 拉取最新脚本（强制刷新，绕过 CDN 缓存）..."
-    local tmp url
+    local tmp url newver
     tmp=$(mktemp)
     url="${UPDATE_URL}?t=$(date +%s)$RANDOM"
     if ! curl -fsSL -m 60 \
@@ -851,9 +885,12 @@ cmd_update() {
     [ -s "$tmp" ] || { rm -f "$tmp"; die "下载内容为空"; }
     head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; c_red "下载内容不是有效脚本（可能是 GitHub 404 页面）"; head -n3 "$tmp"; die "已放弃更新"; }
     bash -n "$tmp" || { rm -f "$tmp"; die "新脚本语法校验未通过，已放弃更新"; }
-    cp -f "$tmp" "$SCRIPT_PATH" && chmod +x "$SCRIPT_PATH"
+    
+    # 修复3: 先放到 .new 文件，再原子替换，避免 Text file busy
+    cp -f "$tmp" "${SCRIPT_PATH}.new" && chmod +x "${SCRIPT_PATH}.new" && mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
     rm -f "$tmp"
-    local newver; newver=$(grep -m1 '^VERSION=' "$SCRIPT_PATH" | cut -d'"' -f2)
+    
+    newver=$(grep -m1 '^VERSION=' "$SCRIPT_PATH" | cut -d'"' -f2)
     c_green "✔ 脚本已更新至 ${newver:-未知}（原版本 $VERSION）: $SCRIPT_PATH"
     log "OK" "脚本已从 GitHub 更新: $VERSION → ${newver:-未知}"
     echo "  提示: 建议执行【6. 环境自检】确认新版本生效"
