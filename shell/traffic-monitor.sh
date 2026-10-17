@@ -1,9 +1,23 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.3
+# 版    本 : v1.4
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
+#   v1.4 按代码审查意见全面修复:
+#        [必修] cycle_start_date 短月末日判断错误(重置日>当月天数时)导致
+#               周期起点算错、阈值误触发；配置文件写入未转义(含 " $ ` 会
+#               破坏配置甚至 RCE)；install_cron 未确保脚本可执行位
+#        [应修] 95% 关机命令失败后锁不释放导致本周期永不重试；cmd_check
+#               未用 flock 保护并发(95% 分支 sleep 60 必然重叠)；cmd_show
+#               缺口语义写反；install_deps 每次强制 apt update/重装
+#        [改进] setup_vnstat_utc 删死代码；install_cron 路径加引号；
+#               cmd_show 浮点比较改 awk；load_state source 失败兜底；
+#               cmd_test_push/cmd_show 加 check_root，cmd_diag 软提示；
+#               setup_timezone 回退路径检查写入结果；cmd_reset_db 补充说明；
+#               tg_send 提取 Telegram 错误 description；关机二次确认加入
+#               周期切换判断；validate_config 严格校验 LIMIT_GB 数值；
+#               卸载日志备份从 /tmp 迁至 $HOME
 #   v1.3 全面代码审查重写；新增环境自检(diag)与 vnStat 数据库重置；
 #        账单周期日明细缺口检测提示；HTML 特殊字符转义；非 tty 防护；
 #        兼容 cron 服务名差异(cron/crond)
@@ -24,7 +38,7 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.3"
+VERSION="v1.4"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -96,8 +110,12 @@ load_config() {
 }
 
 load_state() {
-    WARNED_CYCLE="${WARNED_CYCLE:-}"
-    [ -f "$STATE_FILE" ] && . "$STATE_FILE" 2>/dev/null
+    # source 失败时也保证 WARNED_CYCLE 为空，避免沿用错误状态
+    WARNED_CYCLE=""
+    if [ -r "$STATE_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$STATE_FILE" 2>/dev/null || WARNED_CYCLE=""
+    fi
     return 0
 }
 
@@ -123,8 +141,11 @@ validate_config() {
     case "${STAT_TYPE:-}" in 1|2|3) ;; *) c_red "  × 流量统计类型 [$STAT_TYPE] 非法（应为 1/2/3）"; err=1;; esac
     [ -n "$TG_TOKEN" ]  || { c_red "  × Telegram Bot Token 为空";  err=1; }
     [ -n "$TG_CHATID" ] || { c_red "  × Telegram Chat ID 为空";    err=1; }
-    awk -v l="${LIMIT_GB:-0}" 'BEGIN{exit !(l+0>0)}' 2>/dev/null \
-        || { c_red "  × 流量总额 [$LIMIT_GB] 非法（应为大于 0 的数字，单位 GB）"; err=1; }
+    # 严格数字校验，避免 "10abc" 被 awk 前缀解析成合法值
+    if ! [[ "${LIMIT_GB:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+            || ! awk -v l="$LIMIT_GB" 'BEGIN{exit !(l+0>0)}' 2>/dev/null; then
+        c_red "  × 流量总额 [$LIMIT_GB] 非法（应为大于 0 的数字，单位 GB）"; err=1
+    fi
     [ "$err" -eq 0 ] || die "配置校验失败，请重新执行【安装部署/修改配置】"
 }
 
@@ -136,22 +157,21 @@ validate_config() {
 PARSE_ERROR=0
 
 # 计算当前账单周期起始日期（UTC）
+# 关键: 重置日超出当月天数时必须按"当月有效日=min(rd, 当月天数)"计算，
+#       否则 rd=31 遇 2 月 28 日时会把上月最后一天当作本月起点，误统计旧流量
 cycle_start_date() {
-    local y m d rd first cand fm
+    local rd=$((10#$RESET_DAY)) y m d dim eff pfirst pdim peff
     y=$(date -u +%Y); m=$(date -u +%m); d=$((10#$(date -u +%d)))
-    rd=$((10#$RESET_DAY))
-    if [ "$d" -ge "$rd" ]; then
-        first="${y}-${m}-01"
+    dim=$(date -u -d "${y}-${m}-01 +1 month -1 day" +%d); dim=$((10#$dim))
+    eff=$rd; [ "$eff" -gt "$dim" ] && eff=$dim
+    if [ "$d" -ge "$eff" ]; then
+        date -u -d "${y}-${m}-01 +$((eff-1)) days" +%Y-%m-%d
     else
-        first=$(date -u -d "${y}-${m}-01 -1 month" +%Y-%m-01)
+        pfirst=$(date -u -d "${y}-${m}-01 -1 month" +%Y-%m-01)
+        pdim=$(date -u -d "${pfirst} +1 month -1 day" +%d); pdim=$((10#$pdim))
+        peff=$rd; [ "$peff" -gt "$pdim" ] && peff=$pdim
+        date -u -d "${pfirst} +$((peff-1)) days" +%Y-%m-%d
     fi
-    cand=$(date -u -d "${first} +$((rd-1)) days" +%Y-%m-%d)
-    fm=$(echo "$first" | cut -c6-7)
-    # 重置日超出当月天数（如 31 日遇 2 月），取当月最后一天
-    if [ "$(date -u -d "$cand" +%m)" != "$fm" ]; then
-        cand=$(date -u -d "${first} +1 month -1 day" +%Y-%m-%d)
-    fi
-    echo "$cand"
 }
 
 # 拉取该网口按日明细 JSON（供解析与自检复用）
@@ -255,7 +275,7 @@ stat_type_name() {
 #===============================================================================
 tg_send() {
     # $1=消息文本；成功返回 0，失败(已重试 3 次)返回 1
-    local text=$1 i resp
+    local text=$1 i resp desc
     for i in 1 2 3; do
         resp=$(curl -sS -m 20 -X POST \
             "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
@@ -265,7 +285,9 @@ tg_send() {
         if echo "$resp" | grep -q '"ok":true'; then
             return 0
         fi
-        log "WARN" "Telegram 推送第 ${i}/3 次失败: $(echo "$resp" | head -c 200)"
+        # 优先展示 Telegram 返回的 description 字段，便于定位 Token/Chat ID 问题
+        desc=$(echo "$resp" | jq -r '.description // empty' 2>/dev/null)
+        log "WARN" "Telegram 推送第 ${i}/3 次失败: ${desc:-$(echo "$resp" | head -c 200)}"
         [ "$i" -lt 3 ] && sleep 2
     done
     return 1
@@ -319,6 +341,7 @@ cmd_daily() {
 }
 
 cmd_test_push() {
+    check_root
     load_config || die "尚未安装配置，请先执行【1. 安装部署/修改配置】"
     validate_config
     echo "正在发送测试日报..."
@@ -339,6 +362,15 @@ cmd_test_push() {
 #===============================================================================
 cmd_check() {
     load_config || exit 0
+
+    # 并发保护：95% 分支会 sleep 60，若不互斥会出现两条关机告警
+    mkdir -p "$BASE_DIR" 2>/dev/null
+    if command -v flock >/dev/null 2>&1; then
+        if exec 200>"${BASE_DIR}/check.lock" 2>/dev/null; then
+            flock -n 200 || { log "INFO" "已有检查实例运行，跳过本次"; exit 0; }
+        fi
+    fi
+
     validate_config
     local used_bytes percent start
     PARSE_ERROR=0
@@ -383,14 +415,28 @@ cmd_check() {
         fi
         percent=$(calc_percent "$used_bytes")
         local new_start; new_start=$(cycle_start_date)
+
+        # 周期已切换 → 说明已进入新账单周期，必须取消关机（避免新周期高额度误杀）
+        if [ "$new_start" != "$start" ]; then
+            log "INFO" "账单周期已切换 ($start → $new_start)，取消关机"
+            rm -f "$LOCK_SHUTDOWN"
+            exit 0
+        fi
+
         if awk -v p="$percent" 'BEGIN{exit !(p >= 95)}'; then
             log "WARN" "二次确认通过（${percent}% ≥95%，周期 ${new_start}），执行关机命令"
             tg_send "⛔ 服务器 <b>$(html_escape "$SERVER_NAME")</b> 二次确认 ${percent}% ≥95%，正在执行关机... $(date -u '+%Y-%m-%d %H:%M') UTC" >/dev/null 2>&1
             sync
-            shutdown -h now "traffic-monitor: 流量达到 95% 阈值，自动关机"
-            exit 0
+            if shutdown -h now "traffic-monitor: 流量达到 95% 阈值，自动关机"; then
+                log "OK" "关机命令已下发"
+                exit 0
+            else
+                log "ERROR" "关机命令执行失败，移除锁以便下分钟重试"
+                rm -f "$LOCK_SHUTDOWN"
+                exit 1
+            fi
         else
-            log "INFO" "二次确认未通过（当前 ${percent}%，周期 ${new_start}），取消关机（可能已进入新账单周期）"
+            log "INFO" "二次确认未通过（当前 ${percent}%，周期 ${new_start}），取消关机"
             rm -f "$LOCK_SHUTDOWN"
         fi
         exit 0
@@ -422,13 +468,24 @@ cmd_check() {
 # 依赖安装 / 时区 / vnStat 基础配置
 #===============================================================================
 install_deps() {
+    # 智能跳过：依赖已齐全时不再 apt update/重装，避免改配置也要等网络
+    local missing=0 p
+    for p in vnstat curl jq crontab; do
+        command -v "$p" >/dev/null 2>&1 || missing=1
+    done
+    if [ "$missing" -eq 0 ]; then
+        c_green "✔ 依赖已齐全，跳过安装: $(vnstat --version 2>/dev/null | head -n1)"
+        log "INFO" "依赖已齐全，跳过安装"
+        systemctl enable vnstat >/dev/null 2>&1
+        systemctl start vnstat  >/dev/null 2>&1
+        return
+    fi
     echo "→ 检查并安装依赖软件 (vnstat curl jq cron) ..."
     log "INFO" "开始安装依赖"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1 || c_yellow "  ! apt-get update 失败，尝试继续安装"
     apt-get install -y vnstat curl jq cron ca-certificates >/dev/null 2>&1 \
         || die "依赖安装失败，请检查网络或 apt 源后重试"
-    local p
     for p in vnstat curl jq crontab; do
         command -v "$p" >/dev/null 2>&1 || die "依赖 [$p] 安装后仍不可用"
     done
@@ -448,8 +505,10 @@ setup_timezone() {
         return
     fi
     if ! timedatectl set-timezone Asia/Shanghai 2>/dev/null; then
-        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-        echo "Asia/Shanghai" > /etc/timezone
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+            || c_yellow "  ! 无法创建 /etc/localtime 符号链接"
+        echo "Asia/Shanghai" > /etc/timezone 2>/dev/null \
+            || c_yellow "  ! 无法写入 /etc/timezone，请手动确认时区"
     fi
     c_green "✔ 系统时区已设置为 Asia/Shanghai（原时区: ${tz:-未知}）"
     log "INFO" "系统时区由 [$tz] 改为 Asia/Shanghai"
@@ -457,7 +516,6 @@ setup_timezone() {
 
 setup_vnstat_utc() {
     echo "→ 配置 vnStat 使用 UTC0 时间基准 (UseUTC 1) ..."
-    [ -f "$VNSTAT_CONF" ] || echo "" > /dev/null   # 保持后续 || 分支简单
     if [ ! -f "$VNSTAT_CONF" ]; then
         echo "UseUTC 1" > "$VNSTAT_CONF" || die "无法写入 $VNSTAT_CONF"
     elif grep -qE '^[#[:space:]]*UseUTC' "$VNSTAT_CONF"; then
@@ -550,7 +608,11 @@ interactive_config() {
     prompt_input "⑥ Telegram Chat ID" "$TG_CHATID";   TG_CHATID=$REPLY_VAL
     echo
     prompt_input "⑦ 账单周期总流量 (GB, 支持小数)" "$LIMIT_GB"
-    awk -v l="$REPLY_VAL" 'BEGIN{exit !(l+0>0)}' 2>/dev/null || die "流量总额非法：$REPLY_VAL"
+    # 严格数字校验，拒绝 "10abc" 这类看似合法但实际无效的输入
+    if ! [[ "$REPLY_VAL" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+            || ! awk -v l="$REPLY_VAL" 'BEGIN{exit !(l+0>0)}' 2>/dev/null; then
+        die "流量总额非法：$REPLY_VAL"
+    fi
     LIMIT_GB=$REPLY_VAL
     echo
 
@@ -565,18 +627,19 @@ interactive_config() {
     read -rp "$(c_blue "确认保存配置？(Y/n): ")" REPLY_VAL
     case "$REPLY_VAL" in n|N) die "用户取消保存";; esac
 
+    # 使用 printf %q 转义，避免 SERVER_NAME 含 " $ ` 破坏配置文件或形成 RCE
     mkdir -p "$BASE_DIR"
-    cat > "$CONF_FILE" <<EOF
-# traffic-monitor 配置文件 ($VERSION)
-# 生成时间: $(date '+%Y-%m-%d %H:%M:%S %Z')
-SERVER_NAME="$SERVER_NAME"
-IFACE="$IFACE"
-RESET_DAY=$RESET_DAY
-STAT_TYPE=$STAT_TYPE
-TG_TOKEN="$TG_TOKEN"
-TG_CHATID="$TG_CHATID"
-LIMIT_GB="$LIMIT_GB"
-EOF
+    {
+        echo "# traffic-monitor 配置文件 ($VERSION)"
+        echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        printf 'SERVER_NAME=%q\n' "$SERVER_NAME"
+        printf 'IFACE=%q\n'       "$IFACE"
+        printf 'RESET_DAY=%d\n'   "$RESET_DAY"
+        printf 'STAT_TYPE=%d\n'   "$STAT_TYPE"
+        printf 'TG_TOKEN=%q\n'    "$TG_TOKEN"
+        printf 'TG_CHATID=%q\n'   "$TG_CHATID"
+        printf 'LIMIT_GB=%q\n'    "$LIMIT_GB"
+    } > "$CONF_FILE" || die "无法写入配置文件: $CONF_FILE"
     chmod 600 "$CONF_FILE"
 
     if [ "$is_update" -eq 1 ]; then
@@ -596,12 +659,19 @@ EOF
 
 install_cron() {
     echo "→ 创建/更新定时任务 ..."
-    local tmp; tmp=$(mktemp)
+    # 确保脚本有执行位（用户可能以 bash script.sh 方式启动，文件本身无 x 位）
+    [ -x "$SCRIPT_PATH" ] || chmod +x "$SCRIPT_PATH" 2>/dev/null
+
+    local tmp scmd lcmd
+    tmp=$(mktemp)
+    # 路径加双引号，避免包含空格时 cron 无法执行
+    scmd="\"$SCRIPT_PATH\""
+    lcmd="\"$LOG_FILE\""
     crontab -l 2>/dev/null | grep -v "# traffic-monitor" > "$tmp"
     # 每日日报：服务器时区已设为 Asia/Shanghai，即北京时间 08:00
-    echo "0 8 * * * $SCRIPT_PATH daily >> $LOG_FILE 2>&1 # traffic-monitor" >> "$tmp"
+    echo "0 8 * * * $scmd daily >> $lcmd 2>&1 # traffic-monitor" >> "$tmp"
     # 每分钟阈值检查
-    echo "* * * * * $SCRIPT_PATH check >> $LOG_FILE 2>&1 # traffic-monitor" >> "$tmp"
+    echo "* * * * * $scmd check >> $lcmd 2>&1 # traffic-monitor" >> "$tmp"
     crontab "$tmp" || { rm -f "$tmp"; die "crontab 写入失败"; }
     rm -f "$tmp"
     restart_cron_service
@@ -634,6 +704,7 @@ cmd_install() {
 # 查看当前流量数据
 #===============================================================================
 cmd_show() {
+    check_root
     load_config || die "尚未安装配置，请先执行【1. 安装部署/修改配置】"
     validate_config
     local used_bytes percent start cover cov_earliest all_bytes
@@ -653,14 +724,15 @@ cmd_show() {
         c_red "  ⚠ 周期流量解析失败！请执行【6. 环境自检】或查看日志: $LOG_FILE"
     elif [ "${used_bytes:-0}" -eq 0 ]; then
         all_bytes=$(vnstat_day_json | jq -r "$(jq_day_sum_filter '(.rx + .tx)' '')" 2>/dev/null)
-        if [ "${all_bytes:-0}" -gt 0 ] 2>/dev/null; then
+        # 用 awk 判浮点，避免上游返回小数时 [ -gt ] 报错
+        if awk -v v="${all_bytes:-0}" 'BEGIN{exit !(v+0>0)}' 2>/dev/null; then
             c_yellow "  ⚠ 本账单周期统计为 0，但 vnStat 存在其他时段流量，请核对日明细"
         fi
     else
         cover=$(check_day_coverage "$start")
         if [ "${cover#missing:}" != "$cover" ]; then
             cov_earliest=${cover#missing:}
-            c_yellow "  ⚠ 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}（早于周期起点），周期统计可能偏低"
+            c_yellow "  ⚠ 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}（晚于周期起点），此前的周期流量无法统计"
             c_yellow "    历史数据口径错乱可用【7. 重置 vnStat 数据库】解决"
         fi
     fi
@@ -674,6 +746,9 @@ cmd_show() {
 # 环境自检（远程排障用）
 #===============================================================================
 cmd_diag() {
+    # diag 目的是排障，非 root 也允许进入，但需明确告知可能读不到配置
+    [ "$(id -u)" -eq 0 ] \
+        || c_yellow "提示：当前非 root 运行，可能无法读取配置文件 ($CONF_FILE)，完整自检建议 sudo 运行"
     echo "================ 环境自检 ($VERSION) ================"
     echo "脚本路径   : $SCRIPT_PATH"
     echo "运行时间   : $(date '+%Y-%m-%d %H:%M:%S %Z') / UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
@@ -713,7 +788,7 @@ cmd_diag() {
             c_red "vnstat --json d -i $IFACE 无输出！请在服务器手动执行该命令排障"
         fi
     else
-        c_yellow "配置文件不存在（尚未安装或已被清理），仅输出环境信息"
+        c_yellow "配置文件不存在或不可读（尚未安装 / 无读取权限 / 已被清理），仅输出环境信息"
     fi
     echo "--- 定时任务 ---"
     crontab -l 2>/dev/null | grep "# traffic-monitor" | sed 's/^/    /' || echo "    (无 traffic-monitor 任务)"
@@ -739,7 +814,7 @@ cmd_reset_db() {
     # 重置周期状态，允许新数据重新触发预警
     rm -f "$STATE_FILE" "$LOCK_SHUTDOWN"
     log "WARN" "已重置 vnStat 数据库: 网口=$IFACE，历史明细清空，预警/关机状态重置"
-    c_green "✔ 已重置。流量约 1 分钟后开始重新累积，账单周期将从当前日明细重新计"
+    c_green "✔ 已重置。流量约 1~2 分钟后开始重新累积，期间【查看当前流量】显示 0 属正常"
 }
 
 #===============================================================================
@@ -792,9 +867,17 @@ cmd_uninstall() {
     rm -f "$tmp"
     restart_cron_service
     c_green "✔ 定时任务已清理"
-    [ -f "$LOG_FILE" ] && cp -f "$LOG_FILE" /tmp/traffic-monitor-last.log 2>/dev/null
+    # 备份日志到 $HOME，避免 /tmp 重启丢失或 noexec/nosuid 挂载问题
+    local bak="${HOME:-/root}/traffic-monitor-last.log"
+    if [ -f "$LOG_FILE" ]; then
+        if cp -f "$LOG_FILE" "$bak" 2>/dev/null; then
+            c_green "✔ 日志已备份至: $bak"
+        else
+            c_yellow "  ! 日志备份失败，请手动备份: $LOG_FILE"
+        fi
+    fi
     rm -rf "$BASE_DIR"
-    c_green "✔ 配置/状态/日志已删除（最后日志备份: /tmp/traffic-monitor-last.log）"
+    c_green "✔ 配置/状态/日志已删除"
     rm -f "$SCRIPT_PATH"
     c_green "✔ 脚本文件已删除: $SCRIPT_PATH"
     echo
