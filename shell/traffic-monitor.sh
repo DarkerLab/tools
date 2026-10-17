@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-# vnstat 流量监控助手 v1.2
+# vnstat 流量监控助手 v1.4
 #
 # 功能：
 #   1. 一键安装部署 vnstat 流量监控（自动更新脚本、安装依赖、设置时区）
@@ -27,7 +27,7 @@
 #===============================================================================
 set -u
 
-VERSION="1.3"
+VERSION="1.4"
 REPO_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 MIN_VNSTAT_VER="2.7"          # UseUTC 参数最低支持版本，低于此版本建议升级
 VNSTAT_FALLBACK_VER="2.12"    # GitHub API 不可用时的源码编译兜底版本
@@ -131,6 +131,7 @@ validate_config() {
         die "配置缺失或不完整:${missing}，请先执行「安装部署/修改配置」"
     fi
     case "$TRAFFIC_TYPE" in 1|2|3) ;; *) die "TRAFFIC_TYPE 非法（应为 1/2/3）";; esac
+    case "${UNIT_MODE:-si}" in si|iec) ;; *) die "UNIT_MODE 非法（应为 si/iec）";; esac
     if ! awk -v v="$MONTHLY_LIMIT_GB" 'BEGIN{exit !(v>0)}'; then
         die "MONTHLY_LIMIT_GB 非法（应为大于 0 的数值）"
     fi
@@ -178,8 +179,11 @@ get_used_bytes() {
     local json rx tx
     json="$(vnstat --json m -i "$INTERFACES" 2>/dev/null)" || return 1
     [ -z "$json" ] && return 1
-    rx="$(printf '%s' "$json" | jq '[.vnstatjson[]? | if (.traffic.month | length) > 0 then .traffic.month[-1].rx else 0 end] | add // 0' 2>/dev/null)" || return 1
-    tx="$(printf '%s' "$json" | jq '[.vnstatjson[]? | if (.traffic.month | length) > 0 then .traffic.month[-1].tx else 0 end] | add // 0' 2>/dev/null)" || return 1
+    
+    # 修复：使用正确的 JSON 键名 months 替代 month
+    rx="$(printf '%s' "$json" | jq '[.vnstatjson[]? | if (.traffic.months | length) > 0 then .traffic.months[-1].rx else 0 end] | add // 0' 2>/dev/null)" || return 1
+    tx="$(printf '%s' "$json" | jq '[.vnstatjson[]? | if (.traffic.months | length) > 0 then .traffic.months[-1].tx else 0 end] | add // 0' 2>/dev/null)" || return 1
+    
     rx="${rx:-0}"; tx="${tx:-0}"
     RX_BYTES="$rx"; TX_BYTES="$tx"
     case "$TRAFFIC_TYPE" in
@@ -194,20 +198,27 @@ get_period_info() {
     local json
     PERIOD_ID="unknown"; PERIOD_START="unknown"
     json="$(vnstat --json m -i "$INTERFACES" 2>/dev/null)" || return 1
-    PERIOD_ID="$(printf '%s' "$json" | jq -r '.vnstatjson[0].traffic.month[-1].id // "unknown"' 2>/dev/null)"
-    PERIOD_START="$(printf '%s' "$json" | jq -r '.vnstatjson[0].traffic.month[-1].start.date // "unknown"' 2>/dev/null)"
+    
+    # 修复：使用正确的 JSON 键名 months，并提取日期对象格式化
+    PERIOD_ID="$(printf '%s' "$json" | jq -r '.vnstatjson[0].traffic.months[-1].id // "unknown"' 2>/dev/null)"
+    PERIOD_START="$(printf '%s' "$json" | jq -r '.vnstatjson[0].traffic.months[-1].start.date | if type=="object" then "\(.year)-\(if (.month|tostring|length) == 1 then "0" else "" end)\(.month)-\(if (.day|tostring|length) == 1 then "0" else "" end)\(.day)" else (. // "unknown") end' 2>/dev/null)"
+    
     return 0
 }
 
-# 字节数转 GB（统一按 1GB = 1000^3 计算，与多数商家计费口径一致）
+# 字节数转 GB/GiB（根据配置的 UNIT_MODE）
 fmt_gb() {
-    awk -v b="$1" 'BEGIN{ printf "%.2f", b/1000000000 }'
+    local b="$1"
+    local div=1000000000
+    [ "${UNIT_MODE:-si}" = "iec" ] && div=1073741824
+    awk -v b="$b" -v d="$div" 'BEGIN{ printf "%.2f", b/d }'
 }
 
-# 计算百分比（保留两位小数，GB=1000^3）
+# 计算百分比（根据配置的 UNIT_MODE）
 calc_pct() {
-    awk -v u="$1" -v l="$2" 'BEGIN{
-        limit = l * 1000000000;
+    awk -v u="$1" -v l="$2" -v m="${UNIT_MODE:-si}" 'BEGIN{
+        div = (m=="iec") ? 1073741824 : 1000000000;
+        limit = l * div;
         if (limit <= 0) { print "0.00"; exit }
         printf "%.2f", u/limit*100
     }'
@@ -233,12 +244,14 @@ now_beijing() { TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S'; }
 
 build_report_msg() {
     local used="$1" pct="$2"
+    local unit_str="GB"
+    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
     cat <<EOF
 📊 每日流量报告
 ━━━━━━━━━━━━━━━
 🖥 服务器：${SERVER_NAME}
-📶 计费流量：$(fmt_gb "$used") GB / ${MONTHLY_LIMIT_GB} GB（${pct}%）
-🔼 上传：$(fmt_gb "${TX_BYTES:-0}") GB   🔽 下载：$(fmt_gb "${RX_BYTES:-0}") GB
+📶 计费流量：$(fmt_gb "$used") ${unit_str} / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）
+🔼 上传：$(fmt_gb "${TX_BYTES:-0}") ${unit_str}   🔽 下载：$(fmt_gb "${RX_BYTES:-0}") ${unit_str}
 📋 统计类型：$(traffic_type_name "$TRAFFIC_TYPE")
 🗓 账单周期：${PERIOD_START}（UTC0）起 至当前
 🌐 监控网口：${INTERFACES}
@@ -248,11 +261,13 @@ EOF
 
 build_warn_msg() {
     local used="$1" pct="$2"
+    local unit_str="GB"
+    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
     cat <<EOF
 ⚠️ 流量预警通知（已达 ${pct}%）
 ━━━━━━━━━━━━━━━
 🖥 服务器：${SERVER_NAME}
-📶 计费流量：$(fmt_gb "$used") GB / ${MONTHLY_LIMIT_GB} GB（${pct}%）
+📶 计费流量：$(fmt_gb "$used") ${unit_str} / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）
 🚨 预警阈值：${WARN_PCT}%（已触发）  关机阈值：${SHUTDOWN_PCT}%
 🗓 账单周期：${PERIOD_START}（UTC0）起 至当前
 请尽快处理，达到 ${SHUTDOWN_PCT}% 将自动关机！
@@ -262,11 +277,13 @@ EOF
 
 build_shutdown_msg() {
     local used="$1" pct="$2"
+    local unit_str="GB"
+    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
     cat <<EOF
 🛑 流量超限关机通知（已达 ${pct}%）
 ━━━━━━━━━━━━━━━
 🖥 服务器：${SERVER_NAME}
-📶 计费流量：$(fmt_gb "$used") GB / ${MONTHLY_LIMIT_GB} GB（${pct}%）
+📶 计费流量：$(fmt_gb "$used") ${unit_str} / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）
 🚨 已触达关机阈值 ${SHUTDOWN_PCT}%，服务器将在 30 秒后执行自动关机！
 🗓 账单周期：${PERIOD_START}（UTC0）起 至当前
 🕗 时间：$(now_beijing)（北京时间）
@@ -404,7 +421,7 @@ prompt_config() {
 
     def="${MONTHLY_LIMIT_GB:-}"
     while true; do
-        read -r -p "每月总流量限额（GB）[${def:-必填}]: " val
+        read -r -p "每月总流量限额（GB/GiB）[${def:-必填}]: " val
         MONTHLY_LIMIT_GB="${val:-$def}"
         if [ -n "$MONTHLY_LIMIT_GB" ] && awk -v v="$MONTHLY_LIMIT_GB" 'BEGIN{exit !(v>0)}'; then
             break
@@ -424,7 +441,7 @@ prompt_config() {
 
     echo "────────────────────────────────────────────────────────────────"
     info "配置预览：服务器=${SERVER_NAME} 网口=${INTERFACES} 重置日=${BILLING_DAY}(UTC0) 类型=$(traffic_type_name "$TRAFFIC_TYPE")"
-    info "          限额=${MONTHLY_LIMIT_GB}GB(${UNIT_MODE}) 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}% 检查间隔=${CHECK_INTERVAL}分钟"
+    info "          限额=${MONTHLY_LIMIT_GB}(${UNIT_MODE}) 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}% 检查间隔=${CHECK_INTERVAL}分钟"
 }
 
 save_config() {
@@ -446,7 +463,7 @@ CHECK_INTERVAL="${CHECK_INTERVAL}"
 EOF
     chmod 600 "$CONF_FILE"
     ok "配置已保存至 ${CONF_FILE}"
-    log_info "配置已保存：网口=${INTERFACES} 重置日=${BILLING_DAY} 类型=${TRAFFIC_TYPE} 限额=${MONTHLY_LIMIT_GB}GB 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}%"
+    log_info "配置已保存：网口=${INTERFACES} 重置日=${BILLING_DAY} 类型=${TRAFFIC_TYPE} 限额=${MONTHLY_LIMIT_GB} 预警=${WARN_PCT}% 关机=${SHUTDOWN_PCT}%"
 }
 
 # 获取 vnstat 版本号（如 2.10），未安装返回空
@@ -466,7 +483,6 @@ upgrade_vnstat() {
         return 1
     fi
 
-    # 优先从 GitHub 获取最新 release 版本号，失败则用兜底版本
     local ver=""
     if have_cmd jq; then
         ver="$(curl -fsSL -m 20 https://api.github.com/repos/vergoh/vnstat/releases/latest 2>/dev/null \
@@ -501,7 +517,6 @@ upgrade_vnstat() {
     ) >>"$LOG_FILE" 2>&1 || rc=1
 
     if [ "$rc" -eq 0 ] && [ -f "${srcdir}/examples/systemd/vnstat.service" ]; then
-        # 使用源码自带的 systemd 服务单元（apt 版单元已随卸载移除）
         cp -f "${srcdir}/examples/systemd/vnstat.service" /etc/systemd/system/vnstat.service
     fi
     rm -rf "$workdir"
@@ -510,7 +525,6 @@ upgrade_vnstat() {
     if [ "$rc" -ne 0 ]; then
         log_error "vnstat 编译/安装失败，详见 ${LOG_FILE}"
         warn "编译安装失败（详见 ${LOG_FILE}），若系统vnstat已被卸载请重新执行安装流程"
-        # 编译失败后若二进制缺失，尝试恢复 apt 版本，避免系统无 vnstat 可用
         if ! have_cmd vnstat; then
             warn "检测到 vnstat 已缺失，尝试恢复 apt 源版本..."
             apt-get install -y vnstat >>"$LOG_FILE" 2>&1 || true
@@ -562,7 +576,6 @@ setup_vnstat() {
     info "配置 vnstat（UTC0 时间基准 + 账单日轮转）..."
     [ -f "$VNSTAT_CONF" ] || die "未找到 ${VNSTAT_CONF}，vnstat 可能未正确安装"
 
-    # 版本检测：UseUTC 需要 vnstat >= ${MIN_VNSTAT_VER}，老版本自动降级为 systemd 注入 TZ=UTC（等效 UTC0 口径）
     local vnum="" use_utc=1
     vnum="$(vnstat_get_ver)"
     if [ -n "$vnum" ] && ver_lt "$vnum" "$MIN_VNSTAT_VER"; then
@@ -572,32 +585,23 @@ setup_vnstat() {
     fi
 
     if [ "$use_utc" = "1" ]; then
-        # 严格 UTC0 口径：UseUTC 1 使数据库全部按 UTC 记录
         set_vnstat_conf "UseUTC" "1"
         rm -f /etc/systemd/system/vnstat.service.d/utc.conf
     else
-        # 老版本：必须移除可能残留的 UseUTC 行（未知参数会导致 2.6 等旧版守护进程启动失败）
         sed -i -E '/^[[:space:]]*UseUTC[[:space:]]/d' "$VNSTAT_CONF"
         mkdir -p /etc/systemd/system/vnstat.service.d
         printf '[Service]\nEnvironment="TZ=UTC"\n' > /etc/systemd/system/vnstat.service.d/utc.conf
         log_info "已写入 systemd drop-in：/etc/systemd/system/vnstat.service.d/utc.conf (TZ=UTC)"
     fi
-    # MonthRotate 使月边界=账单日 UTC 零点
+    
     set_vnstat_conf "MonthRotate" "$BILLING_DAY"
     set_vnstat_conf "TrafficlessDays" "1"
-    local first_if="${INTERFACES%%+*}"
-    set_vnstat_conf "Interface" "\"${first_if}\""
+    
+    # 修复多网卡配置：将配置文件中原本的接口加上，支持空格分隔
+    local conf_interfaces="${INTERFACES//+/ }"
+    set_vnstat_conf "Interface" "\"${conf_interfaces}\""
 
-    # 添加监控网口到数据库
-    local IFS_SAVE="$IFS" iface
-    IFS='+'
-    for iface in $INTERFACES; do
-        vnstat --add -i "$iface" >/dev/null 2>&1 || true
-        log_info "vnstat 添加监控网口：${iface}"
-    done
-    IFS="$IFS_SAVE"
-
-    # 配置自检（--configtest 仅新版 vnstat 支持，老版本跳过）
+    # 配置自检
     if vnstat --help 2>&1 | grep -q -- '--configtest'; then
         if ! vnstat --configtest >>"$LOG_FILE" 2>&1; then
             warn "vnstat 配置自检未通过，请检查 ${VNSTAT_CONF}（详见日志）"
@@ -622,9 +626,21 @@ setup_vnstat() {
         echo "------------------------------------"
         die "vnstat 服务未处于运行状态，完整日志见 ${LOG_FILE}"
     fi
-    ok "vnstat 已配置并运行（UseUTC=1, MonthRotate=${BILLING_DAY}）"
-    log_info "vnstat 配置完成并重启：UseUTC=1 MonthRotate=${BILLING_DAY} 网口=${INTERFACES}"
-    warn "注意：启用 UseUTC 后，vnstat 历史数据的日/月边界将按 UTC 解释；若此前按本地时区记录，切换当日数据可能有最多 8 小时的归属偏移，属正常现象"
+
+    # 修复：将 vnstat --add 移到服务重启之后，确保 daemon 已运行接收指令
+    local IFS_SAVE="$IFS" iface
+    IFS='+'
+    for iface in $INTERFACES; do
+        vnstat --add -i "$iface" >/dev/null 2>&1 || true
+        log_info "vnstat 添加监控网口：${iface}"
+    done
+    IFS="$IFS_SAVE"
+
+    ok "vnstat 已配置并运行（UseUTC=${use_utc}, MonthRotate=${BILLING_DAY}）"
+    log_info "vnstat 配置完成并重启：UseUTC=${use_utc} MonthRotate=${BILLING_DAY} 网口=${INTERFACES}"
+    if [ "$use_utc" = "1" ]; then
+        warn "注意：启用 UseUTC 后，vnstat 历史数据的日/月边界将按 UTC 解释；若此前按本地时区记录，切换当日数据可能有最多 8 小时的归属偏移，属正常现象"
+    fi
 }
 
 install_script() {
@@ -742,16 +758,15 @@ do_check() {
 
     # ---- 95% 关机流程 ----
     if pct_ge "$pct" "$SHUTDOWN_PCT"; then
-        log_warn "触发关机阈值：周期=${PERIOD_ID} 已用=$(fmt_gb "$used")GB/${MONTHLY_LIMIT_GB}GB (${pct}%) >= ${SHUTDOWN_PCT}%"
+        log_warn "触发关机阈值：周期=${PERIOD_ID} 已用=$(fmt_gb "$used")/${MONTHLY_LIMIT_GB} (${pct}%) >= ${SHUTDOWN_PCT}%"
         local msg; msg="$(build_shutdown_msg "$used" "$pct")"
         if tg_send_retry "$msg" 2; then
             log_info "关机通知发送成功"
         else
-            # 用户确认的策略：重试 2 次后即使未送达也执行关机，防止超额产生账单
             log_error "关机通知发送失败（已重试 2 次），按策略仍继续执行关机"
         fi
 
-        # 关机前二次复核：防止账单周期刚重置导致误关机
+        # 关机前二次复核
         sleep 2
         get_period_info || true
         local used2 pct2
@@ -764,23 +779,23 @@ do_check() {
             log_warn "关机前复核：当前 ${pct2}% 未达 ${SHUTDOWN_PCT}%（账单周期可能已重置），中止关机"
             if tg_send "ℹ️ 关机已中止
 服务器：${SERVER_NAME}
-复核流量：$(fmt_gb "$used2") GB / ${MONTHLY_LIMIT_GB} GB（${pct2}%），未达关机阈值 ${SHUTDOWN_PCT}%（账单周期可能已重置）。
+复核流量：$(fmt_gb "$used2") / ${MONTHLY_LIMIT_GB}（${pct2}%），未达关机阈值 ${SHUTDOWN_PCT}%（账单周期可能已重置）。
 时间：$(now_beijing)（北京时间）"; then
                 log_info "关机中止通知发送成功"
             fi
             exit 0
         fi
         log_warn "关机前复核通过：${pct2}% >= ${SHUTDOWN_PCT}%，30 秒后执行关机"
-        tg_send "⏳ 关机复核通过（${pct2}%），服务器 ${SERVER_NAME} 将在 30 秒后关机。时间：$(now_beijing)" || true
+        tg_send_retry "⏳ 关机复核通过（${pct2}%），服务器 ${SERVER_NAME} 将在 30 秒后关机。时间：$(now_beijing)" 1 || true
         sync
         sleep 30
-        # 最终防线：执行关机命令前再确认一次
+        # 最终防线
         if ! used2="$(get_used_bytes)" || ! pct_ge "$(calc_pct "$used2" "$MONTHLY_LIMIT_GB")" "$SHUTDOWN_PCT"; then
             log_warn "最终确认未达关机阈值，中止关机"
             exit 0
         fi
         log_warn "===== 执行关机命令（poweroff）====="
-        _log "INFO " "关机指令下发：$(now_beijing)"
+        _log "INFO" "关机指令下发：$(now_beijing)"
         sync
         if have_cmd systemctl; then
             systemctl poweroff -i
@@ -797,7 +812,7 @@ do_check() {
             log_info "已达预警阈值 ${pct}%（周期 ${PERIOD_ID} 已推送过预警，跳过）"
             exit 0
         fi
-        log_warn "触发预警阈值：周期=${PERIOD_ID} 已用=$(fmt_gb "$used")GB/${MONTHLY_LIMIT_GB}GB (${pct}%) >= ${WARN_PCT}%"
+        log_warn "触发预警阈值：周期=${PERIOD_ID} 已用=$(fmt_gb "$used")/${MONTHLY_LIMIT_GB} (${pct}%) >= ${WARN_PCT}%"
         local msg; msg="$(build_warn_msg "$used" "$pct")"
         if tg_send_retry "$msg" 2; then
             WARN_PERIOD="$PERIOD_ID"
@@ -809,7 +824,7 @@ do_check() {
         exit 0
     fi
 
-    log_info "阈值检查正常：周期=${PERIOD_ID} 已用=$(fmt_gb "$used")GB/${MONTHLY_LIMIT_GB}GB (${pct}%)"
+    log_info "阈值检查正常：周期=${PERIOD_ID} 已用=$(fmt_gb "$used")/${MONTHLY_LIMIT_GB} (${pct}%)"
 }
 
 #===============================================================================
@@ -819,10 +834,13 @@ do_status() {
     load_config || die "未找到配置文件，请先执行安装部署"
     validate_config
     get_period_info || true
-    local used pct remain
+    local used pct remain unit_str="GB"
+    [ "${UNIT_MODE:-si}" = "iec" ] && unit_str="GiB"
+    
     used="$(get_used_bytes)" || die "读取 vnstat 流量数据失败（vnstatd 可能刚启动，请稍后再试）"
     pct="$(calc_pct "$used" "$MONTHLY_LIMIT_GB")"
-    remain="$(awk -v u="$used" -v l="$MONTHLY_LIMIT_GB" -v m="${UNIT_MODE}" 'BEGIN{
+    
+    remain="$(awk -v u="$used" -v l="$MONTHLY_LIMIT_GB" -v m="${UNIT_MODE:-si}" 'BEGIN{
         div=(m=="iec")?1024*1024*1024:1000*1000*1000; r=l*div-u; if(r<0)r=0; printf "%.2f", r/div }')"
 
     echo
@@ -831,9 +849,9 @@ do_status() {
     echo "  监控网口   ：${INTERFACES}"
     echo "  账单周期   ：${PERIOD_ID}（自 ${PERIOD_START} UTC0 起，重置日：每月 ${BILLING_DAY} 日）"
     echo "  统计类型   ：$(traffic_type_name "$TRAFFIC_TYPE")"
-    echo "  已用流量   ：$(fmt_gb "$used") GB / ${MONTHLY_LIMIT_GB} GB（${pct}%）"
-    echo "  剩余流量   ：${remain} GB"
-    echo "  上传/下载  ：$(fmt_gb "${TX_BYTES:-0}") GB / $(fmt_gb "${RX_BYTES:-0}") GB"
+    echo "  已用流量   ：$(fmt_gb "$used") ${unit_str} / ${MONTHLY_LIMIT_GB} ${unit_str}（${pct}%）"
+    echo "  剩余流量   ：${remain} ${unit_str}"
+    echo "  上传/下载  ：$(fmt_gb "${TX_BYTES:-0}") ${unit_str} / $(fmt_gb "${RX_BYTES:-0}") ${unit_str}"
     echo "  预警阈值   ：${WARN_PCT}%    关机阈值：${SHUTDOWN_PCT}%"
     echo "═════════════════════════════════════"
     echo
@@ -855,7 +873,6 @@ do_update() {
         log_error "更新失败：下载脚本出错（网络或仓库地址问题）"
         die "下载失败，请检查网络或仓库地址是否可访问"
     fi
-    # 完整性校验
     if [ ! -s "$tmp" ]; then
         rm -f "$tmp"; die "下载内容为空，更新中止"
     fi
@@ -869,7 +886,7 @@ do_update() {
     new_ver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
     cp -f "$tmp" "$INSTALL_PATH"
     chmod +x "$INSTALL_PATH"
-    if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ] && [ -w "$SCRIPT_PATH" ]; then
+    if [ "$SCRIPT_PATH" != "$INSTALL_PATH" ] && [ -w "$SCRIPT_PATH" ] && [[ "$SCRIPT_PATH" != /tmp/* ]]; then
         cp -f "$tmp" "$SCRIPT_PATH" 2>/dev/null || true
     fi
     rm -f "$tmp"
@@ -934,7 +951,7 @@ show_menu() {
     local cfg_tip="未配置"
     if [ -f "$CONF_FILE" ]; then
         # shellcheck disable=SC1090
-        cfg_tip="$(. "$CONF_FILE"; echo "${SERVER_NAME:-?} | ${INTERFACES:-?} | 限额${MONTHLY_LIMIT_GB:-?}GB")"
+        cfg_tip="$(. "$CONF_FILE"; echo "${SERVER_NAME:-?} | ${INTERFACES:-?} | 限额${MONTHLY_LIMIT_GB:-?}${UNIT_MODE:-si}")"
     fi
     cat <<EOF
 
