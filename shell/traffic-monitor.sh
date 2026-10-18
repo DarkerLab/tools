@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.6.2
+# 版    本 : v1.6.3
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
+#   v1.6.3 [优化] 互换菜单 5 和 7 的位置；优化主菜单排版对齐；验证自动重载。
 #   v1.6.2 [优化] 更新 URL 改为完整 refs/heads 路径；从菜单更新成功后自动重载脚本。
 #   v1.6.1 [UI] 去除复杂的 Unicode 画框，改用清爽的 ASCII 分隔线；菜单两列对齐。
 #   v1.6.0 [UI] 初步 UI 美化。
@@ -18,7 +19,7 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.6.2"
+VERSION="v1.6.3"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -499,9 +500,9 @@ print_banner() {
     echo -e "  \033[1;37mvnStat 流量监控助手\033[0m  \033[33m${VERSION}\033[0m"
     echo -e "  \033[90mSystem: Debian 13 / vnStat 2.x\033[0m"
     echo -e "\033[36m===================================================\033[0m"
-    echo -e "  \033[32m1.\033[0m 安装部署/修改配置       \033[32m5.\033[0m 卸载监控程序"
+    echo -e "  \033[32m1.\033[0m 安装部署/修改配置       \033[32m5.\033[0m 重置 vnStat 数据库"
     echo -e "  \033[32m2.\033[0m 测试发送每日流量推送   \033[32m6.\033[0m 环境自检 (排障)"
-    echo -e "  \033[32m3.\033[0m 查看当前流量数据       \033[32m7.\033[0m 重置 vnStat 数据库"
+    echo -e "  \033[32m3.\033[0m 查看当前流量数据       \033[32m7.\033[0m 卸载监控程序"
     echo -e "  \033[32m4.\033[0m 从 GitHub 更新脚本     \033[32m0.\033[0m 退出"
     echo -e "\033[36m===================================================\033[0m"
 }
@@ -951,9 +952,9 @@ menu() {
             2) cmd_test_push ;;
             3) cmd_show ;;
             4) cmd_update ;;
-            5) cmd_uninstall ;;
+            5) cmd_reset_db ;;
             6) cmd_diag ;;
-            7) cmd_reset_db ;;
+            7) cmd_uninstall ;;
             0) echo -e "\n 再见！"; exit 0 ;;
             *) echo -e "\n\033[33m[!]\033[0m 无效选项，请重新输入"; sleep 1;;
         esac
