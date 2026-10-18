@@ -1,35 +1,22 @@
 #!/usr/bin/env bash
 #==============================================================================
-# Linux 运维工具合集 v1.6  (生产就绪版)
+# Linux 运维工具合集 v1.7  (生产就绪版)
 # 适用系统: Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)
 #
-# 交互模式: bash /root/linux-tools.sh
-# 管道模式: bash <(wget -qO- URL)               （保留 tty，可进菜单）
-#           curl -fsSL URL | bash -s -- <子命令>  （非交互，需带子命令）
-# 命令模式: bash /root/linux-tools.sh <子命令> [参数]
-#
-# 环境变量覆盖:
-#   SWAPPINESS_DEFAULT=20 bash linux-tools.sh swap-add 2G    # 改变默认 swappiness
-#
-# v1.6 变更（相对 v1.5）:
-#   [致命修复] 将脚本 VERSION 变量重命名为 SCRIPT_VERSION，避免被 /etc/os-release 覆盖
-#   [逻辑优化] 更新脚本时，比对目标文件版本而非当前运行版本，避免重复覆盖
-#   [修正地址] UPDATE_URL 修正为 linux-tools.sh，与 INSTALL_PATH 命名对齐
-#   [保留] v1.0~v1.5 全部修复与增强
+# v1.7 变更（相对 v1.6）:
+#   [功能修复] 移除强制转小写的逻辑，支持保留大写主机名
+#   [体验优化] 若输入大写，提示业界规范（RFC 1123），由用户决定是否继续
+#   [保留] v1.0~v1.6 全部修复与增强
 #==============================================================================
 
 set -o pipefail
 
-SCRIPT_VERSION="1.6"
+SCRIPT_VERSION="1.7"
 SCRIPT_NAME="Linux 运维工具合集"
 
-# 本地固定安装路径：脚本落盘位置，便于固定记忆和统一管理
 INSTALL_PATH="/root/linux-tools.sh"
-# 远端更新源：从 GitHub raw 拉取最新版本
-# 注意：远端文件名应与本地基础名保持对应关系（linux-tools.sh）
 UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/refs/heads/main/shell/linux-tools.sh"
 
-# 新建 swap 时写入 99-swap.conf 的默认 swappiness（可通过环境变量覆盖）
 SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-10}"
 
 RAW_ARG0="$0"
@@ -98,7 +85,6 @@ backup_file() {
 is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
 have()   { command -v "$1" >/dev/null 2>&1; }
 
-# 精准识别执行模式：仅基于路径本身，不做 basename 兜底（避免 /root/bash 误判）
 detect_exec_mode() {
     if [ -z "$SELF_PATH" ] || [ ! -f "$SELF_PATH" ]; then
         RUN_MODE="pipe"; SELF_PATH=""; return 0
@@ -114,7 +100,6 @@ detect_exec_mode() {
     RUN_MODE="file"
 }
 
-# 虚拟化环境检测
 detect_virt() {
     VIRT_TYPE="none"
     if [ -f /proc/vz/veinfo ] || [ -f /proc/user_beancounters ] || have vzctl; then
@@ -130,7 +115,6 @@ detect_virt() {
     fi
 }
 
-# 智能解析大小（512M / 2G / 1024 → MB）
 parse_size_mb() {
     local input="$1" n unit
     if [[ "$input" =~ ^([0-9]+)([MmGg])$ ]]; then
@@ -217,9 +201,16 @@ do_hostname() {
         err "主机名格式非法：字母/数字/连字符/点，不能以连字符或点开头/结尾"; return 1
     fi
     [ ${#NEW_HOST} -gt 253 ] && { err "主机名过长（FQDN 上限 253 字符）"; return 1; }
-    NEW_HOST="$(echo "$NEW_HOST" | tr 'A-Z' 'a-z')"
 
     [ "$NEW_HOST" = "$(hostname)" ] && { warn "新主机名与当前一致，无需修改"; return 0; }
+
+    # [v1.7] 检测到大写字母时给出业界规范提示，由用户决定
+    if [[ "$NEW_HOST" =~ [A-Z] ]]; then
+        warn "检测到输入包含大写字母 (${NEW_HOST})。"
+        echo "    提示: 虽然 Linux 系统支持大写主机名，但按照 RFC 1123 业界规范，"
+        echo "          为了避免部分网络服务（如 DNS、邮件服务）解析异常，通常建议使用全小写。"
+        confirm "是否保留大写并继续?" || { info "已取消"; return 1; }
+    fi
 
     confirm "确认将主机名修改为 ${NEW_HOST} ?" || { info "已取消"; return 1; }
 
