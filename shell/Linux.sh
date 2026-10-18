@@ -1,36 +1,50 @@
 #!/usr/bin/env bash
 #==============================================================================
-# Linux 运维工具合集 v1.1
+# Linux 运维工具合集 v1.5  (生产就绪版)
 # 适用系统: Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)
 #
-# 交互模式: bash Linux运维工具合集.sh
-# 命令模式: bash Linux运维工具合集.sh <子命令> [参数]   （支持自动化）
-#   例: bash Linux运维工具合集.sh hostname web01
-#       bash Linux运维工具合集.sh bbr
-#       bash Linux运维工具合集.sh swap-add 2G /swapfile
-#       bash Linux运维工具合集.sh dns apply
-#       bash Linux运维工具合集.sh help
+# 交互模式: bash /root/linux-tools.sh
+# 管道模式: bash <(wget -qO- URL)               （保留 tty，可进菜单）
+#           curl -fsSL URL | bash -s -- <子命令>  （非交互，需带子命令）
+# 命令模式: bash /root/linux-tools.sh <子命令> [参数]
 #
-# v1.1 变更（相对 v1.0）:
-#   - 融合五个独立老脚本优点: 虚拟化检测 / BBR 模块预检 / GB、MB 智能单位
-#   - 新增命令行子命令模式（非交互，适合 Ansible/CI/一键脚本调用）
-#   - 保留 v1.0 的全部缺陷修复 (gai precedence / fstab 显示 / 原子自更新 等)
-#   - BBR 模块加载改用 modprobe -n 预检，避免盲加载
-#   - swap 增加 OpenVZ/LXC/Docker 警告
-#   - 系统信息面板 DNS 锁状态显示更准确
+# 环境变量覆盖:
+#   SWAPPINESS_DEFAULT=20 bash linux-tools.sh swap-add 2G    # 改变默认 swappiness
+#
+# v1.5 变更（相对 v1.4）:
+#   [R1] install 路径黑名单补全 /usr/bin /usr/sbin
+#   [R2] swap_add_file 中 read 在 ASSUME_YES 时跳过，避免误吞 stdin
+#   [R3] swap_add_partition 增加 virt_warn_for 虚拟化预警
+#   [R4] 新增 SWAPPINESS_DEFAULT 环境变量，可覆盖硬编码值 10
+#   [R5] show_sysinfo 合并重复 sysctl 调用
+#   [R6] sysctl.conf 清理用 [[:space:]] 替代 \s（POSIX 兼容）
+#   [R7] INSTALL_PATH / UPDATE_URL 顶部注释说明区别
+#   [R8] sysctl.conf 清理加注释说明 Debian 12 兼容性原因
+#
+# 保留 v1.0~v1.4 全部修复与增强。
 #==============================================================================
 
 set -o pipefail
 
-VERSION="1.1"
+VERSION="1.5"
 SCRIPT_NAME="Linux 运维工具合集"
-UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/refs/heads/main/shell/Linux.sh"
 
+# 本地固定安装路径：脚本落盘位置，便于固定记忆和统一管理
+INSTALL_PATH="/root/linux-tools.sh"
+# 远端更新源：从 GitHub raw 拉取最新版本
+# 与 INSTALL_PATH 职责不同、可以不一致（用户也可 install 到 /usr/local/bin/xxx）
+UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/refs/heads/main/shell/linux-tools.sh"
+
+# 新建 swap 时写入 99-swap.conf 的默认 swappiness（可通过环境变量覆盖）
+SWAPPINESS_DEFAULT="${SWAPPINESS_DEFAULT:-10}"
+
+RAW_ARG0="$0"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+RUN_MODE="unknown"   # file | pipe
+
 BACKUP_DIR="/root/.linux-tools-backup"
 LOG_FILE="/var/log/linux-tools-$(date +%Y%m%d).log"
 
-# 命令行模式下自动确认（可在子命令中按需绕过）
 ASSUME_YES=0
 VIRT_TYPE="none"
 
@@ -80,7 +94,7 @@ confirm() {
 #------------------------------------------------------------------------------
 backup_file() {
     local f="$1"
-    [ -f "$f" ] || return 0
+    [ -n "$f" ] && [ -f "$f" ] || return 0
     mkdir -p "$BACKUP_DIR"
     local name
     name="$(basename "$f").$(date +%Y%m%d%H%M%S).bak"
@@ -90,7 +104,23 @@ backup_file() {
 is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
 have()   { command -v "$1" >/dev/null 2>&1; }
 
-# [v1.1] 虚拟化环境检测（融合 swap.sh 的 OpenVZ 检测）
+# 精准识别执行模式：仅基于路径本身，不做 basename 兜底（避免 /root/bash 误判）
+detect_exec_mode() {
+    if [ -z "$SELF_PATH" ] || [ ! -f "$SELF_PATH" ]; then
+        RUN_MODE="pipe"; SELF_PATH=""; return 0
+    fi
+    case "$SELF_PATH" in
+        /proc/*/fd/*|/dev/fd/*|*pipe:*)
+            RUN_MODE="pipe"; SELF_PATH=""; return 0 ;;
+    esac
+    case "$SELF_PATH" in
+        /bin/bash|/bin/sh|/usr/bin/bash|/usr/bin/sh|/usr/local/bin/bash|/usr/local/bin/sh)
+            RUN_MODE="pipe"; SELF_PATH=""; return 0 ;;
+    esac
+    RUN_MODE="file"
+}
+
+# 虚拟化环境检测
 detect_virt() {
     VIRT_TYPE="none"
     if [ -f /proc/vz/veinfo ] || [ -f /proc/user_beancounters ] || have vzctl; then
@@ -106,16 +136,12 @@ detect_virt() {
     fi
 }
 
-# [v1.1] 智能解析大小（如 512M / 2G / 1024），统一返回 MB
+# 智能解析大小（512M / 2G / 1024 → MB）
 parse_size_mb() {
     local input="$1" n unit
     if [[ "$input" =~ ^([0-9]+)([MmGg])$ ]]; then
         n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2],,}"
-        if [ "$unit" = "g" ]; then
-            echo $((n * 1024))
-        else
-            echo "$n"
-        fi
+        if [ "$unit" = "g" ]; then echo $((n * 1024)); else echo "$n"; fi
     elif [[ "$input" =~ ^[0-9]+$ ]]; then
         echo "$input"
     else
@@ -127,9 +153,15 @@ parse_size_mb() {
 # 环境检查
 #------------------------------------------------------------------------------
 preflight() {
+    detect_exec_mode
+
     if [ "$(id -u)" -ne 0 ]; then
         err "本脚本必须以 root 权限运行"
-        echo "    请使用: sudo bash $0"
+        if [ "$RUN_MODE" = "pipe" ]; then
+            echo "    请使用: sudo bash <(wget -qO- ${UPDATE_URL}) install"
+        else
+            echo "    请使用: sudo bash ${SELF_PATH:-$0}"
+        fi
         exit 1
     fi
 
@@ -144,33 +176,28 @@ preflight() {
     fi
 
     KERNEL="$(uname -r)"
-
     mkdir -p "$BACKUP_DIR"
     touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/linux-tools-$(date +%Y%m%d).log"
     log "==== 脚本启动 v${VERSION} | ${OS_PRETTY} | kernel ${KERNEL} ===="
+    log "运行模式: $([ "$RUN_MODE" = "pipe" ] && echo "管道 (需 install 到 ${INSTALL_PATH} 才能持久化)" || echo "本地文件 (${SELF_PATH})")"
 
     detect_virt
-    if [ "$VIRT_TYPE" != "none" ]; then
-        log "虚拟化环境: ${VIRT_TYPE}"
-    fi
+    [ "$VIRT_TYPE" != "none" ] && log "虚拟化环境: ${VIRT_TYPE}"
 
     if [ "$OS_ID" != "debian" ] && [ "$OS_ID" != "ubuntu" ]; then
         warn "当前系统为 ${OS_PRETTY}，本脚本主要针对 Debian/Ubuntu 优化，部分功能可能不适用"
     fi
 }
 
-# 各功能开始前的虚拟化提示（在进入具体操作时调用）
 virt_warn_for() {
     local action="$1"
     case "$VIRT_TYPE" in
         openvz)
             warn "检测到 OpenVZ 环境，${action} 在 OpenVZ 下可能不生效或不支持"
-            confirm "是否仍继续?" || { info "已取消"; return 1; }
-            ;;
+            confirm "是否仍继续?" || { info "已取消"; return 1; } ;;
         lxc|container|docker)
             warn "检测到容器环境 (${VIRT_TYPE})，${action} 可能影响宿主机或不被允许"
-            confirm "是否仍继续?" || { info "已取消"; return 1; }
-            ;;
+            confirm "是否仍继续?" || { info "已取消"; return 1; } ;;
     esac
     return 0
 }
@@ -191,25 +218,14 @@ do_hostname() {
         read -r -p "${C_CYAN}请输入新主机名 (字母/数字/连字符/点，支持 FQDN): ${C_RESET}" NEW_HOST
     fi
 
-    if [ -z "$NEW_HOST" ]; then
-        warn "未输入，已取消"
-        return 1
-    fi
-    # [v1.1] 允许点号以支持 FQDN（兼容老脚本 hostname-set.sh 行为）
+    [ -z "$NEW_HOST" ] && { warn "未输入，已取消"; return 1; }
     if ! [[ "$NEW_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
-        err "主机名格式非法：字母/数字/连字符/点，不能以连字符或点开头/结尾"
-        return 1
+        err "主机名格式非法：字母/数字/连字符/点，不能以连字符或点开头/结尾"; return 1
     fi
-    if [ ${#NEW_HOST} -gt 253 ]; then
-        err "主机名过长（FQDN 上限 253 字符）"
-        return 1
-    fi
+    [ ${#NEW_HOST} -gt 253 ] && { err "主机名过长（FQDN 上限 253 字符）"; return 1; }
     NEW_HOST="$(echo "$NEW_HOST" | tr 'A-Z' 'a-z')"
 
-    if [ "$NEW_HOST" = "$(hostname)" ]; then
-        warn "新主机名与当前一致，无需修改"
-        return 0
-    fi
+    [ "$NEW_HOST" = "$(hostname)" ] && { warn "新主机名与当前一致，无需修改"; return 0; }
 
     confirm "确认将主机名修改为 ${NEW_HOST} ?" || { info "已取消"; return 1; }
 
@@ -245,11 +261,8 @@ do_hostname() {
     chmod 644 /etc/hosts
 
     ok "主机名已修改为 ${NEW_HOST}"
-    echo
-    echo "  生效后的 /etc/hosts:"
-    sed 's/^/    /' /etc/hosts
-    echo
-    info "hostname 已即时生效；部分服务（如 SSH 横幅、面板）需重启或重新登录后刷新"
+    echo; echo "  生效后的 /etc/hosts:"; sed 's/^/    /' /etc/hosts; echo
+    info "hostname 已即时生效；部分服务需重启或重新登录后刷新"
     log "主机名修改: ${OLD_HOST:-none} -> ${NEW_HOST}"
 }
 
@@ -258,9 +271,7 @@ do_hostname() {
 #------------------------------------------------------------------------------
 do_ipv4_first() {
     title "2. 设置 IPv4 解析优先"
-
-    echo "  原理: 通过 /etc/gai.conf 提高 IPv4 映射地址 (::ffff:0:0/96) 优先级，"
-    echo "        使 getaddrinfo() 优先返回 A 记录。"
+    echo "  原理: 通过 /etc/gai.conf 提高 IPv4 映射地址 (::ffff:0:0/96) 优先级"
     echo
     echo "  当前状态:"
     if [ -f /etc/gai.conf ] \
@@ -275,17 +286,13 @@ do_ipv4_first() {
         echo "    ${C_YELL}未启用${C_RESET}"
     fi
     echo
-    echo "  验证测试:"
     getent ahosts "$(hostname)" 2>/dev/null | head -3 | sed 's/^/      /'
 
-    if ! confirm "是否启用 IPv4 解析优先?"; then
-        info "已取消"; return 0
-    fi
+    confirm "是否启用 IPv4 解析优先?" || { info "已取消"; return 0; }
 
     backup_file /etc/gai.conf
     touch /etc/gai.conf
 
-    # [FIX 1] 强制 precedence = 100：删除所有该前缀行再追加
     sed -i -E '/^[[:space:]]*#?[[:space:]]*precedence[[:space:]]+::ffff:0:0\/96/d' /etc/gai.conf
     {
         echo ""
@@ -293,7 +300,6 @@ do_ipv4_first() {
         echo "precedence ::ffff:0:0/96  100"
     } >> /etc/gai.conf
 
-    # 调整 /etc/hosts 顺序：IPv4 记录前移，IPv6 后置
     if [ -f /etc/hosts ]; then
         awk 'BEGIN{rest="";v6=""}
              /^::1/{v6=v6 $0 ORS; next}
@@ -301,18 +307,15 @@ do_ipv4_first() {
              {rest=rest $0 ORS}
              END{printf "%s%s", rest, v6}' /etc/hosts > /etc/hosts.new
         if [ -s /etc/hosts.new ]; then
-            cat /etc/hosts.new > /etc/hosts
-            chmod 644 /etc/hosts
+            cat /etc/hosts.new > /etc/hosts; chmod 644 /etc/hosts
         fi
         rm -f /etc/hosts.new
         info "已调整 /etc/hosts 中 IPv4 记录顺序"
     fi
 
     ok "IPv4 解析优先已启用（立即生效）"
-    echo "  生效内容:"
-    grep -nE '^[[:space:]]*precedence' /etc/gai.conf | sed 's/^/    /'
+    echo "  生效内容:"; grep -nE '^[[:space:]]*precedence' /etc/gai.conf | sed 's/^/    /'
     echo
-    echo "  验证命令: getent ahosts example.com | head"
     getent ahosts example.com 2>/dev/null | head -4 | sed 's/^/    /'
     log "已启用 IPv4 解析优先"
 }
@@ -362,12 +365,8 @@ menu_dns() {
 }
 
 dns_apply() {
-    echo
-    echo "  将写入以下 DNS:"
-    echo "$DNS_CONTENT" | sed 's/^/    /'
-    if ! confirm "确认写入并锁定 /etc/resolv.conf ?"; then
-        info "已取消"; return 0
-    fi
+    echo; echo "  将写入以下 DNS:"; echo "$DNS_CONTENT" | sed 's/^/    /'
+    confirm "确认写入并锁定 /etc/resolv.conf ?" || { info "已取消"; return 0; }
 
     backup_file /etc/resolv.conf
 
@@ -410,8 +409,7 @@ dns_apply() {
     fi
 
     log "DNS 已配置并锁定"
-    echo
-    dns_test
+    echo; dns_test
 }
 
 dns_fallback_watch() {
@@ -464,7 +462,6 @@ dns_unlock() {
 }
 
 dns_test() {
-    echo
     echo "  DNS 连通性测试:"
     local d t flag
     for d in 1.1.1.1 8.8.8.8 2606:4700:4700::1111 2001:4860:4860::8888; do
@@ -499,15 +496,11 @@ dns_test() {
 #------------------------------------------------------------------------------
 menu_swap() {
     title "4. 交换分区 (Swap) 管理"
-    # [v1.1] 虚拟化预警
-    if [ "$VIRT_TYPE" = "openvz" ]; then
-        warn "当前为 OpenVZ 环境，swap 操作通常不被支持，可能失败"
-    fi
+    [ "$VIRT_TYPE" = "openvz" ] && warn "当前为 OpenVZ 环境，swap 操作通常不被支持"
 
     while true; do
         echo
-        echo "  内存概况:"
-        free -h 2>/dev/null | sed 's/^/    /'
+        echo "  内存概况:"; free -h 2>/dev/null | sed 's/^/    /'
         echo
         echo "  当前 Swap 设备:"
         if swapon --show=NAME,TYPE,SIZE,USED,PRIO --noheadings 2>/dev/null | grep -q .; then
@@ -519,7 +512,6 @@ menu_swap() {
         fi
         echo
         echo "  /etc/fstab 中的 swap 条目:"
-        # [FIX 2] 避免 grep|sed 掩盖 grep 的失败
         if grep -qE '\sswap\s|swapfile' /etc/fstab 2>/dev/null; then
             grep -nE '\sswap\s|swapfile' /etc/fstab | sed 's/^/    /'
         else
@@ -527,10 +519,11 @@ menu_swap() {
         fi
         echo
         echo "  vm.swappiness = $(cat /proc/sys/vm/swappiness 2>/dev/null || echo '未知')"
+        echo "  默认 swappiness (新建时) = ${SWAPPINESS_DEFAULT}"
         echo
         echo "  ${C_BOLD}[1]${C_RESET} 添加 swap 文件"
-        echo "  ${C_BOLD}[2]${C_RESET} 添加 swap 分区（已有未挂载的分区/设备）"
-        echo "  ${C_BOLD}[3]${C_RESET} 删除 swap（文件或分区）"
+        echo "  ${C_BOLD}[2]${C_RESET} 添加 swap 分区"
+        echo "  ${C_BOLD}[3]${C_RESET} 删除 swap"
         echo "  ${C_BOLD}[4]${C_RESET} 调整 vm.swappiness"
         echo "  ${C_BOLD}[0]${C_RESET} 返回主菜单"
         echo
@@ -549,50 +542,40 @@ menu_swap() {
 swap_add_file() {
     local SIZE_INPUT="${1:-}" SWAPFILE="${2:-}"
 
-    echo
-    echo "  磁盘剩余空间:"
-    df -h / | sed 's/^/    /'
-    echo
+    echo; echo "  磁盘剩余空间:"; df -h / | sed 's/^/    /'; echo
 
-    if [ -z "$SIZE_INPUT" ]; then
+    # [R2] ASSUME_YES 时跳过 read，避免误吞 stdin 数据
+    if [ -z "$SIZE_INPUT" ] && [ "$ASSUME_YES" != "1" ]; then
         read -r -p "${C_CYAN}swap 文件大小 (支持 512M / 2G，默认 1024M): ${C_RESET}" SIZE_INPUT
     fi
     SIZE_INPUT="${SIZE_INPUT:-1024M}"
 
-    # [v1.1] 智能解析大小
     local SIZE_MB
     SIZE_MB="$(parse_size_mb "$SIZE_INPUT")"
     if [ -z "$SIZE_MB" ] || [ "$SIZE_MB" -lt 64 ]; then
-        err "大小无效或过小（最小 64MB），输入: ${SIZE_INPUT}"
-        return 1
+        err "大小无效或过小（最小 64MB），输入: ${SIZE_INPUT}"; return 1
     fi
 
-    if [ -z "$SWAPFILE" ]; then
+    # [R2] ASSUME_YES 时跳过 read
+    if [ -z "$SWAPFILE" ] && [ "$ASSUME_YES" != "1" ]; then
         read -r -p "${C_CYAN}文件路径 [默认 /swapfile]: ${C_RESET}" SWAPFILE
     fi
     SWAPFILE="${SWAPFILE:-/swapfile}"
 
-    # [FIX 4] 绝对路径校验
     if [[ "$SWAPFILE" != /* ]]; then
-        err "请使用绝对路径（如 /swapfile），当前输入: ${SWAPFILE}"
-        return 1
+        err "请使用绝对路径（如 /swapfile），当前输入: ${SWAPFILE}"; return 1
     fi
 
     local avail_kb
     avail_kb=$(df -Pk "$(dirname "$SWAPFILE")" 2>/dev/null | awk 'NR==2{print $4}')
     if [ -n "$avail_kb" ] && [ "$((SIZE_MB * 1024))" -gt "$avail_kb" ]; then
-        err "空间不足：需要 ${SIZE_MB}MB，可用 $((avail_kb / 1024))MB"
-        return 1
+        err "空间不足：需要 ${SIZE_MB}MB，可用 $((avail_kb / 1024))MB"; return 1
     fi
-    if [ -e "$SWAPFILE" ]; then
-        err "${SWAPFILE} 已存在，请先删除或换路径"
-        return 1
-    fi
+    [ -e "$SWAPFILE" ] && { err "${SWAPFILE} 已存在，请先删除或换路径"; return 1; }
 
-    # 虚拟化环境二次确认（OpenVZ 等）
     virt_warn_for "添加 swap 文件" || return 0
-
-    confirm "确认创建 ${SIZE_MB}MB (${SIZE_INPUT}) 的 swap 文件 ${SWAPFILE} ?" || { info "已取消"; return 0; }
+    confirm "确认创建 ${SIZE_MB}MB (${SIZE_INPUT}) 的 swap 文件 ${SWAPFILE} ?" \
+        || { info "已取消"; return 0; }
 
     info "分配空间 (${SIZE_MB}MB)..."
     if ! fallocate -l "${SIZE_MB}M" "$SWAPFILE" 2>/dev/null; then
@@ -602,9 +585,7 @@ swap_add_file() {
     fi
     [ -s "$SWAPFILE" ] || { err "文件创建失败"; rm -f "$SWAPFILE"; return 1; }
 
-    chmod 600 "$SWAPFILE"
-    ok "权限已设为 600"
-
+    chmod 600 "$SWAPFILE"; ok "权限已设为 600"
     mkswap "$SWAPFILE" >/dev/null 2>&1 || { err "mkswap 失败"; rm -f "$SWAPFILE"; return 1; }
     ok "已格式化"
 
@@ -614,11 +595,9 @@ swap_add_file() {
         err "swapon 失败，常见原因："
         echo "    - 文件系统不支持（btrfs 需在目标目录 chattr +C 后用 dd 重建）"
         echo "    - 文件含空洞：删除后用 dd 重新生成"
-        rm -f "$SWAPFILE"
-        return 1
+        rm -f "$SWAPFILE"; return 1
     fi
 
-    # [FIX 6] awk 按字段精确匹配
     if ! awk -v f="$SWAPFILE" '!/^[[:space:]]*#/ && $1==f {found=1} END{exit !found}' /etc/fstab 2>/dev/null; then
         backup_file /etc/fstab
         echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
@@ -627,30 +606,27 @@ swap_add_file() {
         info "/etc/fstab 已存在该条目，跳过"
     fi
 
-    # [FIX] 不覆盖已有 99-swap.conf（尊重用户 swappiness 设置）
     mkdir -p /etc/sysctl.d
     if [ -f /etc/sysctl.d/99-swap.conf ]; then
         info "/etc/sysctl.d/99-swap.conf 已存在，保留现有配置"
     else
-        cat > /etc/sysctl.d/99-swap.conf <<'EOF'
-# Swap 调优 (由 Linux 运维工具合集 写入)
-vm.swappiness = 10
+        # [R4] 使用可配置的 SWAPPINESS_DEFAULT
+        cat > /etc/sysctl.d/99-swap.conf <<EOF
+# Swap 调优 (由 ${SCRIPT_NAME} 写入)
+vm.swappiness = ${SWAPPINESS_DEFAULT}
 vm.vfs_cache_pressure = 50
 vm.overcommit_memory = 0
 EOF
         sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-swap.conf >/dev/null 2>&1
-        ok "已写入 /etc/sysctl.d/99-swap.conf 并应用"
+        ok "已写入 /etc/sysctl.d/99-swap.conf (swappiness=${SWAPPINESS_DEFAULT}) 并应用"
     fi
 
-    echo
-    ok "swap 添加完成"
-    free -h | sed 's/^/    /'
-    log "添加 swap 文件 ${SWAPFILE} ${SIZE_MB}MB"
+    echo; ok "swap 添加完成"; free -h | sed 's/^/    /'
+    log "添加 swap 文件 ${SWAPFILE} ${SIZE_MB}MB swappiness=${SWAPPINESS_DEFAULT}"
 }
 
 swap_add_partition() {
-    echo
-    echo "  可用块设备:"
+    echo; echo "  可用块设备:"
     if have lsblk; then
         lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT | sed 's/^/    /'
     else
@@ -661,16 +637,15 @@ swap_add_partition() {
     if [ -z "$DEV" ] || [ ! -b "$DEV" ]; then
         err "无效设备: ${DEV:-空}"; return 1
     fi
-    if findmnt -S "$DEV" >/dev/null 2>&1; then
-        err "该设备已挂载，请先卸载"; return 1
-    fi
+    findmnt -S "$DEV" >/dev/null 2>&1 && { err "该设备已挂载，请先卸载"; return 1; }
     local fstype
     fstype=$(lsblk -no FSTYPE "$DEV" 2>/dev/null || echo "")
     echo
     warn "即将 ${C_RED}格式化${C_RESET} ${DEV}，当前文件系统: ${fstype:-未知}"
-    if ! confirm "该操作会${C_RED}永久清除${C_RESET}设备上所有数据，确认继续?"; then
-        info "已取消"; return 0
-    fi
+    # [R3] 格式化设备前先做虚拟化预警
+    virt_warn_for "将 ${DEV} 格式化为 swap" || return 0
+    confirm "该操作会${C_RED}永久清除${C_RESET}设备上所有数据，确认继续?" \
+        || { info "已取消"; return 0; }
 
     mkswap "$DEV" || { err "mkswap 失败"; return 1; }
     swapon "$DEV" && ok "已启用 swap 分区 ${DEV}" || { err "swapon 失败"; return 1; }
@@ -689,7 +664,6 @@ swap_add_partition() {
     log "添加 swap 分区 ${DEV}"
 }
 
-# [v1.1] 支持直接指定目标（命令行模式），无参数则交互选择
 swap_remove() {
     local target="${1:-}"
 
@@ -698,10 +672,7 @@ swap_remove() {
         while IFS= read -r line; do
             [ -n "$line" ] && entries+=("$line")
         done < <(swapon --show=NAME --noheadings 2>/dev/null)
-
-        if [ "${#entries[@]}" -eq 0 ]; then
-            warn "当前没有已启用的 swap"; return 0
-        fi
+        [ "${#entries[@]}" -eq 0 ] && { warn "当前没有已启用的 swap"; return 0; }
 
         echo "  可删除的 swap:"
         local i=1
@@ -720,40 +691,31 @@ swap_remove() {
         target="${entries[$((idx - 1))]}"
     fi
 
-    # 校验目标确实是已启用的 swap
-    if ! swapon --show=NAME --noheadings 2>/dev/null | grep -qxF "$target"; then
-        err "该设备/文件未启用为 swap: ${target}"
-        return 1
-    fi
+    swapon --show=NAME --noheadings 2>/dev/null | grep -qxF "$target" \
+        || { err "该设备/文件未启用为 swap: ${target}"; return 1; }
 
-    echo
-    warn "目标: ${target}"
-    if ! confirm "确认关闭并移除该 swap?"; then
-        info "已取消"; return 0
-    fi
+    echo; warn "目标: ${target}"
+    confirm "确认关闭并移除该 swap?" || { info "已取消"; return 0; }
 
     swapoff "$target" && ok "已关闭 ${target}" \
         || { err "swapoff 失败（内存不足时无法回迁）"; return 1; }
 
     backup_file /etc/fstab
-    # [FIX 6] awk 按路径或 UUID 精确删除
-    if grep -qF "$target" /etc/fstab 2>/dev/null; then
+    if awk -v t="$target" '!/^[[:space:]]*#/ && $1==t && /[[:space:]]swap[[:space:]]/{f=1} END{exit !f}' /etc/fstab 2>/dev/null; then
         awk -v t="$target" '
             /^[[:space:]]*#/ { print; next }
-            index($0, t) && /[[:space:]]swap[[:space:]]/ { next }
-            { print }
-        ' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+            $1==t && /[[:space:]]swap[[:space:]]/ { next }
+            { print }' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
         chmod 644 /etc/fstab
         ok "已从 /etc/fstab 移除 ${target}"
     else
         local u
         u=$(blkid -s UUID -o value "$target" 2>/dev/null)
-        if [ -n "$u" ] && grep -q "UUID=${u}" /etc/fstab 2>/dev/null; then
+        if [ -n "$u" ] && awk -v u="UUID=${u}" '!/^[[:space:]]*#/ && $1==u && /[[:space:]]swap[[:space:]]/{f=1} END{exit !f}' /etc/fstab 2>/dev/null; then
             awk -v u="UUID=${u}" '
                 /^[[:space:]]*#/ { print; next }
-                index($0, u) && /[[:space:]]swap[[:space:]]/ { next }
-                { print }
-            ' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
+                $1==u && /[[:space:]]swap[[:space:]]/ { next }
+                { print }' /etc/fstab > /etc/fstab.tmp && mv /etc/fstab.tmp /etc/fstab
             chmod 644 /etc/fstab
             ok "已从 /etc/fstab 移除 UUID 条目: ${u}"
         else
@@ -778,12 +740,9 @@ swap_remove() {
 
 swap_swappiness() {
     local v="${1:-}"
-    echo
-    echo "  当前 vm.swappiness = $(cat /proc/sys/vm/swappiness 2>/dev/null)"
+    echo; echo "  当前 vm.swappiness = $(cat /proc/sys/vm/swappiness 2>/dev/null)"
     echo "  说明: 0-100，值越大越倾向使用 swap。服务器常用 10，桌面常用 60。"
-    if [ -z "$v" ]; then
-        read -r -p "${C_CYAN}请输入新值 (0-100): ${C_RESET}" v
-    fi
+    [ -z "$v" ] && read -r -p "${C_CYAN}请输入新值 (0-100): ${C_RESET}" v
     if ! is_num "$v" || [ "$v" -gt 100 ]; then
         err "请输入 0-100 的整数"; return 1
     fi
@@ -801,7 +760,7 @@ swap_swappiness() {
 }
 
 #------------------------------------------------------------------------------
-# 5. 启用 TCP BBR 拥塞控制
+# 5. 启用 TCP BBR
 #------------------------------------------------------------------------------
 do_bbr() {
     title "5. 启用 TCP BBR 拥塞控制"
@@ -816,15 +775,11 @@ do_bbr() {
     kMajor=$(echo "$KERNEL" | cut -d. -f1)
     kMinor=$(echo "$KERNEL" | cut -d. -f2 | grep -oE '^[0-9]+' || echo 0)
     if [ "$kMajor" -lt 4 ] || { [ "$kMajor" -eq 4 ] && [ "$kMinor" -lt 9 ]; }; then
-        err "内核 ${KERNEL} 过低，BBR 需要 >= 4.9"
-        return 1
+        err "内核 ${KERNEL} 过低，BBR 需要 >= 4.9"; return 1
     fi
-
-    # [v1.1] 融合 bbr-enable.sh: modprobe -n 预检内核是否支持
     if ! modprobe -n tcp_bbr >/dev/null 2>&1; then
         err "当前内核模块池中没有 tcp_bbr，无法启用 BBR"
-        echo "    Debian 13 默认内核 6.x 已原生支持；如为自定义内核请重新编译"
-        return 1
+        echo "    Debian 13 默认内核 6.x 已原生支持；如为自定义内核请重新编译"; return 1
     fi
     info "内核模块 tcp_bbr 可用"
 
@@ -832,18 +787,12 @@ do_bbr() {
     cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     if [ "$cur" = "bbr" ]; then
         ok "TCP BBR 已处于启用状态"
-        if ! confirm "是否仍要重写配置文件以确保重启后生效?"; then
-            return 0
-        fi
+        confirm "是否仍要重写配置文件以确保重启后生效?" || return 0
     fi
 
     virt_warn_for "启用 BBR" || return 0
+    confirm "是否启用 TCP BBR?" || { info "已取消"; return 0; }
 
-    if ! confirm "是否启用 TCP BBR?"; then
-        info "已取消"; return 0
-    fi
-
-    # 加载模块
     if [ ! -d /sys/module/tcp_bbr ]; then
         modprobe tcp_bbr 2>/dev/null && ok "已加载 tcp_bbr 模块" \
             || warn "modprobe tcp_bbr 失败（可能已内置于内核）"
@@ -903,11 +852,15 @@ net.ipv4.ip_local_port_range = 1024 65535
 EOF
     ok "已写入 /etc/sysctl.d/99-bbr.conf"
 
-    # 清理旧位置的历史配置
-    if [ -f /etc/sysctl.conf ] && grep -qE '^\s*net\.ipv4\.tcp_congestion_control' /etc/sysctl.conf; then
+    # [R6][R8] 清理 /etc/sysctl.conf 中的旧 BBR 配置
+    # 保留原因：Debian 12 上 /etc/sysctl.conf 通过 99-sysctl.conf 符号链接加载，
+    # 按文件名排序会排在 99-bbr.conf 之后，旧配置可能覆盖新配置。
+    # Debian 13 上 /etc/sysctl.conf 已被 systemd-sysctl 忽略，清理是无害的"卫生"操作。
+    if [ -f /etc/sysctl.conf ] && \
+       grep -qE '^[[:space:]]*(net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc)' /etc/sysctl.conf; then
         backup_file /etc/sysctl.conf
-        sed -i -E '/^\s*net\.ipv4\.tcp_congestion_control/d; /^\s*net\.core\.default_qdisc/d' /etc/sysctl.conf
-        warn "已清理 /etc/sysctl.conf 中的旧 BBR 配置"
+        sed -i -E '/^[[:space:]]*net\.ipv4\.tcp_congestion_control/d; /^[[:space:]]*net\.core\.default_qdisc/d' /etc/sysctl.conf
+        warn "已清理 /etc/sysctl.conf 中的旧 BBR 配置（Debian 12 兼容性保障）"
     fi
 
     info "应用配置中..."
@@ -919,8 +872,7 @@ EOF
         sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
     fi
 
-    echo
-    title "验证结果"
+    echo; title "验证结果"
     local nowAlgo nowQdisc
     nowAlgo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     nowQdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
@@ -930,16 +882,13 @@ EOF
     echo "  可用算法: $(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
 
     if [ "$nowAlgo" = "bbr" ] && [ "$nowQdisc" = "fq" ]; then
-        echo
-        ok "TCP BBR 启用成功，配置已持久化"
+        echo; ok "TCP BBR 启用成功，配置已持久化"
     elif [ "$nowAlgo" = "bbr" ]; then
-        echo
-        warn "BBR 已启用，qdisc 为 ${nowQdisc}（尝试加载 sch_fq）"
+        echo; warn "BBR 已启用，qdisc 为 ${nowQdisc}（尝试加载 sch_fq）"
         modprobe sch_fq 2>/dev/null && sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
         echo "  当前 qdisc: $(sysctl -n net.core.default_qdisc)"
     else
-        echo
-        err "BBR 未生效，请检查:"
+        echo; err "BBR 未生效，请检查:"
         echo "    1) lsmod | grep bbr        → 模块是否加载"
         echo "    2) uname -r                → 内核是否 >= 4.9"
         echo "    3) 是否为 OpenVZ/LXC 容器 → 不支持自定义拥塞算法"
@@ -949,18 +898,47 @@ EOF
 }
 
 #------------------------------------------------------------------------------
-# 6. 更新脚本
+# 6. 更新 / 安装到固定位置
 #------------------------------------------------------------------------------
-menu_update() {
-    title "6. 更新 ${SCRIPT_NAME}"
+show_update_header() {
+    local target="$1"
+    title "6. 更新 / 安装 ${SCRIPT_NAME}"
 
     echo "  当前版本 : v${VERSION}"
-    echo "  当前路径 : ${SELF_PATH}"
+    if [ "$RUN_MODE" = "pipe" ]; then
+        echo "  运行模式 : 管道"
+    else
+        echo "  运行模式 : 本地文件"
+        echo "  当前路径 : ${SELF_PATH}"
+    fi
+    local tag
+    if [ -f "$target" ]; then
+        local tv
+        tv=$(grep -m1 -oE 'VERSION="[0-9][^"]*"' "$target" 2>/dev/null | cut -d'"' -f2)
+        tag="[已存在, v${tv:-未知}]"
+    else
+        tag="[新装]"
+    fi
+    echo "  目标位置 : ${target} ${tag}"
     echo "  更新源   : ${UPDATE_URL}"
     echo
+    if [ "$RUN_MODE" = "pipe" ]; then
+        echo "  ${C_DIM}说明: 管道模式无法原地更新，将下载并安装到 ${target}${C_RESET}"
+    elif [ "$SELF_PATH" = "$target" ]; then
+        echo "  ${C_DIM}说明: 原地升级 ${target}${C_RESET}"
+    else
+        echo "  ${C_DIM}说明: 当前脚本不在标准位置，将迁移到 ${target}${C_RESET}"
+    fi
+    echo
+}
+
+do_download_and_install() {
+    local target="${1:-$INSTALL_PATH}"
+
+    show_update_header "$target"
 
     if ! have curl && ! have wget; then
-        err "未找到 curl 或 wget，无法下载更新"
+        err "未找到 curl 或 wget，无法下载"
         echo "    安装: apt-get update && apt-get install -y curl"
         return 1
     fi
@@ -969,8 +947,7 @@ menu_update() {
     tmp_new="$(mktemp /tmp/linux-tools-new.XXXXXX.sh)"
     info "正在拉取最新版本（强制绕过缓存）..."
 
-    local nocache="t=$(date +%s%N)"
-    local ok_dl=0
+    local nocache="t=$(date +%s%N)" ok_dl=0
     if have curl; then
         if curl -fsSL --connect-timeout 15 --max-time 120 --retry 2 \
                 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
@@ -1001,7 +978,6 @@ menu_update() {
     newVer=$(grep -m1 -oE 'VERSION="[0-9][^"]*"' "$tmp_new" | cut -d'"' -f2)
     newVer="${newVer:-未知}"
 
-    echo
     echo "  ${C_BOLD}下载完成，安全校验:${C_RESET}"
     printf "    %-14s %s bytes\n" "文件大小" "$size"
     printf "    %-14s v%s\n" "远端版本" "$newVer"
@@ -1029,48 +1005,74 @@ menu_update() {
 
     if [ "$newVer" = "$VERSION" ]; then
         warn "远端版本与本地相同 (v${newVer})"
-        if ! confirm "是否仍然强制覆盖安装?"; then
-            rm -f "$tmp_new"; info "已取消"; return 0
-        fi
+        confirm "是否仍然强制覆盖安装?" || { rm -f "$tmp_new"; info "已取消"; return 0; }
     fi
 
-    if have diff && [ -f "$SELF_PATH" ]; then
+    if have diff && [ -f "$target" ]; then
         echo
-        echo "  ${C_BOLD}变更摘要 (diff):${C_RESET}"
+        echo "  ${C_BOLD}变更摘要 (diff ${target} → 远端):${C_RESET}"
         local dl
-        dl=$(diff "$SELF_PATH" "$tmp_new" | grep -cE '^[<>]' 2>/dev/null || echo 0)
+        dl=$(diff "$target" "$tmp_new" 2>/dev/null | grep -cE '^[<>]')
+        dl="${dl:-0}"
         echo "    共 ${dl} 行差异，前 25 行预览:"
-        diff "$SELF_PATH" "$tmp_new" 2>/dev/null | head -25 | sed 's/^/      /'
+        diff "$target" "$tmp_new" 2>/dev/null | head -25 | sed 's/^/      /'
         [ "$dl" -gt 25 ] && echo "      ${C_DIM}... (其余 ${dl} 行已省略)${C_RESET}"
     fi
 
     echo
-    warn "${C_BOLD}即将用远端脚本覆盖本地: ${SELF_PATH}${C_RESET}"
-    warn "远端代码来自第三方仓库，覆盖后将以 root 权限运行。"
-    if ! confirm "确认安装 v${newVer} ?"; then
-        rm -f "$tmp_new"; info "已取消"; return 0
+    if [ "$SELF_PATH" = "$target" ]; then
+        warn "${C_BOLD}即将用 v${newVer} 覆盖 ${target}${C_RESET}"
+    else
+        warn "${C_BOLD}即将把 v${newVer} 安装到 ${target}${C_RESET}"
+        [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ] && [ "$SELF_PATH" != "$target" ] \
+            && echo "  当前运行文件 ${SELF_PATH} 保持不变"
+    fi
+    warn "远端代码来自第三方仓库，将以 root 权限运行；请先核对上方 SHA256 与 diff"
+    confirm "确认安装 v${newVer} 到 ${target} ?" \
+        || { rm -f "$tmp_new"; info "已取消"; return 0; }
+
+    local target_dir
+    target_dir="$(dirname "$target")"
+    if [ ! -d "$target_dir" ]; then
+        mkdir -p "$target_dir" 2>/dev/null \
+            || { rm -f "$tmp_new"; err "无法创建目录: ${target_dir}"; return 1; }
     fi
 
-    # [FIX 3] 原子替换
-    backup_file "$SELF_PATH"
-    local new_tmp="${SELF_PATH}.new"
-    if cp "$tmp_new" "$new_tmp" 2>/dev/null \
-       && chmod +x "$new_tmp" 2>/dev/null \
-       && mv -f "$new_tmp" "$SELF_PATH" 2>/dev/null; then
-        ok "更新成功: v${VERSION} → v${newVer}"
-        ok "原文件已备份至 ${BACKUP_DIR}"
-        log "脚本更新 v${VERSION} -> v${newVer}"
+    [ -f "$target" ] && backup_file "$target"
+
+    if cp "$tmp_new" "${target}.new" 2>/dev/null \
+       && chmod +x "${target}.new" 2>/dev/null \
+       && mv -f "${target}.new" "$target" 2>/dev/null; then
         rm -f "$tmp_new"
-        if confirm "是否立即运行新版本?"; then
-            echo; info "正在启动新版本..."; sleep 1
-            exec bash "$SELF_PATH"
+        if [ "$SELF_PATH" = "$target" ]; then
+            ok "更新成功: v${VERSION} → v${newVer} (${target})"
+        else
+            ok "安装成功: v${newVer} → ${target}"
+        fi
+        log "安装/更新 v${VERSION} -> v${newVer} @ ${target}"
+
+        if [ "$SELF_PATH" = "$target" ]; then
+            if [ "$ASSUME_YES" != "1" ] && confirm "是否立即运行新版本?"; then
+                echo; info "正在启动新版本..."; sleep 1
+                exec bash "$target"
+            fi
+        elif [ "$RUN_MODE" = "file" ] && [ -n "$SELF_PATH" ] && [ -f "$SELF_PATH" ]; then
+            echo
+            info "原脚本位于 ${SELF_PATH}，已安装到标准位置 ${target}"
+            echo "    运行新版本: bash ${target}"
+            if [ "$ASSUME_YES" != "1" ] && confirm "是否删除原脚本 ${SELF_PATH} ?"; then
+                rm -f "$SELF_PATH" && ok "已删除原脚本"
+            fi
+        else
+            echo
+            info "运行新版本: bash ${target}"
         fi
     else
-        cp -f "$tmp_new" "${SELF_PATH}.new" 2>/dev/null
+        cp -f "$tmp_new" "${target}.new" 2>/dev/null
         rm -f "$tmp_new"
-        err "无法写入 ${SELF_PATH}"
-        echo "    新版本已保存为: ${SELF_PATH}.new"
-        echo "    手动替换: mv -f '${SELF_PATH}.new' '${SELF_PATH}' && chmod +x '${SELF_PATH}'"
+        err "无法写入 ${target}（可能被占用或权限不足）"
+        echo "    新版本已保存为: ${target}.new"
+        echo "    手动替换: mv -f '${target}.new' '${target}' && chmod +x '${target}'"
         return 1
     fi
 }
@@ -1079,18 +1081,30 @@ menu_update() {
 # 系统信息面板
 #------------------------------------------------------------------------------
 show_sysinfo() {
-    echo "${C_DIM}────────────────────────────────────────────────────────${C_RESET}"
-    printf "  %-10s %s\n" "系统"   "${OS_PRETTY}"
-    printf "  %-10s %s\n" "内核"   "${KERNEL}"
-    printf "  %-10s %s\n" "虚拟化" "${VIRT_TYPE}"
-    printf "  %-10s %s\n" "主机名" "$(hostname)"
-    printf "  %-10s %s\n" "IP"     "$(hostname -I 2>/dev/null | awk '{print $1}' || echo '未知')"
-    printf "  %-10s %s\n" "运行"   "$(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/')"
-    printf "  %-10s %s %s\n" "拥塞算法" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" \
-                                  "$( [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ] && echo "${C_GREEN}(BBR ✓)${C_RESET}" )"
-    printf "  %-10s %s\n" "Swap"   "$(free -h 2>/dev/null | awk '/^Swap:/{print $3" / "$2}')"
+    local mode_str
+    if [ "$RUN_MODE" = "pipe" ]; then
+        mode_str="管道"
+    else
+        mode_str="本地文件"
+    fi
 
-    # [v1.1] DNS 锁状态更准确
+    local install_str
+    if [ -f "$INSTALL_PATH" ]; then
+        local iv
+        iv=$(grep -m1 -oE 'VERSION="[0-9][^"]*"' "$INSTALL_PATH" 2>/dev/null | cut -d'"' -f2)
+        install_str="${INSTALL_PATH} ${C_GREEN}✓${C_RESET} (v${iv:-?})"
+    else
+        install_str="${INSTALL_PATH} ${C_YELL}未安装${C_RESET}"
+    fi
+
+    local first_ip
+    first_ip=$(hostname -I 2>/dev/null | awk '{print $1; exit}')
+
+    # [R5] 合并 sysctl 调用
+    local cc_val cc_mark
+    cc_val=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    [ "$cc_val" = "bbr" ] && cc_mark="${C_GREEN}(BBR ✓)${C_RESET}" || cc_mark=""
+
     local dns_lock="未知"
     if have lsattr && [ -e /etc/resolv.conf ]; then
         if lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}' | grep -q i; then
@@ -1099,7 +1113,19 @@ show_sysinfo() {
             dns_lock="未锁定"
         fi
     fi
-    printf "  %-10s %s\n" "DNS锁" "$dns_lock"
+
+    echo "${C_DIM}────────────────────────────────────────────────────────${C_RESET}"
+    printf "  %-10s %s\n" "系统"     "${OS_PRETTY}"
+    printf "  %-10s %s\n" "内核"     "${KERNEL}"
+    printf "  %-10s %s\n" "虚拟化"   "${VIRT_TYPE}"
+    printf "  %-10s %s\n" "主机名"   "$(hostname)"
+    printf "  %-10s %s\n" "IP"       "${first_ip:-未知}"
+    printf "  %-10s %s\n" "运行"     "$(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/')"
+    printf "  %-10s %s %s\n" "拥塞算法" "${cc_val:-未知}" "$cc_mark"
+    printf "  %-10s %s\n" "Swap"     "$(free -h 2>/dev/null | awk '/^Swap:/{print $3" / "$2}')"
+    printf "  %-10s %s\n" "DNS锁"    "$dns_lock"
+    printf "  %-10s %s\n" "运行模式" "$mode_str"
+    printf "  %-10s %s\n" "安装位置" "$install_str"
     echo "${C_DIM}────────────────────────────────────────────────────────${C_RESET}"
 }
 
@@ -1111,31 +1137,43 @@ show_help() {
 ${SCRIPT_NAME} v${VERSION}
 
 用法:
-  bash $(basename "$SELF_PATH")                       进入交互菜单
-  bash $(basename "$SELF_PATH") <子命令> [参数...]    非交互执行（适合自动化）
+  bash ${INSTALL_PATH}                      进入交互菜单（需已安装）
+  bash <(wget -qO- URL)                     直接进入交互菜单（保留 tty）
+  curl -fsSL URL | bash -s -- <子命令>      非交互执行
+  bash ${INSTALL_PATH} <子命令> [参数...]   非交互执行
 
 子命令:
   hostname <新主机名>          修改主机名并同步 /etc/hosts
   ipv4-first                   设置 IPv4 解析优先
-  dns apply                    写入预设 DNS 并锁定 /etc/resolv.conf
-  dns unlock                   解锁 /etc/resolv.conf
-  dns test                     测试 DNS 连通性
+  dns apply|unlock|test        配置 / 解锁 / 测试 DNS
   swap-list                    列出当前 swap
   swap-add <大小> [路径]       添加 swap 文件，如 swap-add 2G /swapfile
-                               大小支持 512M / 2G / 1024（纯数字视为 MB）
-  swap-remove <路径|设备>      移除指定 swap
+  swap-remove <路径|设备>      移除指定 swap（精确匹配 fstab 条目）
   swap-swappiness <0-100>      设置 vm.swappiness
   bbr                          启用 TCP BBR 拥塞控制
-  update                       更新脚本到最新版本
+  update                       更新/安装到 ${INSTALL_PATH}
+  install [路径]               安装到指定路径（默认 ${INSTALL_PATH}）
   info                         显示系统信息
   help                         显示本帮助
 
+默认安装位置: ${INSTALL_PATH}
+
+环境变量:
+  SWAPPINESS_DEFAULT=20        新建 swap 文件时的默认 swappiness（默认 10）
+
 示例:
-  bash $(basename "$SELF_PATH") hostname web01
-  bash $(basename "$SELF_PATH") swap-add 2G
-  bash $(basename "$SELF_PATH") swap-remove /swapfile
-  bash $(basename "$SELF_PATH") dns apply
-  bash $(basename "$SELF_PATH") bbr
+  # 首次安装
+  curl -fsSL ${UPDATE_URL} | bash -s -- install
+  bash /root/linux-tools.sh
+
+  # 常用命令
+  bash /root/linux-tools.sh hostname web01
+  bash /root/linux-tools.sh swap-add 2G
+  bash /root/linux-tools.sh bbr
+  bash /root/linux-tools.sh update
+
+  # 自定义 swappiness
+  SWAPPINESS_DEFAULT=20 bash /root/linux-tools.sh swap-add 2G
 EOF
 }
 
@@ -1143,8 +1181,7 @@ cmd_swap_list() {
     local rows
     rows=$(swapon --show=NAME,TYPE,SIZE,USED,PRIO --noheadings 2>/dev/null)
     if [ -z "$rows" ]; then
-        echo "无已启用的 swap"
-        return 0
+        echo "无已启用的 swap"; return 0
     fi
     printf "%-24s %-8s %-8s %-8s %-6s\n" "设备" "类型" "大小" "已用" "优先级"
     printf '%s\n' "$rows" | awk '{printf "%-24s %-8s %-8s %-8s %-6s\n",$1,$2,$3,$4,$5}'
@@ -1152,63 +1189,71 @@ cmd_swap_list() {
 
 cmd_dispatch() {
     local cmd="$1"; shift
-    # 命令行模式默认自动确认（危险操作已通过"目标必须存在/已启用"校验）
     ASSUME_YES=1
 
     case "$cmd" in
         hostname)
             [ -n "${1:-}" ] || { err "用法: hostname <新主机名>"; exit 1; }
-            do_hostname "$1"
-            ;;
+            do_hostname "$1" ;;
         ipv4-first)
-            do_ipv4_first
-            ;;
+            do_ipv4_first ;;
         dns)
             case "${1:-}" in
                 apply)  dns_apply ;;
                 unlock) dns_unlock ;;
                 test)   dns_test ;;
                 *) err "用法: dns apply|unlock|test"; exit 1 ;;
-            esac
-            ;;
+            esac ;;
         swap-list)
-            cmd_swap_list
-            ;;
+            cmd_swap_list ;;
         swap-add)
-            [ -n "${1:-}" ] || { err "用法: swap-add <大小> [路径]，如 swap-add 2G"; exit 1; }
-            swap_add_file "$1" "${2:-}"
-            ;;
+            [ -n "${1:-}" ] || { err "用法: swap-add <大小> [路径]"; exit 1; }
+            swap_add_file "$1" "${2:-}" ;;
         swap-remove)
             [ -n "${1:-}" ] || { err "用法: swap-remove <路径|设备>"; exit 1; }
-            swap_remove "$1"
-            ;;
+            swap_remove "$1" ;;
         swap-swappiness)
             [ -n "${1:-}" ] || { err "用法: swap-swappiness <0-100>"; exit 1; }
-            swap_swappiness "$1"
-            ;;
+            swap_swappiness "$1" ;;
         bbr)
-            do_bbr
-            ;;
+            do_bbr ;;
         update)
-            menu_update
-            ;;
+            do_download_and_install "$INSTALL_PATH" ;;
+        install)
+            # [R1] 路径黑名单补全 /usr/bin /usr/sbin
+            local t="${1:-$INSTALL_PATH}"
+            if [[ "$t" != /* ]]; then
+                err "install 需要绝对路径: ${t}"; exit 1
+            fi
+            case "$t" in
+                /etc/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/boot/*|/sys/*|/proc/*|/dev/*|/usr/bin/*|/usr/sbin/*)
+                    err "拒绝安装到系统目录: ${t}"
+                    echo "    建议: ${INSTALL_PATH} 或 /usr/local/bin/linux-tools"
+                    exit 1 ;;
+            esac
+            do_download_and_install "$t" ;;
         info)
-            show_sysinfo
-            ;;
+            show_sysinfo ;;
         help|-h|--help)
-            show_help
-            ;;
+            show_help ;;
         *)
-            err "未知子命令: ${cmd}"
-            show_help
-            exit 1
-            ;;
+            err "未知子命令: ${cmd}"; show_help; exit 1 ;;
     esac
 }
 
 #------------------------------------------------------------------------------
 # 主菜单
 #------------------------------------------------------------------------------
+menu_item_6_text() {
+    if [ "$RUN_MODE" = "pipe" ]; then
+        echo "安装到 ${INSTALL_PATH}"
+    elif [ "$SELF_PATH" = "$INSTALL_PATH" ]; then
+        echo "更新 ${SCRIPT_NAME}"
+    else
+        echo "迁移到 ${INSTALL_PATH} 并更新"
+    fi
+}
+
 main_menu() {
     while true; do
         clear 2>/dev/null || printf '\033c'
@@ -1223,7 +1268,7 @@ main_menu() {
         echo "    ${C_BOLD}${C_GREEN}3${C_RESET})  配置 DNS 并锁定 resolv.conf"
         echo "    ${C_BOLD}${C_GREEN}4${C_RESET})  交换分区添加/删除管理"
         echo "    ${C_BOLD}${C_GREEN}5${C_RESET})  启用 TCP BBR 拥塞控制"
-        echo "    ${C_BOLD}${C_GREEN}6${C_RESET})  更新 ${SCRIPT_NAME}"
+        echo "    ${C_BOLD}${C_GREEN}6${C_RESET})  $(menu_item_6_text)"
         echo
         echo "    ${C_BOLD}${C_RED}0${C_RESET})  退出"
         echo
@@ -1234,15 +1279,14 @@ main_menu() {
             3) menu_dns ;;
             4) menu_swap ;;
             5) do_bbr;         pause ;;
-            6) menu_update;    pause ;;
+            6) do_download_and_install "$INSTALL_PATH"; pause ;;
             0|q|Q|exit)
                 echo
                 info "日志已保存至: ${LOG_FILE}"
                 info "配置备份位于: ${BACKUP_DIR}"
                 ok "再见"
                 log "==== 脚本退出 ===="
-                exit 0
-                ;;
+                exit 0 ;;
             "") ;;
             *) warn "无效选项: ${choice}"; sleep 1 ;;
         esac
@@ -1257,6 +1301,21 @@ trap 'echo; err "脚本被中断"; log "中断退出"; exit 130' INT
 preflight
 
 if [ $# -eq 0 ]; then
+    if [ "$RUN_MODE" = "pipe" ] && [ ! -t 0 ]; then
+        err "管道模式 (curl|bash) 且 stdin 非终端，无法进入交互菜单"
+        echo
+        echo "  请使用以下任一方式:"
+        echo "    1) 先安装到固定位置:"
+        echo "         curl -fsSL ${UPDATE_URL} | bash -s -- install"
+        echo "         bash ${INSTALL_PATH}"
+        echo "    2) 使用进程替换保留终端:"
+        echo "         bash <(wget -qO- ${UPDATE_URL})"
+        echo "    3) 直接跑子命令:"
+        echo "         curl -fsSL ${UPDATE_URL} | bash -s -- <子命令>"
+        echo
+        echo "  查看帮助: curl -fsSL ${UPDATE_URL} | bash -s -- help"
+        exit 1
+    fi
     main_menu
 else
     cmd_dispatch "$@"
