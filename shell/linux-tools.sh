@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #==============================================================================
-# Linux 运维工具合集 v1.5  (生产就绪版)
+# Linux 运维工具合集 v1.6  (生产就绪版)
 # 适用系统: Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)
 #
 # 交互模式: bash /root/linux-tools.sh
@@ -11,28 +11,22 @@
 # 环境变量覆盖:
 #   SWAPPINESS_DEFAULT=20 bash linux-tools.sh swap-add 2G    # 改变默认 swappiness
 #
-# v1.5 变更（相对 v1.4）:
-#   [R1] install 路径黑名单补全 /usr/bin /usr/sbin
-#   [R2] swap_add_file 中 read 在 ASSUME_YES 时跳过，避免误吞 stdin
-#   [R3] swap_add_partition 增加 virt_warn_for 虚拟化预警
-#   [R4] 新增 SWAPPINESS_DEFAULT 环境变量，可覆盖硬编码值 10
-#   [R5] show_sysinfo 合并重复 sysctl 调用
-#   [R6] sysctl.conf 清理用 [[:space:]] 替代 \s（POSIX 兼容）
-#   [R7] INSTALL_PATH / UPDATE_URL 顶部注释说明区别
-#   [R8] sysctl.conf 清理加注释说明 Debian 12 兼容性原因
-#
-# 保留 v1.0~v1.4 全部修复与增强。
+# v1.6 变更（相对 v1.5）:
+#   [致命修复] 将脚本 VERSION 变量重命名为 SCRIPT_VERSION，避免被 /etc/os-release 覆盖
+#   [逻辑优化] 更新脚本时，比对目标文件版本而非当前运行版本，避免重复覆盖
+#   [修正地址] UPDATE_URL 修正为 linux-tools.sh，与 INSTALL_PATH 命名对齐
+#   [保留] v1.0~v1.5 全部修复与增强
 #==============================================================================
 
 set -o pipefail
 
-VERSION="1.5"
+SCRIPT_VERSION="1.6"
 SCRIPT_NAME="Linux 运维工具合集"
 
 # 本地固定安装路径：脚本落盘位置，便于固定记忆和统一管理
 INSTALL_PATH="/root/linux-tools.sh"
 # 远端更新源：从 GitHub raw 拉取最新版本
-# 与 INSTALL_PATH 职责不同、可以不一致（用户也可 install 到 /usr/local/bin/xxx）
+# 注意：远端文件名应与本地基础名保持对应关系（linux-tools.sh）
 UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/refs/heads/main/shell/linux-tools.sh"
 
 # 新建 swap 时写入 99-swap.conf 的默认 swappiness（可通过环境变量覆盖）
@@ -178,7 +172,7 @@ preflight() {
     KERNEL="$(uname -r)"
     mkdir -p "$BACKUP_DIR"
     touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/linux-tools-$(date +%Y%m%d).log"
-    log "==== 脚本启动 v${VERSION} | ${OS_PRETTY} | kernel ${KERNEL} ===="
+    log "==== 脚本启动 v${SCRIPT_VERSION} | ${OS_PRETTY} | kernel ${KERNEL} ===="
     log "运行模式: $([ "$RUN_MODE" = "pipe" ] && echo "管道 (需 install 到 ${INSTALL_PATH} 才能持久化)" || echo "本地文件 (${SELF_PATH})")"
 
     detect_virt
@@ -544,7 +538,6 @@ swap_add_file() {
 
     echo; echo "  磁盘剩余空间:"; df -h / | sed 's/^/    /'; echo
 
-    # [R2] ASSUME_YES 时跳过 read，避免误吞 stdin 数据
     if [ -z "$SIZE_INPUT" ] && [ "$ASSUME_YES" != "1" ]; then
         read -r -p "${C_CYAN}swap 文件大小 (支持 512M / 2G，默认 1024M): ${C_RESET}" SIZE_INPUT
     fi
@@ -556,7 +549,6 @@ swap_add_file() {
         err "大小无效或过小（最小 64MB），输入: ${SIZE_INPUT}"; return 1
     fi
 
-    # [R2] ASSUME_YES 时跳过 read
     if [ -z "$SWAPFILE" ] && [ "$ASSUME_YES" != "1" ]; then
         read -r -p "${C_CYAN}文件路径 [默认 /swapfile]: ${C_RESET}" SWAPFILE
     fi
@@ -610,7 +602,6 @@ swap_add_file() {
     if [ -f /etc/sysctl.d/99-swap.conf ]; then
         info "/etc/sysctl.d/99-swap.conf 已存在，保留现有配置"
     else
-        # [R4] 使用可配置的 SWAPPINESS_DEFAULT
         cat > /etc/sysctl.d/99-swap.conf <<EOF
 # Swap 调优 (由 ${SCRIPT_NAME} 写入)
 vm.swappiness = ${SWAPPINESS_DEFAULT}
@@ -642,7 +633,6 @@ swap_add_partition() {
     fstype=$(lsblk -no FSTYPE "$DEV" 2>/dev/null || echo "")
     echo
     warn "即将 ${C_RED}格式化${C_RESET} ${DEV}，当前文件系统: ${fstype:-未知}"
-    # [R3] 格式化设备前先做虚拟化预警
     virt_warn_for "将 ${DEV} 格式化为 swap" || return 0
     confirm "该操作会${C_RED}永久清除${C_RESET}设备上所有数据，确认继续?" \
         || { info "已取消"; return 0; }
@@ -811,7 +801,7 @@ do_bbr() {
 #==============================================================================
 # TCP BBR + FQ 网络加速配置
 # 写入位置: /etc/sysctl.d/99-bbr.conf
-# 由 ${SCRIPT_NAME} v${VERSION} 于 $(date '+%F %T') 生成
+# 由 ${SCRIPT_NAME} v${SCRIPT_VERSION} 于 $(date '+%F %T') 生成
 #==============================================================================
 
 # --- BBR 核心 ---
@@ -852,10 +842,6 @@ net.ipv4.ip_local_port_range = 1024 65535
 EOF
     ok "已写入 /etc/sysctl.d/99-bbr.conf"
 
-    # [R6][R8] 清理 /etc/sysctl.conf 中的旧 BBR 配置
-    # 保留原因：Debian 12 上 /etc/sysctl.conf 通过 99-sysctl.conf 符号链接加载，
-    # 按文件名排序会排在 99-bbr.conf 之后，旧配置可能覆盖新配置。
-    # Debian 13 上 /etc/sysctl.conf 已被 systemd-sysctl 忽略，清理是无害的"卫生"操作。
     if [ -f /etc/sysctl.conf ] && \
        grep -qE '^[[:space:]]*(net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc)' /etc/sysctl.conf; then
         backup_file /etc/sysctl.conf
@@ -904,7 +890,7 @@ show_update_header() {
     local target="$1"
     title "6. 更新 / 安装 ${SCRIPT_NAME}"
 
-    echo "  当前版本 : v${VERSION}"
+    echo "  当前版本 : v${SCRIPT_VERSION}"
     if [ "$RUN_MODE" = "pipe" ]; then
         echo "  运行模式 : 管道"
     else
@@ -914,7 +900,7 @@ show_update_header() {
     local tag
     if [ -f "$target" ]; then
         local tv
-        tv=$(grep -m1 -oE 'VERSION="[0-9][^"]*"' "$target" 2>/dev/null | cut -d'"' -f2)
+        tv=$(grep -m1 -oE 'SCRIPT_VERSION="[0-9][^"]*"' "$target" 2>/dev/null | cut -d'"' -f2)
         tag="[已存在, v${tv:-未知}]"
     else
         tag="[新装]"
@@ -975,7 +961,7 @@ do_download_and_install() {
 
     local size newVer
     size=$(wc -c < "$tmp_new")
-    newVer=$(grep -m1 -oE 'VERSION="[0-9][^"]*"' "$tmp_new" | cut -d'"' -f2)
+    newVer=$(grep -m1 -oE 'SCRIPT_VERSION="[0-9][^"]*"' "$tmp_new" | cut -d'"' -f2)
     newVer="${newVer:-未知}"
 
     echo "  ${C_BOLD}下载完成，安全校验:${C_RESET}"
@@ -1003,9 +989,21 @@ do_download_and_install() {
         return 1
     fi
 
-    if [ "$newVer" = "$VERSION" ]; then
-        warn "远端版本与本地相同 (v${newVer})"
-        confirm "是否仍然强制覆盖安装?" || { rm -f "$tmp_new"; info "已取消"; return 0; }
+    # 比对本地目标文件和远端文件的版本
+    local target_ver=""
+    if [ -f "$target" ]; then
+        target_ver=$(grep -m1 -oE 'SCRIPT_VERSION="[0-9][^"]*"' "$target" 2>/dev/null | cut -d'"' -f2)
+    fi
+
+    if [ "$newVer" = "$target_ver" ]; then
+        if [ "$SELF_PATH" = "$target" ]; then
+            ok "当前运行的就是最新版本 (v${newVer})"
+            rm -f "$tmp_new"
+            return 0
+        else
+            warn "目标位置 ${target} 已是最新版本 (v${newVer})"
+            confirm "是否仍然强制覆盖安装?" || { rm -f "$tmp_new"; info "已取消"; return 0; }
+        fi
     fi
 
     if have diff && [ -f "$target" ]; then
@@ -1045,11 +1043,11 @@ do_download_and_install() {
        && mv -f "${target}.new" "$target" 2>/dev/null; then
         rm -f "$tmp_new"
         if [ "$SELF_PATH" = "$target" ]; then
-            ok "更新成功: v${VERSION} → v${newVer} (${target})"
+            ok "更新成功: v${SCRIPT_VERSION} → v${newVer} (${target})"
         else
             ok "安装成功: v${newVer} → ${target}"
         fi
-        log "安装/更新 v${VERSION} -> v${newVer} @ ${target}"
+        log "安装/更新 v${SCRIPT_VERSION} -> v${newVer} @ ${target}"
 
         if [ "$SELF_PATH" = "$target" ]; then
             if [ "$ASSUME_YES" != "1" ] && confirm "是否立即运行新版本?"; then
@@ -1091,7 +1089,7 @@ show_sysinfo() {
     local install_str
     if [ -f "$INSTALL_PATH" ]; then
         local iv
-        iv=$(grep -m1 -oE 'VERSION="[0-9][^"]*"' "$INSTALL_PATH" 2>/dev/null | cut -d'"' -f2)
+        iv=$(grep -m1 -oE 'SCRIPT_VERSION="[0-9][^"]*"' "$INSTALL_PATH" 2>/dev/null | cut -d'"' -f2)
         install_str="${INSTALL_PATH} ${C_GREEN}✓${C_RESET} (v${iv:-?})"
     else
         install_str="${INSTALL_PATH} ${C_YELL}未安装${C_RESET}"
@@ -1100,7 +1098,6 @@ show_sysinfo() {
     local first_ip
     first_ip=$(hostname -I 2>/dev/null | awk '{print $1; exit}')
 
-    # [R5] 合并 sysctl 调用
     local cc_val cc_mark
     cc_val=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     [ "$cc_val" = "bbr" ] && cc_mark="${C_GREEN}(BBR ✓)${C_RESET}" || cc_mark=""
@@ -1134,7 +1131,7 @@ show_sysinfo() {
 #------------------------------------------------------------------------------
 show_help() {
     cat <<EOF
-${SCRIPT_NAME} v${VERSION}
+${SCRIPT_NAME} v${SCRIPT_VERSION}
 
 用法:
   bash ${INSTALL_PATH}                      进入交互菜单（需已安装）
@@ -1220,7 +1217,6 @@ cmd_dispatch() {
         update)
             do_download_and_install "$INSTALL_PATH" ;;
         install)
-            # [R1] 路径黑名单补全 /usr/bin /usr/sbin
             local t="${1:-$INSTALL_PATH}"
             if [[ "$t" != /* ]]; then
                 err "install 需要绝对路径: ${t}"; exit 1
@@ -1259,7 +1255,7 @@ main_menu() {
         clear 2>/dev/null || printf '\033c'
         echo
         echo "  ${C_BOLD}${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}"
-        echo "  ${C_BOLD}${C_CYAN}║${C_RESET}     ${C_BOLD}Linux 运维工具合集  v${VERSION}${C_RESET}                     ${C_BOLD}${C_CYAN}║${C_RESET}"
+        echo "  ${C_BOLD}${C_CYAN}║${C_RESET}     ${C_BOLD}Linux 运维工具合集  v${SCRIPT_VERSION}${C_RESET}                     ${C_BOLD}${C_CYAN}║${C_RESET}"
         echo "  ${C_BOLD}${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}"
         show_sysinfo
         echo
