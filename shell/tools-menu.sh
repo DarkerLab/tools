@@ -1,36 +1,31 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.5 (Final)
+# 版    本 : v1.5.1
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
-#   v1.5 Final
-#        [修复] 新库检测逻辑带上具体起始日期 (newdb:yyyymmdd)，解决“包含
-#               昨天数据却提示从今日起统计”的文案矛盾。
-#        [修复] 管道执行拦截增加 root 权限检查，避免非 root 写入失败误导。
-#        [修复] 关机命令增加降级机制 (shutdown -> poweroff -> systemctl)。
-#        [修复] 自动更新改用 .new + mv 原子替换，避免 Text file busy。
-#   v1.5 流量统计口径改为 1000 进制(SI)；新增在线管道执行拦截；
-#        日报/预警/关机警报格式大幅精简。
-#   v1.4 按代码审查意见全面修复（同前）
-#   v1.3 全面代码审查重写（同前）
-#   v1.2 修复 vnStat 2.x JSON 结构解析（同前）
-#   v1.1 初始版本
+#   v1.5.1 [修复] 提升版本号，强制刷新 CDN 缓存。新库检测逻辑带上具体起始
+#          日期 (newdb:yyyymmdd)，解决“包含昨天数据却提示从今日起统计”文案矛盾。
+#   v1.5   [修复] 管道执行拦截增加 root 权限检查；关机命令增加降级机制；
+#          自动更新改用 .new + mv 原子替换；日报/预警/关机格式精简。
+#   v1.4   全面代码审查修复。
+#   v1.3   全面重写，增加环境自检。
+#   v1.2   修复 vnStat 2.x JSON 解析。
+#   v1.1   初始版本。
 # 功能说明 :
 #   1. 基于 vnStat 的账单周期流量监控（自定义每月重置日，UTC0 时间基准）
 #   2. Telegram 每日流量日报（北京时间 08:00 推送）
 #   3. 流量达 90% 首次预警推送（每账单周期仅推送一次）
-#   4. 流量达 95% 关机报警推送（失败自动重试 3 次），延迟 1 分钟并二次确认
-#   5. 每分钟定时检查（cron），安装/修改配置后自动创建、更新并重载定时任务
-#   6. 完整日志记录、权限检查、依赖检查、配置校验、中文交互提示
-#   7. 流量单位按 1000 进制(SI)换算，与主流云服务商账单口径一致
+#   4. 流量达 95% 关机报警推送（延迟 1 分钟并二次确认）
+#   5. 完整日志记录、权限检查、依赖检查、中文交互提示
+#   6. 流量单位按 1000 进制(SI)换算，与云服务商账单口径一致
 # 更新地址 : https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 #===============================================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.5"
+VERSION="v1.5.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -46,9 +41,8 @@ MAX_LOG_SIZE=$((5*1024*1024))   # 日志超过 5MB 自动截断
 # 拦截在线管道执行（自动保存并重启）
 #===============================================================================
 if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] || [ "$0" = "bash" ] || [ "$0" = "sh" ]; then
-    # 强制要求 root 权限，否则无法自动写入本地文件
     if [ "$(id -u)" -ne 0 ]; then
-        echo -e "\033[31m[错误] 检测到在线临时运行。由于需要将脚本固化到本地，请使用 root 权限重新执行：\033[0m"
+        echo -e "\033[31m[错误] 检测到在线临时运行。请使用 root 权限重新执行：\033[0m"
         echo -e "\033[31m       sudo bash <(curl -sL $UPDATE_URL)\033[0m"
         exit 1
     fi
@@ -60,8 +54,7 @@ if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] ||
 
     if [ -r "$0" ] && [ "$0" != "bash" ] && [ "$0" != "sh" ]; then
         echo -e "\033[33m[提示] 检测到当前通过在线管道/临时方式运行脚本（$SCRIPT_PATH）。\033[0m"
-        echo -e "\033[33m       为了确保定时任务(cron)和自动更新正常工作，需将脚本保存到本地。\033[0m"
-        echo -e "\033[33m       正在保存至: $_real_target\033[0m"
+        echo -e "\033[33m       正在保存至本地: $_real_target\033[0m"
         if cat "$0" > "$_real_target" 2>/dev/null; then
             chmod +x "$_real_target"
             echo -e "\033[32m✔ 保存成功，正在切换为本地文件重新执行...\033[0m"
@@ -69,8 +62,8 @@ if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] ||
             exec "$_real_target" "$@"
         fi
     fi
-    echo -e "\033[31m[错误] 检测到脚本在内存/管道中执行，且无法自动固化到本地！\033[0m"
-    echo -e "\033[31m       请手动下载后再运行:\033[0m"
+    echo -e "\033[31m[错误] 检测到脚本在内存中执行，无法固化到本地！\033[0m"
+    echo -e "\033[31m       请手动下载运行:\033[0m"
     echo -e "\033[31m       wget -O /root/traffic-monitor.sh $UPDATE_URL\033[0m"
     echo -e "\033[31m       bash /root/traffic-monitor.sh\033[0m"
     exit 1
@@ -493,7 +486,7 @@ cmd_check() {
         exit 0
     fi
 
-    # ---- 90% 预警 ----
+    # ---- 90% 预警（每周期仅首次触发，极简） ----
     if awk -v p="$percent" 'BEGIN{exit !(p >= 90)}'; then
         load_state
         if [ "$WARNED_CYCLE" != "$start" ]; then
