@@ -1,34 +1,31 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.5 (Final)
+# 版    本 : v1.5.1
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
-#   v1.5 Final
-#        [修复] 管道执行拦截增加 root 权限检查，避免非 root 写入失败误导。
-#        [修复] 关机命令增加降级机制 (shutdown -> poweroff -> systemctl)。
-#        [修复] 自动更新改用 .new + mv 原子替换，避免 Text file busy。
-#   v1.5 流量统计口径改为 1000 进制(SI)；修复新库误报；新增在线管道执行
-#        拦截；日报/预警/关机警报格式大幅精简。
-#   v1.4 按代码审查意见全面修复（同前）
-#   v1.3 全面代码审查重写（同前）
-#   v1.2 修复 vnStat 2.x JSON 结构解析（同前）
-#   v1.1 初始版本
+#   v1.5.1 [修复] 提升版本号，强制刷新 CDN 缓存。新库检测逻辑带上具体起始
+#          日期 (newdb:yyyymmdd)，解决“包含昨天数据却提示从今日起统计”文案矛盾。
+#   v1.5   [修复] 管道执行拦截增加 root 权限检查；关机命令增加降级机制；
+#          自动更新改用 .new + mv 原子替换；日报/预警/关机格式精简。
+#   v1.4   全面代码审查修复。
+#   v1.3   全面重写，增加环境自检。
+#   v1.2   修复 vnStat 2.x JSON 解析。
+#   v1.1   初始版本。
 # 功能说明 :
 #   1. 基于 vnStat 的账单周期流量监控（自定义每月重置日，UTC0 时间基准）
 #   2. Telegram 每日流量日报（北京时间 08:00 推送）
 #   3. 流量达 90% 首次预警推送（每账单周期仅推送一次）
-#   4. 流量达 95% 关机报警推送（失败自动重试 3 次），延迟 1 分钟并二次确认
-#   5. 每分钟定时检查（cron），安装/修改配置后自动创建、更新并重载定时任务
-#   6. 完整日志记录、权限检查、依赖检查、配置校验、中文交互提示
-#   7. 流量单位按 1000 进制(SI)换算，与主流云服务商账单口径一致
+#   4. 流量达 95% 关机报警推送（延迟 1 分钟并二次确认）
+#   5. 完整日志记录、权限检查、依赖检查、中文交互提示
+#   6. 流量单位按 1000 进制(SI)换算，与云服务商账单口径一致
 # 更新地址 : https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 #===============================================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.5"
+VERSION="v1.5.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -44,9 +41,8 @@ MAX_LOG_SIZE=$((5*1024*1024))   # 日志超过 5MB 自动截断
 # 拦截在线管道执行（自动保存并重启）
 #===============================================================================
 if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] || [ "$0" = "bash" ] || [ "$0" = "sh" ]; then
-    # 修复1: 强制要求 root 权限，否则无法自动写入本地文件
     if [ "$(id -u)" -ne 0 ]; then
-        echo -e "\033[31m[错误] 检测到在线临时运行。由于需要将脚本固化到本地，请使用 root 权限重新执行：\033[0m"
+        echo -e "\033[31m[错误] 检测到在线临时运行。请使用 root 权限重新执行：\033[0m"
         echo -e "\033[31m       sudo bash <(curl -sL $UPDATE_URL)\033[0m"
         exit 1
     fi
@@ -56,11 +52,9 @@ if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] ||
         _real_target="/root/traffic-monitor.sh"
     fi
 
-    # 如果能从 fd 读取内容，说明是 bash <(curl) 形式
     if [ -r "$0" ] && [ "$0" != "bash" ] && [ "$0" != "sh" ]; then
         echo -e "\033[33m[提示] 检测到当前通过在线管道/临时方式运行脚本（$SCRIPT_PATH）。\033[0m"
-        echo -e "\033[33m       为了确保定时任务(cron)和自动更新正常工作，需将脚本保存到本地。\033[0m"
-        echo -e "\033[33m       正在保存至: $_real_target\033[0m"
+        echo -e "\033[33m       正在保存至本地: $_real_target\033[0m"
         if cat "$0" > "$_real_target" 2>/dev/null; then
             chmod +x "$_real_target"
             echo -e "\033[32m✔ 保存成功，正在切换为本地文件重新执行...\033[0m"
@@ -68,9 +62,8 @@ if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] ||
             exec "$_real_target" "$@"
         fi
     fi
-    # 如果是 curl | bash 形式，无法直接读源码，只能提示手动下载
-    echo -e "\033[31m[错误] 检测到脚本在内存/管道中执行，且无法自动固化到本地！\033[0m"
-    echo -e "\033[31m       请手动下载后再运行:\033[0m"
+    echo -e "\033[31m[错误] 检测到脚本在内存中执行，无法固化到本地！\033[0m"
+    echo -e "\033[31m       请手动下载运行:\033[0m"
     echo -e "\033[31m       wget -O /root/traffic-monitor.sh $UPDATE_URL\033[0m"
     echo -e "\033[31m       bash /root/traffic-monitor.sh\033[0m"
     exit 1
@@ -85,7 +78,6 @@ c_yellow() { echo -e "\033[33m$*\033[0m"; }
 c_blue()   { echo -e "\033[36m$*\033[0m"; }
 
 log() {
-    # $1=级别(INFO/WARN/ERROR/OK) $2=内容
     mkdir -p "$BASE_DIR" 2>/dev/null
     local ts; ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
     echo "[${ts}] [$1] $2" >> "$LOG_FILE" 2>/dev/null
@@ -105,7 +97,6 @@ check_root() {
 }
 
 human_bytes() {
-    # 1000 进制（SI）：B/KB/MB/GB/TB/PB，与主流云服务商账单口径一致
     awk -v b="${1:-0}" 'BEGIN{
         split("B KB MB GB TB PB", u, " ");
         i = 1;
@@ -115,7 +106,6 @@ human_bytes() {
 }
 
 html_escape() {
-    # Telegram parse_mode=HTML：用户自定义字段须转义 & < >
     printf '%s' "${1-}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
@@ -130,23 +120,19 @@ restart_cron_service() {
 #===============================================================================
 load_config() {
     [ -f "$CONF_FILE" ] || return 1
-    # shellcheck disable=SC1090
     . "$CONF_FILE" || return 1
     return 0
 }
 
 load_state() {
-    # source 失败时也保证 WARNED_CYCLE 为空，避免沿用错误状态
     WARNED_CYCLE=""
     if [ -r "$STATE_FILE" ]; then
-        # shellcheck disable=SC1090
         . "$STATE_FILE" 2>/dev/null || WARNED_CYCLE=""
     fi
     return 0
 }
 
 save_state_var() {
-    # $1=变量名 $2=值
     mkdir -p "$BASE_DIR"
     if [ -f "$STATE_FILE" ] && grep -q "^$1=" "$STATE_FILE"; then
         sed -i "s|^$1=.*|$1=\"$2\"|" "$STATE_FILE"
@@ -167,7 +153,6 @@ validate_config() {
     case "${STAT_TYPE:-}" in 1|2|3) ;; *) c_red "  × 流量统计类型 [$STAT_TYPE] 非法（应为 1/2/3）"; err=1;; esac
     [ -n "$TG_TOKEN" ]  || { c_red "  × Telegram Bot Token 为空";  err=1; }
     [ -n "$TG_CHATID" ] || { c_red "  × Telegram Chat ID 为空";    err=1; }
-    # 严格数字校验
     if ! [[ "${LIMIT_GB:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
             || ! awk -v l="$LIMIT_GB" 'BEGIN{exit !(l+0>0)}' 2>/dev/null; then
         c_red "  × 流量总额 [$LIMIT_GB] 非法（应为大于 0 的数字，单位 GB）"; err=1
@@ -265,7 +250,7 @@ check_day_coverage() {
         yestnum=$(date -u -d "yesterday" +%Y%m%d 2>/dev/null || echo "")
         if [ "$earliest" = "$todaynum" ] \
                 || { [ -n "$yestnum" ] && [ "$earliest" = "$yestnum" ]; }; then
-            echo "newdb"
+            echo "newdb:${earliest}"
         else
             echo "missing:${earliest}"
         fi
@@ -275,7 +260,6 @@ check_day_coverage() {
 }
 
 calc_percent() {
-    # 1000 进制：LIMIT_GB × 1000^3 字节
     local used_bytes=$1 limit_bytes
     limit_bytes=$(awk -v l="$LIMIT_GB" 'BEGIN{printf "%.0f", l*1000*1000*1000}')
     awk -v u="$used_bytes" -v l="$limit_bytes" \
@@ -315,7 +299,7 @@ tg_send() {
 # 正式日报推送（极简格式）
 #===============================================================================
 build_report() {
-    local used_bytes percent now_utc warn="" cover
+    local used_bytes percent now_utc warn="" cover cov_earliest
     PARSE_ERROR=0
     used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
     if [ "$PARSE_ERROR" -eq 1 ]; then
@@ -324,10 +308,16 @@ build_report() {
     else
         cover=$(check_day_coverage "$(cycle_start_date)")
         case "$cover" in
-            missing:*) warn="
-ℹ️ 历史明细缺失，统计可能偏低" ;;
-            newdb)     warn="
-ℹ️ 新建库，从今日起统计" ;;
+            missing:*)
+                cov_earliest=${cover#missing:}
+                warn="
+ℹ️ 历史明细缺失(最早 ${cov_earliest:4:2}-${cov_earliest:6:2})，统计可能偏低"
+                ;;
+            newdb:*)
+                cov_earliest=${cover#newdb:}
+                warn="
+ℹ️ 新建库，数据自 ${cov_earliest:4:2}-${cov_earliest:6:2} 起"
+                ;;
         esac
     fi
     percent=$(calc_percent "${used_bytes:-0}")
@@ -362,7 +352,7 @@ cmd_test_push() {
     load_config || die "尚未安装配置，请先执行【1. 安装部署/修改配置】"
     validate_config
     echo "正在发送测试日报..."
-    local used_bytes percent start now_bj now_utc status_msg cover
+    local used_bytes percent start now_bj now_utc status_msg cover cov_earliest
     PARSE_ERROR=0
     used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
     percent=$(calc_percent "${used_bytes:-0}")
@@ -375,8 +365,14 @@ cmd_test_push() {
     else
         cover=$(check_day_coverage "$start")
         case "$cover" in
-            missing:*) status_msg="历史明细缺失(可能偏低)" ;;
-            newdb)     status_msg="新建库(从今日起统计)" ;;
+            missing:*) 
+                cov_earliest=${cover#missing:}
+                status_msg="历史明细缺失(最早 ${cov_earliest:4:2}-${cov_earliest:6:2}，可能偏低)" 
+                ;;
+            newdb:*)   
+                cov_earliest=${cover#newdb:}
+                status_msg="新建库(数据自 ${cov_earliest:4:2}-${cov_earliest:6:2} 起)" 
+                ;;
             *)         status_msg="正常" ;;
         esac
     fi
@@ -466,7 +462,6 @@ cmd_check() {
             tg_send "⛔ [$(html_escape "$SERVER_NAME")] 确认 ${percent}% ≥95%，正在执行关机... ($(date -u '+%Y-%m-%d %H:%M') UTC)" >/dev/null 2>&1
             sync
             
-            # 修复2: 三级降级关机机制
             local shutdown_success=0
             if command -v shutdown >/dev/null 2>&1; then
                 shutdown -h now "traffic-monitor: 流量达到 95% 阈值，自动关机" && shutdown_success=1
@@ -777,8 +772,9 @@ cmd_show() {
                 c_yellow "  ⚠ 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}（晚于周期起点），此前的周期流量无法统计"
                 c_yellow "    历史数据口径错乱可用【7. 重置 vnStat 数据库】解决"
                 ;;
-            newdb)
-                c_green "  ℹ 日明细从今日开始记录（新建库/刚重置），周期统计从今天起累积"
+            newdb:*)
+                cov_earliest=${cover#newdb:}
+                c_green "  ℹ 日明细自 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2} 开始记录（新建库），周期统计从该日起累积"
                 ;;
         esac
     fi
@@ -886,7 +882,6 @@ cmd_update() {
     head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; c_red "下载内容不是有效脚本（可能是 GitHub 404 页面）"; head -n3 "$tmp"; die "已放弃更新"; }
     bash -n "$tmp" || { rm -f "$tmp"; die "新脚本语法校验未通过，已放弃更新"; }
     
-    # 修复3: 先放到 .new 文件，再原子替换，避免 Text file busy
     cp -f "$tmp" "${SCRIPT_PATH}.new" && chmod +x "${SCRIPT_PATH}.new" && mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
     rm -f "$tmp"
     
