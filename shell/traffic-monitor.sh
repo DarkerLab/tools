@@ -1,31 +1,23 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.5.1
+# 版    本 : v1.6.1 (清爽 UI 版)
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
-#   v1.5.1 [修复] 提升版本号，强制刷新 CDN 缓存。新库检测逻辑带上具体起始
-#          日期 (newdb:yyyymmdd)，解决“包含昨天数据却提示从今日起统计”文案矛盾。
-#   v1.5   [修复] 管道执行拦截增加 root 权限检查；关机命令增加降级机制；
-#          自动更新改用 .new + mv 原子替换；日报/预警/关机格式精简。
+#   v1.6.1 [UI] 去除复杂的 Unicode 画框，改用清爽的 ASCII 分隔线；菜单两列对齐。
+#   v1.6.0 [UI] 初步 UI 美化。
+#   v1.5.1 [修复] 新库检测带上具体日期；强制刷新版本。
+#   v1.5   [修复] 管道拦截、关机降级、自动更新原子替换、精简通知格式。
 #   v1.4   全面代码审查修复。
 #   v1.3   全面重写，增加环境自检。
 #   v1.2   修复 vnStat 2.x JSON 解析。
 #   v1.1   初始版本。
-# 功能说明 :
-#   1. 基于 vnStat 的账单周期流量监控（自定义每月重置日，UTC0 时间基准）
-#   2. Telegram 每日流量日报（北京时间 08:00 推送）
-#   3. 流量达 90% 首次预警推送（每账单周期仅推送一次）
-#   4. 流量达 95% 关机报警推送（延迟 1 分钟并二次确认）
-#   5. 完整日志记录、权限检查、依赖检查、中文交互提示
-#   6. 流量单位按 1000 进制(SI)换算，与云服务商账单口径一致
-# 更新地址 : https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh
 #===============================================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.5.1"
+VERSION="v1.6.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -35,15 +27,15 @@ LOCK_SHUTDOWN="${BASE_DIR}/shutdown.lock"
 UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
 VNSTAT_CONF="/etc/vnstat.conf"
 VNSTAT_DB_DIR="/var/lib/vnstat"
-MAX_LOG_SIZE=$((5*1024*1024))   # 日志超过 5MB 自动截断
+MAX_LOG_SIZE=$((5*1024*1024))
 
 #===============================================================================
-# 拦截在线管道执行（自动保存并重启）
+# 拦截在线管道执行
 #===============================================================================
 if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] || [ "$0" = "bash" ] || [ "$0" = "sh" ]; then
     if [ "$(id -u)" -ne 0 ]; then
-        echo -e "\033[31m[错误] 检测到在线临时运行。请使用 root 权限重新执行：\033[0m"
-        echo -e "\033[31m       sudo bash <(curl -sL $UPDATE_URL)\033[0m"
+        echo -e "\033[1;31m[错误] 检测到在线临时运行。请使用 root 权限重新执行：\033[0m"
+        echo -e "\033[1;31m       sudo bash <(curl -sL $UPDATE_URL)\033[0m"
         exit 1
     fi
 
@@ -53,29 +45,27 @@ if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]] ||
     fi
 
     if [ -r "$0" ] && [ "$0" != "bash" ] && [ "$0" != "sh" ]; then
-        echo -e "\033[33m[提示] 检测到当前通过在线管道/临时方式运行脚本（$SCRIPT_PATH）。\033[0m"
-        echo -e "\033[33m       正在保存至本地: $_real_target\033[0m"
+        echo -e "\033[1;33m[提示] 检测到当前通过在线管道运行脚本，正在固化到本地...\033[0m"
         if cat "$0" > "$_real_target" 2>/dev/null; then
             chmod +x "$_real_target"
-            echo -e "\033[32m✔ 保存成功，正在切换为本地文件重新执行...\033[0m"
+            echo -e "\033[1;32m✔ 保存成功，正在切换为本地文件重新执行...\033[0m"
             sleep 1
             exec "$_real_target" "$@"
         fi
     fi
-    echo -e "\033[31m[错误] 检测到脚本在内存中执行，无法固化到本地！\033[0m"
-    echo -e "\033[31m       请手动下载运行:\033[0m"
-    echo -e "\033[31m       wget -O /root/traffic-monitor.sh $UPDATE_URL\033[0m"
-    echo -e "\033[31m       bash /root/traffic-monitor.sh\033[0m"
+    echo -e "\033[1;31m[错误] 脚本在内存中执行，无法固化到本地。请手动下载运行:\033[0m"
+    echo -e "\033[1;31m       wget -O /root/traffic-monitor.sh $UPDATE_URL && bash /root/traffic-monitor.sh\033[0m"
     exit 1
 fi
 
 #===============================================================================
-# 基础工具
+# 基础工具与颜色
 #===============================================================================
-c_red()    { echo -e "\033[31m$*\033[0m"; }
-c_green()  { echo -e "\033[32m$*\033[0m"; }
-c_yellow() { echo -e "\033[33m$*\033[0m"; }
-c_blue()   { echo -e "\033[36m$*\033[0m"; }
+c_red()    { echo -e "\033[1;31m$*\033[0m"; }
+c_green()  { echo -e "\033[1;32m$*\033[0m"; }
+c_yellow() { echo -e "\033[1;33m$*\033[0m"; }
+c_cyan()   { echo -e "\033[1;36m$*\033[0m"; }
+c_gray()   { echo -e "\033[90m$*\033[0m"; }
 
 log() {
     mkdir -p "$BASE_DIR" 2>/dev/null
@@ -90,7 +80,7 @@ log() {
     fi
 }
 
-die() { c_red "[错误] $1"; log "ERROR" "$1"; exit 1; }
+die() { echo -e "\n\033[1;31m[错误] $1\033[0m"; log "ERROR" "$1"; exit 1; }
 
 check_root() {
     [ "$(id -u)" -eq 0 ] || die "请使用 root 权限运行本脚本（sudo bash $0）"
@@ -112,7 +102,7 @@ html_escape() {
 restart_cron_service() {
     systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null \
         || service cron restart 2>/dev/null || service crond restart 2>/dev/null \
-        || c_yellow "  ! 无法自动重载 cron，请确认 cron 服务已运行"
+        || echo -e "\033[1;33m[警告] 无法自动重载 cron，请确认 cron 服务已运行\033[0m"
 }
 
 #===============================================================================
@@ -143,25 +133,25 @@ save_state_var() {
 
 validate_config() {
     local err=0
-    [ -n "$SERVER_NAME" ] || { c_red "  × 服务器名称为空"; err=1; }
+    [ -n "$SERVER_NAME" ] || { c_red "  ✘ 服务器名称为空"; err=1; }
     if [ -z "$IFACE" ] || [ ! -d "/sys/class/net/$IFACE" ]; then
-        c_red "  × 监控网口 [$IFACE] 不存在"; err=1
+        c_red "  ✘ 监控网口 [$IFACE] 不存在"; err=1
     fi
     if ! [[ "$RESET_DAY" =~ ^[0-9]+$ ]] || [ "$RESET_DAY" -lt 1 ] || [ "$RESET_DAY" -gt 31 ]; then
-        c_red "  × 账单重置日 [$RESET_DAY] 非法（应为 1-31）"; err=1
+        c_red "  ✘ 账单重置日 [$RESET_DAY] 非法（应为 1-31）"; err=1
     fi
-    case "${STAT_TYPE:-}" in 1|2|3) ;; *) c_red "  × 流量统计类型 [$STAT_TYPE] 非法（应为 1/2/3）"; err=1;; esac
-    [ -n "$TG_TOKEN" ]  || { c_red "  × Telegram Bot Token 为空";  err=1; }
-    [ -n "$TG_CHATID" ] || { c_red "  × Telegram Chat ID 为空";    err=1; }
+    case "${STAT_TYPE:-}" in 1|2|3) ;; *) c_red "  ✘ 流量统计类型 [$STAT_TYPE] 非法"; err=1;; esac
+    [ -n "$TG_TOKEN" ]  || { c_red "  ✘ Telegram Bot Token 为空";  err=1; }
+    [ -n "$TG_CHATID" ] || { c_red "  ✘ Telegram Chat ID 为空";    err=1; }
     if ! [[ "${LIMIT_GB:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
             || ! awk -v l="$LIMIT_GB" 'BEGIN{exit !(l+0>0)}' 2>/dev/null; then
-        c_red "  × 流量总额 [$LIMIT_GB] 非法（应为大于 0 的数字，单位 GB）"; err=1
+        c_red "  ✘ 流量总额 [$LIMIT_GB] 非法（应为大于 0 的数字）"; err=1
     fi
-    [ "$err" -eq 0 ] || die "配置校验失败，请重新执行【安装部署/修改配置】"
+    [ "$err" -eq 0 ] || die "配置校验失败，请重新执行【1. 安装部署/修改配置】"
 }
 
 #===============================================================================
-# vnStat 数据采集（核心）
+# vnStat 数据采集
 #===============================================================================
 PARSE_ERROR=0
 
@@ -208,18 +198,18 @@ get_cycle_bytes() {
     json=$(vnstat_day_json)
     if [ -z "$json" ]; then
         PARSE_ERROR=1
-        log "ERROR" "vnStat 无 JSON 输出（接口 [$IFACE] 可能未加入监控或守护进程未运行）"
+        log "ERROR" "vnStat 无 JSON 输出"
         echo 0; return 1
     fi
     if ! echo "$json" | jq -e 'has("interface") or has("interfaces") or has("traffic")' >/dev/null 2>&1; then
         PARSE_ERROR=1
-        log "ERROR" "vnStat JSON 结构无法识别，顶层键: [$(echo "$json" | jq -r 'keys | join(",")' 2>/dev/null)]"
+        log "ERROR" "vnStat JSON 结构无法识别"
         echo 0; return 1
     fi
     sum=$(echo "$json" | jq -r --arg sn "$startnum" "$(jq_day_sum_filter "$field" "$startnum")" 2>/dev/null)
     if ! [[ "$sum" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         PARSE_ERROR=1
-        log "ERROR" "vnStat JSON 周期流量解析失败，原始值: [$sum]"
+        log "ERROR" "vnStat JSON 解析失败，原始值: [$sum]"
         echo 0; return 1
     fi
     printf "%.0f" "$sum"
@@ -295,40 +285,32 @@ tg_send() {
     return 1
 }
 
-#===============================================================================
-# 正式日报推送（极简格式）
-#===============================================================================
 build_report() {
     local used_bytes percent now_utc warn="" cover cov_earliest
     PARSE_ERROR=0
     used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
     if [ "$PARSE_ERROR" -eq 1 ]; then
-        warn="
-⚠️ 数据解析异常，请登录检查"
+        warn="\n⚠️ 数据解析异常，请登录检查"
     else
         cover=$(check_day_coverage "$(cycle_start_date)")
         case "$cover" in
-            missing:*)
+            missing:*) 
                 cov_earliest=${cover#missing:}
-                warn="
-ℹ️ 历史明细缺失(最早 ${cov_earliest:4:2}-${cov_earliest:6:2})，统计可能偏低"
+                warn="\nℹ️ 历史明细缺失(最早 ${cov_earliest:4:2}-${cov_earliest:6:2})，统计可能偏低"
                 ;;
-            newdb:*)
+            newdb:*)   
                 cov_earliest=${cover#newdb:}
-                warn="
-ℹ️ 新建库，数据自 ${cov_earliest:4:2}-${cov_earliest:6:2} 起"
+                warn="\nℹ️ 新建库，数据自 ${cov_earliest:4:2}-${cov_earliest:6:2} 起"
                 ;;
         esac
     fi
     percent=$(calc_percent "${used_bytes:-0}")
     now_utc=$(date -u '+%Y-%m-%d %H:%M')
 
-    cat <<EOF
-📊 [$(html_escape "$SERVER_NAME")]每日流量日报
-
-- 周期用量: $(human_bytes "${used_bytes:-0}") / $(html_escape "$LIMIT_GB") GB (${percent}%)
-- 统计时间: ${now_utc} (UTC)${warn}
-EOF
+    echo "📊 [$(html_escape "$SERVER_NAME")]每日流量日报"
+    echo "━━━━━━━━━━━━━━━"
+    echo "- 周期用量: $(human_bytes "${used_bytes:-0}") / $(html_escape "$LIMIT_GB") GB (${percent}%)"
+    echo "- 统计时间: ${now_utc} (UTC)${warn}"
 }
 
 cmd_daily() {
@@ -344,14 +326,14 @@ cmd_daily() {
     fi
 }
 
-#===============================================================================
-# 测试推送（保留全量信息，用于排障）
-#===============================================================================
 cmd_test_push() {
     check_root
     load_config || die "尚未安装配置，请先执行【1. 安装部署/修改配置】"
     validate_config
-    echo "正在发送测试日报..."
+    
+    print_section "测试发送"
+    echo -e "正在生成并发送测试消息..."
+    
     local used_bytes percent start now_bj now_utc status_msg cover cov_earliest
     PARSE_ERROR=0
     used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
@@ -378,7 +360,7 @@ cmd_test_push() {
     fi
 
     local msg="📊 [$(html_escape "$SERVER_NAME")]每日流量日报 (测试)
-
+━━━━━━━━━━━━━━━
 - 周期用量: $(human_bytes "${used_bytes:-0}") / $(html_escape "$LIMIT_GB") GB (${percent}%)
 - 账单周期: ${start} 起 (UTC)
 - 监控网口: $(html_escape "$IFACE") ($(stat_type_name))
@@ -387,16 +369,16 @@ cmd_test_push() {
 ✅ 这是一条测试消息"
 
     if tg_send "$msg"; then
-        c_green "✔ 测试推送成功，请到 Telegram 查收"
+        echo -e " \033[1;32m[✔] 测试推送成功，请到 Telegram 查收\033[0m"
         log "OK" "测试日报推送成功"
     else
-        c_red "✘ 测试推送失败（已重试 3 次），请检查 Token / Chat ID / 网络连通性"
+        echo -e " \033[1;31m[✘] 测试推送失败（已重试 3 次），请检查 Token / Chat ID / 网络连通性\033[0m"
         log "ERROR" "测试日报推送失败"
     fi
 }
 
 #===============================================================================
-# 每分钟阈值检查（cron）
+# 阈值检查逻辑 (cron 调用)
 #===============================================================================
 cmd_check() {
     load_config || exit 0
@@ -429,7 +411,7 @@ cmd_check() {
         echo "$start" > "$LOCK_SHUTDOWN"
 
         local msg="🚨 [$(html_escape "$SERVER_NAME")]关机警报 (95%)
-
+━━━━━━━━━━━━━━━
 - 周期用量: $(human_bytes "$used_bytes") / $(html_escape "$LIMIT_GB") GB (${percent}%)
 - 统计时间: $(date -u '+%Y-%m-%d %H:%M') (UTC)
 ⚠️ 服务器将在 1 分钟后自动关机"
@@ -486,13 +468,13 @@ cmd_check() {
         exit 0
     fi
 
-    # ---- 90% 预警（每周期仅首次触发，极简） ----
+    # ---- 90% 预警 ----
     if awk -v p="$percent" 'BEGIN{exit !(p >= 90)}'; then
         load_state
         if [ "$WARNED_CYCLE" != "$start" ]; then
             log "WARN" "流量达到预警阈值: ${percent}%，周期 ${start}，首次触发推送"
             local msg="⚠️ [$(html_escape "$SERVER_NAME")]流量预警 (90%)
-
+━━━━━━━━━━━━━━━
 - 周期用量: $(human_bytes "$used_bytes") / $(html_escape "$LIMIT_GB") GB (${percent}%)
 - 统计时间: $(date -u '+%Y-%m-%d %H:%M') (UTC)"
             if tg_send "$msg"; then
@@ -507,7 +489,45 @@ cmd_check() {
 }
 
 #===============================================================================
-# 依赖安装 / 时区 / vnStat 基础配置
+# UI 模块
+#===============================================================================
+print_banner() {
+    clear 2>/dev/null
+    echo -e "\033[36m===================================================\033[0m"
+    echo -e "  \033[1;37mvnStat 流量监控助手\033[0m  \033[33m${VERSION}\033[0m"
+    echo -e "  \033[90mSystem: Debian 13 / vnStat 2.x\033[0m"
+    echo -e "\033[36m===================================================\033[0m"
+    echo -e "  \033[32m1.\033[0m 安装部署/修改配置       \033[32m5.\033[0m 卸载监控程序"
+    echo -e "  \033[32m2.\033[0m 测试发送每日流量推送   \033[32m6.\033[0m 环境自检 (排障)"
+    echo -e "  \033[32m3.\033[0m 查看当前流量数据       \033[32m7.\033[0m 重置 vnStat 数据库"
+    echo -e "  \033[32m4.\033[0m 从 GitHub 更新脚本     \033[32m0.\033[0m 退出"
+    echo -e "\033[36m===================================================\033[0m"
+}
+
+print_section() {
+    echo ""
+    echo -e "\033[36m--- $1 ---\033[0m"
+}
+
+prompt_input() {
+    local tip=$1 def=${2:-} val
+    if [ -n "$def" ]; then
+        echo -ne " \033[32m?\033[0m $tip \033[33m[当前: $def]\033[0m (回车保留): "
+        read -r val
+        REPLY_VAL=${val:-$def}
+    else
+        while true; do
+            echo -ne " \033[32m?\033[0m $tip: "
+            read -r val
+            [ -n "$val" ] && break
+            echo -e " \033[31m✘\033[0m 不能为空，请重新输入"
+        done
+        REPLY_VAL=$val
+    fi
+}
+
+#===============================================================================
+# 依赖与环境配置
 #===============================================================================
 install_deps() {
     local missing=0 p
@@ -515,16 +535,14 @@ install_deps() {
         command -v "$p" >/dev/null 2>&1 || missing=1
     done
     if [ "$missing" -eq 0 ]; then
-        c_green "✔ 依赖已齐全，跳过安装: $(vnstat --version 2>/dev/null | head -n1)"
-        log "INFO" "依赖已齐全，跳过安装"
+        echo -e " \033[32m[✔]\033[0m 依赖已齐全，跳过安装"
         systemctl enable vnstat >/dev/null 2>&1
         systemctl start vnstat  >/dev/null 2>&1
         return
     fi
-    echo "→ 检查并安装依赖软件 (vnstat curl jq cron) ..."
-    log "INFO" "开始安装依赖"
+    echo -e " \033[33m[⏳]\033[0m 检查并安装依赖软件 (vnstat curl jq cron)..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y >/dev/null 2>&1 || c_yellow "  ! apt-get update 失败，尝试继续安装"
+    apt-get update -y >/dev/null 2>&1 || echo -e " \033[33m[!] apt-get update 失败，尝试继续安装\033[0m"
     apt-get install -y vnstat curl jq cron ca-certificates >/dev/null 2>&1 \
         || die "依赖安装失败，请检查网络或 apt 源后重试"
     for p in vnstat curl jq crontab; do
@@ -532,31 +550,25 @@ install_deps() {
     done
     systemctl enable vnstat >/dev/null 2>&1
     systemctl start vnstat  >/dev/null 2>&1
-    c_green "✔ 依赖安装完成: $(vnstat --version 2>/dev/null | head -n1)"
-    log "OK" "依赖安装完成"
+    echo -e " \033[32m[✔]\033[0m 依赖安装完成"
 }
 
 setup_timezone() {
-    echo "→ 检查系统时区 ..."
     local tz
     tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null)
     if [ "$tz" = "Asia/Shanghai" ]; then
-        c_green "✔ 当前时区已是 Asia/Shanghai，跳过设置"
-        log "INFO" "时区已是 Asia/Shanghai，跳过"
+        echo -e " \033[32m[✔]\033[0m 当前时区已是 Asia/Shanghai"
         return
     fi
     if ! timedatectl set-timezone Asia/Shanghai 2>/dev/null; then
-        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
-            || c_yellow "  ! 无法创建 /etc/localtime 符号链接"
-        echo "Asia/Shanghai" > /etc/timezone 2>/dev/null \
-            || c_yellow "  ! 无法写入 /etc/timezone，请手动确认时区"
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime || true
+        echo "Asia/Shanghai" > /etc/timezone 2>/dev/null || true
     fi
-    c_green "✔ 系统时区已设置为 Asia/Shanghai（原时区: ${tz:-未知}）"
-    log "INFO" "系统时区由 [$tz] 改为 Asia/Shanghai"
+    echo -e " \033[32m[✔]\033[0m 系统时区已设置为 Asia/Shanghai"
 }
 
 setup_vnstat_utc() {
-    echo "→ 配置 vnStat 使用 UTC0 时间基准 (UseUTC 1) ..."
+    echo -e " \033[33m[⏳]\033[0m 配置 vnStat UseUTC 1 (UTC0 基准)..."
     if [ ! -f "$VNSTAT_CONF" ]; then
         echo "UseUTC 1" > "$VNSTAT_CONF" || die "无法写入 $VNSTAT_CONF"
     elif grep -qE '^[#[:space:]]*UseUTC' "$VNSTAT_CONF"; then
@@ -566,26 +578,7 @@ setup_vnstat_utc() {
     fi
     grep -qE '^UseUTC 1' "$VNSTAT_CONF" || die "vnStat UseUTC 配置写入失败"
     systemctl restart vnstat >/dev/null 2>&1
-    c_green "✔ vnStat UseUTC=1 已生效，流量统计与重置日均以 UTC0 为基准"
-    log "INFO" "vnStat UseUTC=1 配置完成"
-}
-
-#===============================================================================
-# 交互式配置
-#===============================================================================
-prompt_input() {
-    local tip=$1 def=${2:-} val
-    if [ -n "$def" ]; then
-        read -rp "$(c_blue "$tip [当前: $def，回车保留]: ")" val
-        REPLY_VAL=${val:-$def}
-    else
-        while true; do
-            read -rp "$(c_blue "$tip: ")" val
-            [ -n "$val" ] && break
-            c_yellow "  ! 不能为空，请重新输入"
-        done
-        REPLY_VAL=$val
-    fi
+    echo -e " \033[32m[✔]\033[0m vnStat UseUTC=1 已生效"
 }
 
 choose_iface() {
@@ -596,25 +589,25 @@ choose_iface() {
         ifaces+=("$n")
     done
     [ ${#ifaces[@]} -gt 0 ] || die "未检测到任何可用网卡接口"
-    echo "检测到以下网卡接口:"
+    echo -e "检测到网卡接口:"
     for i in "${!ifaces[@]}"; do
         ip=$(ip -4 addr show "${ifaces[i]}" 2>/dev/null | grep -oP '(?<=inet )[\d.]+' | head -n1)
-        echo "  $((i+1))) ${ifaces[i]} ${ip:+(IP: $ip)}"
+        echo -e "   \033[32m$((i+1)))\033[0m ${ifaces[i]} \033[90m${ip:+(IP: $ip)}\033[0m"
     done
     if [ ${#ifaces[@]} -eq 1 ]; then
-        read -rp "$(c_blue "仅检测到一个网口，使用 [${ifaces[0]}]？(Y/n): ")" REPLY_VAL
+        prompt_input "仅检测到 [${ifaces[0]}]，确认使用？(Y/n)"
         case "$REPLY_VAL" in n|N) ;; *) REPLY_VAL="${ifaces[0]}"; return;; esac
     fi
     while true; do
-        read -rp "$(c_blue "请选择监控网口编号 [默认: ${IFACE:-1}]: ")" idx
-        idx=${idx:-1}
+        prompt_input "请选择监控网口编号" "${IFACE:-1}"
+        idx=$REPLY_VAL
         if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le ${#ifaces[@]} ]; then
             REPLY_VAL="${ifaces[idx-1]}"; return
         fi
         for n in "${ifaces[@]}"; do
             [ "$idx" = "$n" ] && { REPLY_VAL="$n"; return; }
         done
-        c_yellow "  ! 无效选择，请输入 1-${#ifaces[@]} 的编号或接口名"
+        echo -e "\033[31m[✘]\033[0m 无效选择，请重新输入"
     done
 }
 
@@ -622,48 +615,48 @@ interactive_config() {
     local is_update=0
     if load_config; then
         is_update=1
-        c_yellow "检测到已有配置，将以【修改配置】模式更新（回车保留原值）"
-        log "INFO" "以修改配置模式进入交互设置"
+        echo -e " \033[33m[!]\033[0m 检测到已有配置，进入修改模式（回车保留原值）"
     else
-        c_green "首次安装，进入交互配置"
-        log "INFO" "首次安装，进入交互配置"
+        echo -e " \033[32m[✔]\033[0m 首次安装，进入配置向导"
     fi
-    echo
+    echo ""
 
     prompt_input "① 监控服务器名称" "$SERVER_NAME";   SERVER_NAME=$REPLY_VAL
-    echo
-    echo "② 监控网口设置:"
+    echo ""
+    echo -e " ② 监控网口设置:"
     choose_iface;                                      IFACE=$REPLY_VAL
-    echo
-    prompt_input "③ 每月账单流量重置日 (1-31, UTC 基准)" "$RESET_DAY"
+    echo ""
+    prompt_input "③ 每月账单流量重置日 (1-31, UTC)" "$RESET_DAY"
     [[ "$REPLY_VAL" =~ ^[0-9]+$ ]] && [ "$REPLY_VAL" -ge 1 ] && [ "$REPLY_VAL" -le 31 ] \
         || die "重置日非法：$REPLY_VAL"
     RESET_DAY=$((10#$REPLY_VAL))
-    echo
-    echo "④ 流量统计类型: 1)总流量(上传+下载)  2)上传流量  3)下载流量"
-    prompt_input "   请选择" "${STAT_TYPE:-1}"
-    case "$REPLY_VAL" in 1|2|3) STAT_TYPE=$REPLY_VAL ;; *) die "统计类型非法：$REPLY_VAL" ;; esac
-    echo
+    echo ""
+    echo -e " ④ 流量统计类型: \033[32m1\033[0m)总流量 \033[32m2\033[0m)上传 \033[32m3\033[0m)下载"
+    prompt_input "请选择" "${STAT_TYPE:-1}"
+    case "$REPLY_VAL" in 1|2|3) STAT_TYPE=$REPLY_VAL ;; *) die "统计类型非法" ;; esac
+    echo ""
     prompt_input "⑤ Telegram Bot Token" "$TG_TOKEN";  TG_TOKEN=$REPLY_VAL
     prompt_input "⑥ Telegram Chat ID" "$TG_CHATID";   TG_CHATID=$REPLY_VAL
-    echo
-    prompt_input "⑦ 账单周期总流量 (GB, 支持小数)" "$LIMIT_GB"
+    echo ""
+    prompt_input "⑦ 账单周期总流量 (GB)" "$LIMIT_GB"
     if ! [[ "$REPLY_VAL" =~ ^[0-9]+([.][0-9]+)?$ ]] \
             || ! awk -v l="$REPLY_VAL" 'BEGIN{exit !(l+0>0)}' 2>/dev/null; then
         die "流量总额非法：$REPLY_VAL"
     fi
     LIMIT_GB=$REPLY_VAL
-    echo
+    echo ""
 
-    c_yellow "配置预览:"
-    echo "  服务器名称 : $SERVER_NAME"
-    echo "  监控网口   : $IFACE"
-    echo "  账单重置日 : 每月 ${RESET_DAY} 日 (UTC0)"
-    echo "  统计类型   : $(stat_type_name)"
-    echo "  流量总额   : ${LIMIT_GB} GB"
-    echo "  TG Token   : ${TG_TOKEN:0:12}****"
-    echo "  TG Chat ID : $TG_CHATID"
-    read -rp "$(c_blue "确认保存配置？(Y/n): ")" REPLY_VAL
+    echo -e "\033[36m--- 配置预览 ---\033[0m"
+    echo -e " 服务器名称 : \033[1;37m$SERVER_NAME\033[0m"
+    echo -e " 监控网口   : \033[1;37m$IFACE\033[0m"
+    echo -e " 账单重置日 : \033[1;37m每月 ${RESET_DAY} 日 (UTC0)\033[0m"
+    echo -e " 统计类型   : \033[1;37m$(stat_type_name)\033[0m"
+    echo -e " 流量总额   : \033[1;37m${LIMIT_GB} GB\033[0m"
+    echo -e " TG Token   : \033[1;37m${TG_TOKEN:0:12}****\033[0m"
+    echo -e " TG Chat ID : \033[1;37m$TG_CHATID\033[0m"
+    echo ""
+    
+    prompt_input "确认保存配置？(Y/n)"
     case "$REPLY_VAL" in n|N) die "用户取消保存";; esac
 
     mkdir -p "$BASE_DIR"
@@ -682,11 +675,9 @@ interactive_config() {
 
     if [ "$is_update" -eq 1 ]; then
         rm -f "$STATE_FILE" "$LOCK_SHUTDOWN"
-        log "OK" "配置文件已更新: 名称=$SERVER_NAME 网口=$IFACE 重置日=$RESET_DAY 类型=$STAT_TYPE 总额=${LIMIT_GB}GB"
-        c_green "✔ 配置文件已更新: $CONF_FILE"
+        echo -e "\n \033[32m[✔]\033[0m 配置文件已更新，旧状态已重置"
     else
-        log "OK" "配置文件已创建: 名称=$SERVER_NAME 网口=$IFACE 重置日=$RESET_DAY 类型=$STAT_TYPE 总额=${LIMIT_GB}GB"
-        c_green "✔ 配置文件已创建: $CONF_FILE"
+        echo -e "\n \033[32m[✔]\033[0m 配置文件已创建"
     fi
 
     vnstat --add -i "$IFACE" >/dev/null 2>&1
@@ -694,12 +685,10 @@ interactive_config() {
 }
 
 install_cron() {
-    echo "→ 创建/更新定时任务 ..."
-
+    echo -e " \033[33m[⏳]\033[0m 创建/更新定时任务..."
     if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]]; then
-        die "脚本路径异常 ($SCRIPT_PATH)，无法配置定时任务！请将脚本保存为本地文件后再试。"
+        die "脚本路径异常 ($SCRIPT_PATH)，无法配置定时任务！请保存为本地文件。"
     fi
-
     [ -x "$SCRIPT_PATH" ] || chmod +x "$SCRIPT_PATH" 2>/dev/null
 
     local tmp scmd lcmd
@@ -712,28 +701,28 @@ install_cron() {
     crontab "$tmp" || { rm -f "$tmp"; die "crontab 写入失败"; }
     rm -f "$tmp"
     restart_cron_service
-    c_green "✔ 定时任务已重载:"
-    crontab -l | grep "# traffic-monitor" | sed 's/^/    /'
-    log "OK" "定时任务已创建/更新并重载 cron"
+    echo -e " \033[32m[✔]\033[0m 定时任务已生效"
 }
 
 cmd_install() {
     check_root
-    echo "==============================================="
-    echo "  安装部署 / 修改配置  ($VERSION)"
-    echo "==============================================="
+    print_section "安装部署 / 修改配置"
     install_deps
     setup_timezone
     setup_vnstat_utc
+    echo ""
     interactive_config
+    echo ""
     install_cron
-    echo
-    c_green "✔ 全部完成！"
-    echo "  - 每日日报: 北京时间 08:00 自动推送（流量统计以 UTC0 账单周期为准）"
-    echo "  - 阈值检查: 每分钟一次（90% 首次预警 / 95% 报警并延迟 1 分钟关机）"
-    echo "  - 日志文件: $LOG_FILE"
-    echo
-    read -rp "$(c_blue "是否立即发送一条测试日报？(Y/n): ")" REPLY_VAL
+    echo ""
+    echo -e "\033[32m===================================================\033[0m"
+    echo -e "  \033[1;32m全部完成！\033[0m"
+    echo -e "  - 每日日报: 北京时间 08:00"
+    echo -e "  - 阈值检查: 每分钟一次"
+    echo -e "\033[32m===================================================\033[0m"
+    echo ""
+    
+    prompt_input "是否立即发送一条测试日报？(Y/n)"
     case "$REPLY_VAL" in n|N) ;; *) cmd_test_push ;; esac
 }
 
@@ -744,98 +733,104 @@ cmd_show() {
     check_root
     load_config || die "尚未安装配置，请先执行【1. 安装部署/修改配置】"
     validate_config
+    
+    print_section "当前流量数据 — ${SERVER_NAME}"
+    
     local used_bytes percent start cover cov_earliest all_bytes
     PARSE_ERROR=0
     used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
     percent=$(calc_percent "${used_bytes:-0}")
     start=$(cycle_start_date)
-    echo "==============================================="
-    echo "  当前流量数据 — ${SERVER_NAME}  [$VERSION]"
-    echo "==============================================="
-    echo "  监控网口   : $IFACE"
-    echo "  统计类型   : $(stat_type_name)"
-    echo "  账单周期   : ${start} 起 (UTC0) → 当前 $(date -u '+%Y-%m-%d %H:%M') UTC"
-    echo "  已用流量   : $(human_bytes "${used_bytes:-0}") / ${LIMIT_GB} GB (${percent}%)"
-    echo "  预警阈值   : 90% (首次触发推送) / 95% (报警并关机)"
+    
+    echo -e " \033[36m➜\033[0m 监控网口 : \033[1;37m$IFACE\033[0m ($(stat_type_name))"
+    echo -e " \033[36m➜\033[0m 账单周期 : \033[1;37m${start}\033[0m (UTC0) → 当前 $(date -u '+%Y-%m-%d %H:%M')"
+    echo -e " \033[36m➜\033[0m 已用流量 : \033[1;33m$(human_bytes "${used_bytes:-0}")\033[0m / ${LIMIT_GB} GB (\033[1;32m${percent}%\033[0m)"
+    echo -e " \033[36m➜\033[0m 阈值预警 : 90% (推送) / 95% (关机)"
+    
     if [ "$PARSE_ERROR" -eq 1 ]; then
-        c_red "  ⚠ 周期流量解析失败！请执行【6. 环境自检】或查看日志: $LOG_FILE"
+        echo -e " \033[31m[✘] 周期流量解析失败！请执行【6. 环境自检】\033[0m"
     elif [ "${used_bytes:-0}" -eq 0 ]; then
         all_bytes=$(vnstat_day_json | jq -r "$(jq_day_sum_filter '(.rx + .tx)' '')" 2>/dev/null)
         if awk -v v="${all_bytes:-0}" 'BEGIN{exit !(v+0>0)}' 2>/dev/null; then
-            c_yellow "  ⚠ 本账单周期统计为 0，但 vnStat 存在其他时段流量，请核对日明细"
+            echo -e " \033[33m[!] 周期统计为 0，但 vnStat 存在历史流量，请核对日明细\033[0m"
         fi
     else
         cover=$(check_day_coverage "$start")
         case "$cover" in
             missing:*)
                 cov_earliest=${cover#missing:}
-                c_yellow "  ⚠ 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}（晚于周期起点），此前的周期流量无法统计"
-                c_yellow "    历史数据口径错乱可用【7. 重置 vnStat 数据库】解决"
+                echo -e " \033[33m[!] 日明细最早仅到 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2}，统计可能偏低\033[0m"
                 ;;
             newdb:*)
                 cov_earliest=${cover#newdb:}
-                c_green "  ℹ 日明细自 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2} 开始记录（新建库），周期统计从该日起累积"
+                echo -e " \033[32m[i] 日明细自 ${cov_earliest:0:4}-${cov_earliest:4:2}-${cov_earliest:6:2} 开始记录\033[0m"
                 ;;
         esac
     fi
-    echo "-----------------------------------------------"
-    echo "  vnStat 实时概况:"
-    vnstat -i "$IFACE" 2>/dev/null | sed 's/^/    /' || c_yellow "  (vnStat 暂无该网口数据，等待守护进程采集，约需几分钟)"
-    echo "==============================================="
+    
+    echo -e "\033[36m---------------------------------------------------\033[0m"
+    echo -e " vnStat 实时概况:"
+    vnstat -i "$IFACE" 2>/dev/null | sed 's/^/    /' || echo -e "    \033[33m(暂无数据，等待守护进程采集...)\033[0m"
+    echo -e "\033[36m---------------------------------------------------\033[0m"
 }
 
 #===============================================================================
 # 环境自检
 #===============================================================================
 cmd_diag() {
+    print_section "环境自检"
     [ "$(id -u)" -eq 0 ] \
-        || c_yellow "提示：当前非 root 运行，可能无法读取配置文件 ($CONF_FILE)，完整自检建议 sudo 运行"
-    echo "================ 环境自检 ($VERSION) ================"
-    echo "脚本路径   : $SCRIPT_PATH"
-    echo "运行时间   : $(date '+%Y-%m-%d %H:%M:%S %Z') / UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
-    echo "系统时区   : $(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo 未知)"
-    echo "vnStat 版本: $(vnstat --version 2>/dev/null | head -n1 || echo 未安装)"
-    echo "vnStat 服务: $(systemctl is-active vnstat 2>/dev/null || echo 未知)"
-    echo "UseUTC 配置: $(grep -E '^UseUTC' "$VNSTAT_CONF" 2>/dev/null || echo "未找到($VNSTAT_CONF)")"
-    echo "jq 版本    : $(jq --version 2>/dev/null || echo 未安装)"
-    echo "curl 版本  : $(curl --version 2>/dev/null | head -n1 || echo 未安装)"
+        || echo -e " \033[33m提示：当前非 root 运行，可能无法读取部分配置\033[0m"
+        
+    echo -e " \033[36m[基础环境]\033[0m"
+    echo -e " 脚本路径   : $SCRIPT_PATH"
+    echo -e " 运行时间   : $(date '+%Y-%m-%d %H:%M:%S %Z') / UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+    echo -e " 系统时区   : $(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo 未知)"
+    echo -e " vnStat 版本: $(vnstat --version 2>/dev/null | head -n1 || echo 未安装)"
+    echo -e " vnStat 服务: $(systemctl is-active vnstat 2>/dev/null || echo 未知)"
+    echo -e " UseUTC 配置: $(grep -E '^UseUTC' "$VNSTAT_CONF" 2>/dev/null || echo "未找到")"
+    echo -e " jq 版本    : $(jq --version 2>/dev/null || echo 未安装)"
+    echo -e " curl 版本  : $(curl --version 2>/dev/null | head -n1 || echo 未安装)"
+    
     if load_config; then
-        echo "--- 配置 ---"
-        echo "服务器名称 : $SERVER_NAME"
-        echo "监控网口   : $IFACE (存在: $([ -d "/sys/class/net/$IFACE" ] && echo 是 || echo 否))"
-        echo "重置日/类型: $RESET_DAY / $STAT_TYPE | 总额: ${LIMIT_GB} GB"
-        echo "TG 配置    : Token[$( [ -n "$TG_TOKEN" ] && echo 已填 || echo 空*)] ChatID[$( [ -n "$TG_CHATID" ] && echo 已填 || echo 空 )]"
-        echo "--- vnStat JSON 探测 ---"
-        local json
+        echo -e "\n \033[36m[监控配置]\033[0m"
+        echo -e " 服务器名称 : $SERVER_NAME"
+        echo -e " 监控网口   : $IFACE (存在: $([ -d "/sys/class/net/$IFACE" ] && echo 是 || echo 否))"
+        echo -e " 重置日/类型: $RESET_DAY / $STAT_TYPE | 总额: ${LIMIT_GB} GB"
+        echo -e " TG 配置    : Token[$( [ -n "$TG_TOKEN" ] && echo 已填 || echo 空*)] ChatID[$( [ -n "$TG_CHATID" ] && echo 已填 || echo 空 )]"
+        
+        echo -e "\n \033[36m[vnStat 数据探测]\033[0m"
+        local json start bytes
         json=$(vnstat_day_json)
         if [ -n "$json" ]; then
-            echo "顶层键     : $(echo "$json" | jq -r 'keys | join(", ")' 2>/dev/null || echo jq解析失败)"
-            echo "首条日明细 : $(echo "$json" | jq -c '[ .. | objects | select(has("day")) | select(.day|type=="array") | .day[] ] | first // "无"' 2>/dev/null | head -c 200)"
-            echo "--- 周期计算 ---"
-            local start bytes
+            echo -e " 顶层键     : $(echo "$json" | jq -r 'keys | join(", ")' 2>/dev/null || echo jq解析失败)"
+            echo -e " 首条日明细 : $(echo "$json" | jq -c '[ .. | objects | select(has("day")) | select(.day|type=="array") | .day[] ] | first // "无"' 2>/dev/null | head -c 200)"
+            
+            echo -e "\n \033[36m[周期计算]\033[0m"
             start=$(cycle_start_date)
-            echo "周期起点   : $start (UTC)"
+            echo -e " 周期起点   : $start (UTC)"
             PARSE_ERROR=0
             bytes=$(get_cycle_bytes) || PARSE_ERROR=1
-            echo "周期字节   : ${bytes:-0}  ($(human_bytes "${bytes:-0}"))"
+            echo -e " 周期字节   : ${bytes:-0}  ($(human_bytes "${bytes:-0}"))"
             if [ "$PARSE_ERROR" -eq 1 ]; then
-                c_red "解析状态   : ✘ 失败（详见上方 JSON 探测与日志）"
+                echo -e " 解析状态   : \033[31m✘ 失败（详见 JSON 探测与日志）\033[0m"
             else
-                echo "解析状态   : ✔ 正常"
-                echo "已用百分比 : $(calc_percent "$bytes")%"
-                echo "日明细覆盖 : $(check_day_coverage "$start")"
+                echo -e " 解析状态   : \033[32m✔ 正常\033[0m"
+                echo -e " 已用百分比 : $(calc_percent "$bytes")%"
+                echo -e " 日明细覆盖 : $(check_day_coverage "$start")"
             fi
         else
-            c_red "vnstat --json d -i $IFACE 无输出！请在服务器手动执行该命令排障"
+            echo -e " \033[31m✘ vnstat --json d -i $IFACE 无输出！请手动执行排障\033[0m"
         fi
     else
-        c_yellow "配置文件不存在或不可读（尚未安装 / 无读取权限 / 已被清理），仅输出环境信息"
+        echo -e " \033[33m[!] 配置文件不存在或不可读，仅输出环境信息\033[0m"
     fi
-    echo "--- 定时任务 ---"
+    
+    echo -e "\n \033[36m[定时任务]\033[0m"
     crontab -l 2>/dev/null | grep "# traffic-monitor" | sed 's/^/    /' || echo "    (无 traffic-monitor 任务)"
-    echo "--- 日志最近 10 行 ---"
-    tail -n 10 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (无日志)"
-    echo "===================================================="
+    echo -e "\n \033[36m[日志最近 5 行]\033[0m"
+    tail -n 5 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' || echo "    (无日志)"
+    echo -e "\033[36m---------------------------------------------------\033[0m"
 }
 
 #===============================================================================
@@ -844,17 +839,23 @@ cmd_diag() {
 cmd_reset_db() {
     check_root
     load_config || die "尚未安装配置，请先执行【1. 安装部署/修改配置】"
-    c_yellow "将删除网口 [$IFACE] 的 vnStat 全部历史流量数据，从当前时刻重新统计！"
-    c_yellow "适用场景: 日/月明细口径错乱（如 UseUTC 切换、建库时间错位导致的历史数据不一致）"
-    read -rp "$(c_blue "确认重置？此操作不可恢复 (y/N): ")" REPLY_VAL
-    case "$REPLY_VAL" in y|Y) ;; *) echo "已取消"; return;; esac
+    
+    print_section "重置 vnStat 数据库"
+    echo -e " \033[31m[!] 将删除网口 [$IFACE] 的全部历史流量数据！\033[0m"
+    echo -e " \033[90m适用场景: 日/月明细口径错乱（如 UseUTC 切换导致历史数据不一致）\033[0m"
+    echo ""
+    prompt_input "确认重置？此操作不可恢复 (y/N)"
+    case "$REPLY_VAL" in y|Y) ;; *) echo -e " \033[90m已取消\033[0m"; return;; esac
+    
+    echo -e " \033[33m[⏳]\033[0m 正在重置数据库..."
     systemctl stop vnstat >/dev/null 2>&1
     rm -f "${VNSTAT_DB_DIR}/${IFACE}" "${VNSTAT_DB_DIR}/${IFACE}.tmp" 2>/dev/null
     vnstat --add -i "$IFACE" >/dev/null 2>&1
     systemctl start vnstat >/dev/null 2>&1
     rm -f "$STATE_FILE" "$LOCK_SHUTDOWN"
+    
     log "WARN" "已重置 vnStat 数据库: 网口=$IFACE，历史明细清空，预警/关机状态重置"
-    c_green "✔ 已重置。流量约 1~2 分钟后开始重新累积，期间【查看当前流量】显示 0 属正常"
+    echo -e " \033[32m[✔]\033[0m 已重置。流量约 1~2 分钟后重新累积，期间显示 0 属正常。"
 }
 
 #===============================================================================
@@ -862,15 +863,16 @@ cmd_reset_db() {
 #===============================================================================
 cmd_update() {
     check_root
-
     if [[ "$SCRIPT_PATH" =~ ^/proc/.*/fd/ ]] || [[ "$SCRIPT_PATH" =~ ^/dev/fd/ ]]; then
         die "当前处于临时管道执行模式，无法自动覆盖更新。请手动下载脚本！"
     fi
 
-    echo "→ 正在从 GitHub 拉取最新脚本（强制刷新，绕过 CDN 缓存）..."
+    print_section "更新脚本"
+    echo -e " \033[33m[⏳]\033[0m 正在从 GitHub 拉取最新脚本..."
     local tmp url newver
     tmp=$(mktemp)
     url="${UPDATE_URL}?t=$(date +%s)$RANDOM"
+    
     if ! curl -fsSL -m 60 \
             -H "Cache-Control: no-cache, no-store, must-revalidate" \
             -H "Pragma: no-cache" \
@@ -878,17 +880,18 @@ cmd_update() {
         rm -f "$tmp"
         die "下载失败，请检查网络或仓库地址: $UPDATE_URL"
     fi
+    
     [ -s "$tmp" ] || { rm -f "$tmp"; die "下载内容为空"; }
-    head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; c_red "下载内容不是有效脚本（可能是 GitHub 404 页面）"; head -n3 "$tmp"; die "已放弃更新"; }
+    head -n1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; die "下载内容不是有效脚本"; }
     bash -n "$tmp" || { rm -f "$tmp"; die "新脚本语法校验未通过，已放弃更新"; }
     
     cp -f "$tmp" "${SCRIPT_PATH}.new" && chmod +x "${SCRIPT_PATH}.new" && mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH"
     rm -f "$tmp"
     
     newver=$(grep -m1 '^VERSION=' "$SCRIPT_PATH" | cut -d'"' -f2)
-    c_green "✔ 脚本已更新至 ${newver:-未知}（原版本 $VERSION）: $SCRIPT_PATH"
+    echo -e " \033[32m[✔]\033[0m 脚本已更新至 ${newver:-未知} (原版本 $VERSION)"
     log "OK" "脚本已从 GitHub 更新: $VERSION → ${newver:-未知}"
-    echo "  提示: 建议执行【6. 环境自检】确认新版本生效"
+    echo -e " \033[90m提示: 建议执行【6. 环境自检】确认新版本生效\033[0m"
 }
 
 #===============================================================================
@@ -896,16 +899,15 @@ cmd_update() {
 #===============================================================================
 cmd_uninstall() {
     check_root
-    echo "==============================================="
-    echo "  卸载 traffic-monitor ($VERSION)"
-    echo "==============================================="
-    c_yellow "将执行以下清理操作:"
-    echo "  1) 删除相关 cron 定时任务并重载"
-    echo "  2) 删除配置/状态/日志目录: $BASE_DIR"
-    echo "  3) 删除脚本文件: $SCRIPT_PATH"
-    echo "  （vnStat 本体及其流量数据库默认保留，如需卸载可自行 apt purge vnstat）"
-    read -rp "$(c_blue "确认卸载？(y/N): ")" REPLY_VAL
-    case "$REPLY_VAL" in y|Y) ;; *) echo "已取消卸载"; return;; esac
+    print_section "卸载监控程序"
+    echo -e " \033[33m将执行以下清理操作:\033[0m"
+    echo -e "  1) 删除相关 cron 定时任务并重载"
+    echo -e "  2) 删除配置/状态/日志目录: $BASE_DIR"
+    echo -e "  3) 删除脚本文件: $SCRIPT_PATH"
+    echo -e "  \033[90m(vnStat 本体及其数据库默认保留)\033[0m"
+    echo ""
+    prompt_input "确认卸载？(y/N)"
+    case "$REPLY_VAL" in y|Y) ;; *) echo -e " \033[90m已取消卸载\033[0m"; return;; esac
 
     log "WARN" "开始执行卸载"
     local tmp; tmp=$(mktemp)
@@ -913,49 +915,32 @@ cmd_uninstall() {
     if [ -s "$tmp" ]; then crontab "$tmp"; else crontab -r 2>/dev/null; fi
     rm -f "$tmp"
     restart_cron_service
-    c_green "✔ 定时任务已清理"
+    echo -e " \033[32m[✔]\033[0m 定时任务已清理"
+    
     local bak="${HOME:-/root}/traffic-monitor-last.log"
     if [ -f "$LOG_FILE" ]; then
         if cp -f "$LOG_FILE" "$bak" 2>/dev/null; then
-            c_green "✔ 日志已备份至: $bak"
-        else
-            c_yellow "  ! 日志备份失败，请手动备份: $LOG_FILE"
+            echo -e " \033[32m[✔]\033[0m 日志已备份至: $bak"
         fi
     fi
     rm -rf "$BASE_DIR"
-    c_green "✔ 配置/状态/日志已删除"
+    echo -e " \033[32m[✔]\033[0m 配置/状态/日志已删除"
     rm -f "$SCRIPT_PATH"
-    c_green "✔ 脚本文件已删除: $SCRIPT_PATH"
-    echo
-    c_green "卸载完成！"
+    echo -e " \033[32m[✔]\033[0m 脚本文件已删除: $SCRIPT_PATH"
+    echo ""
+    echo -e "\033[32m 卸载完成！\033[0m"
     exit 0
 }
 
 #===============================================================================
 # 主菜单
 #===============================================================================
-print_banner() {
-    clear 2>/dev/null
-    echo "==============================================="
-    echo "      vnStat 流量监控助手  ${VERSION}"
-    echo "      Debian 13 / vnStat 2.x"
-    echo "==============================================="
-    echo "  1. 安装部署/修改配置"
-    echo "  2. 测试发送每日流量推送"
-    echo "  3. 查看当前流量数据"
-    echo "  4. 从 GitHub 更新脚本"
-    echo "  5. 卸载监控程序"
-    echo "  6. 环境自检（排障）"
-    echo "  7. 重置 vnStat 数据库"
-    echo "  0. 退出"
-    echo "==============================================="
-}
-
 menu() {
     [ -t 0 ] || die "非交互终端环境，请使用子命令: daily|check|config|test|show|diag|update|uninstall|reset-db|version"
     while true; do
         print_banner
-        read -rp "$(c_blue '请输入选项: ')" choice
+        echo -ne " \033[32m?\033[0m 请输入选项: "
+        read -r choice
         case "$choice" in
             1) cmd_install ;;
             2) cmd_test_push ;;
@@ -964,10 +949,13 @@ menu() {
             5) cmd_uninstall ;;
             6) cmd_diag ;;
             7) cmd_reset_db ;;
-            0) echo "再见！"; exit 0 ;;
-            *) c_yellow "无效选项，请重新输入";;
+            0) echo -e "\n 再见！"; exit 0 ;;
+            *) echo -e "\n\033[33m[!]\033[0m 无效选项，请重新输入"; sleep 1;;
         esac
-        [ "$choice" != "0" ] && read -rp "$(c_blue '按回车键返回主菜单...')" _
+        echo ""
+        echo -e "\033[36m---------------------------------------------------\033[0m"
+        echo -ne " 按回车键返回主菜单..."
+        read -r _
     done
 }
 
