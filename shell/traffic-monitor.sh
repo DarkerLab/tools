@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.6.5
+# 版    本 : v1.6.6
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
-#   v1.6.5 [UI] 深度重构 UI 显示。恢复双列主菜单并解决对齐问题；统一状态标签
-#          为 [ OK ]、[WARN]、[INFO] 等对称格式；优化交互提示与配置预览。
+#   v1.6.6 [UI] 交互提示符由 ➜ 替换为更现代、兼容性更好的 ❯。
+#   v1.6.5 [UI] 深度重构 UI 显示。恢复双列主菜单并解决对齐问题；统一状态标签。
 #   v1.6.4 [优化] 主菜单改为单排显示。
-#   v1.6.3 [优化] 互换菜单 5 和 7 的位置。
-#   v1.6.2 [优化] 更新 URL 改为完整 refs/heads 路径。
 #===============================================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.6.5"
+VERSION="v1.6.6"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -517,12 +515,12 @@ print_section() {
 prompt_input() {
     local tip=$1 def=${2:-} val
     if [ -n "$def" ]; then
-        echo -ne " \033[1;36m➜\033[0m $tip \033[90m[当前: $def]\033[0m \033[1;33m(回车保留)\033[0m: "
+        echo -ne " \033[1;36m❯\033[0m $tip \033[90m[当前: $def]\033[0m \033[1;33m(回车保留)\033[0m: "
         read -r val
         REPLY_VAL=${val:-$def}
     else
         while true; do
-            echo -ne " \033[1;36m➜\033[0m $tip: "
+            echo -ne " \033[1;36m❯\033[0m $tip: "
             read -r val
             [ -n "$val" ] && break
             tag_err "不能为空，请重新输入"
@@ -748,10 +746,10 @@ cmd_show() {
     percent=$(calc_percent "${used_bytes:-0}")
     start=$(cycle_start_date)
     
-    echo -e " \033[1;36m➜\033[0m 监控网口 : \033[1;37m$IFACE\033[0m ($(stat_type_name))"
-    echo -e " \033[1;36m➜\033[0m 账单周期 : \033[1;37m${start}\033[0m (UTC0) → 当前 $(date -u '+%Y-%m-%d %H:%M')"
-    echo -e " \033[1;36m➜\033[0m 已用流量 : \033[1;33m$(human_bytes "${used_bytes:-0}")\033[0m / ${LIMIT_GB} GB (\033[1;32m${percent}%\033[0m)"
-    echo -e " \033[1;36m➜\033[0m 阈值预警 : 90% (推送) / 95% (关机)"
+    echo -e " \033[1;36m❯\033[0m 监控网口 : \033[1;37m$IFACE\033[0m ($(stat_type_name))"
+    echo -e " \033[1;36m❯\033[0m 账单周期 : \033[1;37m${start}\033[0m (UTC0) → 当前 $(date -u '+%Y-%m-%d %H:%M')"
+    echo -e " \033[1;36m❯\033[0m 已用流量 : \033[1;33m$(human_bytes "${used_bytes:-0}")\033[0m / ${LIMIT_GB} GB (\033[1;32m${percent}%\033[0m)"
+    echo -e " \033[1;36m❯\033[0m 阈值预警 : 90% (推送) / 95% (关机)"
     
     if [ "$PARSE_ERROR" -eq 1 ]; then
         tag_err "周期流量解析失败！请执行【6. 环境自检】"
@@ -946,7 +944,7 @@ menu() {
     [ -t 0 ] || die "非交互终端环境，请使用子命令: daily|check|config|test|show|diag|update|uninstall|reset-db|version"
     while true; do
         print_banner
-        echo -ne " \033[1;36m➜\033[0m 请输入选项: "
+        echo -ne " \033[1;36m❯\033[0m 请输入选项: "
         read -r choice
         case "$choice" in
             1) cmd_install ;;
