@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.6.1 (清爽 UI 版)
+# 版    本 : v1.6.2
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
+#   v1.6.2 [优化] 更新 URL 改为完整 refs/heads 路径；从菜单更新成功后自动重载脚本。
 #   v1.6.1 [UI] 去除复杂的 Unicode 画框，改用清爽的 ASCII 分隔线；菜单两列对齐。
 #   v1.6.0 [UI] 初步 UI 美化。
 #   v1.5.1 [修复] 新库检测带上具体日期；强制刷新版本。
@@ -17,14 +18,15 @@
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.6.1"
+VERSION="v1.6.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
 STATE_FILE="${BASE_DIR}/state.conf"
 LOG_FILE="${BASE_DIR}/monitor.log"
 LOCK_SHUTDOWN="${BASE_DIR}/shutdown.lock"
-UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/main/shell/traffic-monitor.sh"
+# 使用 GitHub 完整 refs/heads 路径
+UPDATE_URL="https://raw.githubusercontent.com/DarkerLab/tools/refs/heads/main/shell/traffic-monitor.sh"
 VNSTAT_CONF="/etc/vnstat.conf"
 VNSTAT_DB_DIR="/var/lib/vnstat"
 MAX_LOG_SIZE=$((5*1024*1024))
@@ -891,7 +893,10 @@ cmd_update() {
     newver=$(grep -m1 '^VERSION=' "$SCRIPT_PATH" | cut -d'"' -f2)
     echo -e " \033[32m[✔]\033[0m 脚本已更新至 ${newver:-未知} (原版本 $VERSION)"
     log "OK" "脚本已从 GitHub 更新: $VERSION → ${newver:-未知}"
-    echo -e " \033[90m提示: 建议执行【6. 环境自检】确认新版本生效\033[0m"
+    
+    echo -e " \033[33m[⏳]\033[0m 正在重载新版本脚本..."
+    sleep 1
+    exec "$SCRIPT_PATH" "$@"
 }
 
 #===============================================================================
