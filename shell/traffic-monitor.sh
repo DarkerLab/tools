@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.6.6
+# 版    本 : v1.1
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
-#   v1.6.6 [UI] 交互提示符由 ➜ 替换为更现代、兼容性更好的 ❯。
-#   v1.6.5 [UI] 深度重构 UI 显示。恢复双列主菜单并解决对齐问题；统一状态标签。
-#   v1.6.4 [优化] 主菜单改为单排显示。
+#   v1.1 [Produce] 最终优化部署上线的生产版本
 #===============================================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.6.6"
+VERSION="v1.1"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -311,8 +309,8 @@ build_report() {
 
     echo "📊 [$(html_escape "$SERVER_NAME")]每日流量日报"
     echo "━━━━━━━━━━━━━━━"
-    echo "- 周期用量: $(human_bytes "${used_bytes:-0}") / $(html_escape "$LIMIT_GB") GB (${percent}%)"
-    echo "- 统计时间: ${now_utc} (UTC)${warn}"
+    echo "- 周期用量: <code>$(human_bytes "${used_bytes:-0}")</code> / <code>$(html_escape "$LIMIT_GB") GB</code> (${percent}%)"
+    echo "- 统计时间: <code>${now_utc} (UTC)</code>${warn}"
 }
 
 cmd_daily() {
@@ -363,10 +361,10 @@ cmd_test_push() {
 
     local msg="📊 [$(html_escape "$SERVER_NAME")]每日流量日报 (测试)
 ━━━━━━━━━━━━━━━
-- 周期用量: $(human_bytes "${used_bytes:-0}") / $(html_escape "$LIMIT_GB") GB (${percent}%)
-- 账单周期: ${start} 起 (UTC)
+- 周期用量: <code>$(human_bytes "${used_bytes:-0}")</code> / <code>$(html_escape "$LIMIT_GB") GB</code> (${percent}%)
+- 账单周期: <code>${start} 起 (UTC)</code>
 - 监控网口: $(html_escape "$IFACE") ($(stat_type_name))
-- 统计时间: ${now_utc} (UTC) / ${now_bj} (北京)
+- 统计时间: <code>${now_utc} (UTC)</code> / <code>${now_bj} (北京)</code>
 - 数据库状态: ${status_msg}
 ✅ 这是一条测试消息"
 
@@ -414,8 +412,8 @@ cmd_check() {
 
         local msg="🚨 [$(html_escape "$SERVER_NAME")]关机警报 (95%)
 ━━━━━━━━━━━━━━━
-- 周期用量: $(human_bytes "$used_bytes") / $(html_escape "$LIMIT_GB") GB (${percent}%)
-- 统计时间: $(date -u '+%Y-%m-%d %H:%M') (UTC)
+- 周期用量: <code>$(human_bytes "$used_bytes")</code> / <code>$(html_escape "$LIMIT_GB") GB</code> (${percent}%)
+- 统计时间: <code>$(date -u '+%Y-%m-%d %H:%M') (UTC)</code>
 ⚠️ 服务器将在 1 分钟后自动关机"
         
         if tg_send "$msg"; then
@@ -477,8 +475,8 @@ cmd_check() {
             log "WARN" "流量达到预警阈值: ${percent}%，周期 ${start}，首次触发推送"
             local msg="⚠️ [$(html_escape "$SERVER_NAME")]流量预警 (90%)
 ━━━━━━━━━━━━━━━
-- 周期用量: $(human_bytes "$used_bytes") / $(html_escape "$LIMIT_GB") GB (${percent}%)
-- 统计时间: $(date -u '+%Y-%m-%d %H:%M') (UTC)"
+- 周期用量: <code>$(human_bytes "$used_bytes")</code> / <code>$(html_escape "$LIMIT_GB") GB</code> (${percent}%)
+- 统计时间: <code>$(date -u '+%Y-%m-%d %H:%M') (UTC)</code>"
             if tg_send "$msg"; then
                 save_state_var "WARNED_CYCLE" "$start"
                 log "OK" "90% 预警推送成功（本周期不再重复推送）"
