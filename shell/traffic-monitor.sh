@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #===============================================================================
 # 脚本名称 : traffic-monitor.sh
-# 版    本 : v1.1
+# 版    本 : v1.2
 # 适用系统 : Debian 13 (兼容 Debian 11/12、Ubuntu 20.04+)，依赖 vnStat 2.x
 # 更新记录 :
-#   v1.1 [Produce] 最终优化部署上线的生产版本
+#   v1.2 [Produce] 最终优化部署上线的生产版本
 #===============================================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export LC_ALL=C.UTF-8 2>/dev/null || export LC_ALL=C
 
-VERSION="v1.1"
+VERSION="v1.2"
 SCRIPT_PATH="$(readlink -f "$0")"
 BASE_DIR="/etc/traffic-monitor"
 CONF_FILE="${BASE_DIR}/config.conf"
@@ -54,14 +54,12 @@ fi
 #===============================================================================
 # 基础工具与状态标签
 #===============================================================================
-# 统一的色彩定义
 c_red()    { echo -e "\033[1;31m$*\033[0m"; }
 c_green()  { echo -e "\033[1;32m$*\033[0m"; }
 c_yellow() { echo -e "\033[1;33m$*\033[0m"; }
 c_cyan()   { echo -e "\033[1;36m$*\033[0m"; }
 c_gray()   { echo -e "\033[90m$*\033[0m"; }
 
-# 统一的状态标签 (固定宽度，确保对齐)
 tag_ok()   { echo -e " \033[1;32m[ OK ]\033[0m $*"; }
 tag_warn() { echo -e " \033[1;33m[WARN]\033[0m $*"; }
 tag_err()  { echo -e " \033[1;31m[ ERR]\033[0m $*"; }
@@ -290,17 +288,20 @@ build_report() {
     PARSE_ERROR=0
     used_bytes=$(get_cycle_bytes) || PARSE_ERROR=1
     if [ "$PARSE_ERROR" -eq 1 ]; then
-        warn="\n⚠️ 数据解析异常，请登录检查"
+        warn="
+⚠️ 数据解析异常，请登录检查"
     else
         cover=$(check_day_coverage "$(cycle_start_date)")
         case "$cover" in
             missing:*) 
                 cov_earliest=${cover#missing:}
-                warn="\nℹ️ 历史明细缺失(最早 ${cov_earliest:4:2}-${cov_earliest:6:2})，统计可能偏低"
+                warn="
+ℹ️ 历史明细缺失(最早 ${cov_earliest:4:2}-${cov_earliest:6:2})，统计可能偏低"
                 ;;
             newdb:*)   
                 cov_earliest=${cover#newdb:}
-                warn="\nℹ️ 新建库，数据自 ${cov_earliest:4:2}-${cov_earliest:6:2} 起"
+                warn="
+ℹ️ 新建库，数据自 ${cov_earliest:4:2}-${cov_earliest:6:2} 起"
                 ;;
         esac
     fi
@@ -497,7 +498,6 @@ print_banner() {
     echo -e "  \033[1;37mvnStat 流量监控助手\033[0m  \033[1;33m${VERSION}\033[0m"
     echo -e "  \033[90mSystem: Debian 13 / vnStat 2.x\033[0m"
     echo -e "\033[36m=======================================================\033[0m"
-    # 固定宽度的双列菜单，保证在各终端下绝对对齐
     printf "  \033[1;32m%-2s\033[0m %-22s  \033[1;32m%-2s\033[0m %-22s\n" "1." "安装部署/修改配置" "5." "重置 vnStat 数据库"
     printf "  \033[1;32m%-2s\033[0m %-22s  \033[1;32m%-2s\033[0m %-22s\n" "2." "测试发送每日流量推送" "6." "环境自检 (排障)"
     printf "  \033[1;32m%-2s\033[0m %-22s  \033[1;32m%-2s\033[0m %-22s\n" "3." "查看当前流量数据" "7." "卸载监控程序"
